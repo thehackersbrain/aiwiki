@@ -1,0 +1,148 @@
+---
+name: 'Training Compute Accounting'
+desc: 'Why a training run costs 6ND FLOPs, and where the six comes from.'
+category: 'training'
+complexity: 'O(N·D)'
+path: 'training/scaling'
+difficulty: 'introductory'
+described: '2020'
+status: 'standard'
+statusNote: 'The unit every scaling result is expressed in. Accurate to a few percent for dense transformers, and wrong in specific ways for MoE and for long context.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['scaling', 'training', 'core']
+lede: 'One number describes a training run: parameters times tokens times six. Knowing where the six comes from is what lets you tell when it stops being true.'
+metrics:
+  caption: 'FLOPs per parameter per token'
+  rows:
+    - { label: 'Forward', value: '2' }
+    - { label: 'Backward', value: '4' }
+    - { label: 'Total', value: '6', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Six assumes no recomputation. With full <a href="/entries/gradient-checkpointing">gradient checkpointing</a> the forward pass runs twice and the constant is 8 — a 33% cost that never appears in a scaling-law plot.'
+related: [chinchilla-scaling-laws, kaplan-scaling-laws, gradient-checkpointing, mixture-of-experts-routing, compute-optimal-versus-inference-optimal, scaling-law-methodology]
+refs:
+  - cite: 'Kaplan et al. — Scaling Laws for Neural Language Models (2020)'
+    id: 'arXiv:2001.08361'
+    href: https://arxiv.org/abs/2001.08361
+  - cite: 'Hoffmann et al. — Training Compute-Optimal Large Language Models (2022)'
+    id: 'arXiv:2203.15556'
+    href: https://arxiv.org/abs/2203.15556
+  - cite: 'Casson — Transformer FLOPs (2023)'
+    id: 'adamcasson.com'
+    href: https://www.adamcasson.com/posts/transformer-flops
+---
+
+Every scaling result is a statement about $C$, and $C$ is almost always computed
+rather than measured.
+
+<Eq lead caption="eq. 1 — the estimate the whole literature runs on">
+
+$$
+C \approx 6ND
+$$
+
+</Eq>
+
+$N$ parameters, $D$ training tokens, and a constant of six. It is worth being
+able to derive the six, because the derivation says exactly when it fails.
+
+### Where the six comes from
+
+Consider one weight in one matmul, and one token.
+
+**Forward: 2.** The weight is used once, in a multiply-accumulate — one multiply,
+one add. Two FLOPs.
+
+**Backward: 4.** Two products are needed, not one. The gradient with respect to
+the *input* propagates the error down the network, and the gradient with respect
+to the *weight* is what the optimiser consumes. Each is a matmul of the same
+shape as the forward, so each costs two FLOPs per weight per token.
+
+<Eq caption="eq. 2 — the two backward matmuls">
+
+$$
+\frac{\partial \mathcal{L}}{\partial x} = W^\top \frac{\partial \mathcal{L}}{\partial y}
+\qquad
+\frac{\partial \mathcal{L}}{\partial W} = \frac{\partial \mathcal{L}}{\partial y}\, x^\top
+$$
+
+</Eq>
+
+Six FLOPs per parameter per token, and multiplying by $N$ and $D$ gives eq. 1.
+
+<Note label="annotation">
+Notice what is <em>not</em> in the estimate: attention. The <code>QKᵀ</code> and
+<code>AV</code> products involve no parameters at all, so they are invisible to
+6ND. That is deliberate and it is the estimate's main blind spot.
+</Note>
+
+### When it breaks
+
+**Long context.** The attention term is $12 \cdot L \cdot T \cdot d$ per sequence
+against $6ND$'s $6 \cdot 12 L d^2 \cdot T$ — so it matters when $T \gtrsim d$. At
+$d = 4096$ and $T = 2048$ it is a few percent; at $T = 128\text{k}$ it dominates,
+and quoting 6ND for a long-context run understates the cost several-fold.
+
+<Eq caption="eq. 3 — the correction, with the attention term restored">
+
+$$
+C \approx 6ND + 12\,L\,T\,d\,D
+$$
+
+</Eq>
+
+**Mixture of experts.** $N$ must be the *active* parameter count, not the total.
+DeepSeek-V3 is 671B parameters and 37B active; using the former overstates its
+training cost by eighteen times. Every MoE scaling comparison depends on which
+$N$ is meant, and papers are not always explicit.
+
+**Recomputation.** Full checkpointing repeats the forward pass, making the
+constant 8. Megatron-style
+[selective recomputation](/entries/selective-recomputation) puts it near 6.5.
+
+**Embeddings.** Kaplan et al. excluded embedding parameters from $N$; Hoffmann et
+al. included them. At small scale that is a large fraction of the model and the
+two conventions disagree materially — which is part of why the two papers'
+conclusions differ.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python">
+
+```python
+def training_flops(
+    layers: int, d_model: int, vocab: int, seq: int, tokens: int,
+    d_ff: int | None = None, checkpointing: bool = False,
+) -> dict[str, float]:
+    """FLOPs for a dense decoder. Returns the 6ND estimate and the correction."""
+    d_ff = d_ff or 4 * d_model
+
+    # Per layer: 4d² of attention projections, 2·d·d_ff of feed-forward.
+    per_layer = 4 * d_model**2 + 2 * d_model * d_ff
+    n_non_embed = layers * per_layer
+    n_total = n_non_embed + vocab * d_model
+
+    factor = 8 if checkpointing else 6
+    simple = factor * n_total * tokens
+
+    # Attention's parameter-free matmuls: QKᵀ and AV, forward and backward.
+    attention = 12 * layers * seq * d_model * tokens
+    return {"6ND": simple, "with_attention": simple + attention,
+            "attention_share": attention / (simple + attention)}
+```
+
+</CodeFrame>
+
+<Rule label="Why it is worth carrying" />
+
+The estimate is what makes disparate runs comparable. A 70B model on 15T tokens
+is $6.3 \times 10^{24}$ FLOPs whatever hardware ran it, and that number can be
+placed on the same axis as a 7B model on 2T. Every plot in
+[Chinchilla](/entries/chinchilla-scaling-laws) and everything downstream of it
+depends on the comparison being sound.
+
+It is also the basis of the regulatory thresholds now written into law, which are
+stated in FLOPs and computed exactly this way — a detail that makes the
+active-versus-total question for MoE considerably less academic than it looks.

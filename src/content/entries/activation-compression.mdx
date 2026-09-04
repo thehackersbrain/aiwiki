@@ -1,0 +1,146 @@
+---
+name: 'Activation Compression'
+desc: 'Store the saved activations in fewer bits instead of recomputing them.'
+category: 'training'
+complexity: 'O(L·B·T·d)'
+path: 'training/memory'
+difficulty: 'advanced'
+described: '2021'
+status: 'emerging'
+statusNote: 'Sound in principle, with convergence guarantees, and rarely used — recomputation is simpler and FlashAttention removed the largest tensor it targeted.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['memory', 'training', 'numerics']
+lede: 'Recomputation discards activations and regenerates them. The third option is to keep them in two or four bits — the backward pass turns out to tolerate a surprising amount of noise in what it reads.'
+metrics:
+  caption: 'ActNN, reported'
+  rows:
+    - { label: 'Activation memory', value: '≈ 12× less' }
+    - { label: 'Throughput cost', value: '≈ 20%' }
+    - { label: 'Accuracy', value: 'within noise', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Quantise per group, never per tensor. Activations have outliers, and a single scale factor over a whole tensor spends the entire range on them — the same failure that block-wise quantisation exists to prevent in optimiser states.'
+related: [gradient-checkpointing, selective-recomputation, activation-memory-accounting, floating-point-formats, gptq, memory-efficient-optimisers]
+refs:
+  - cite: 'Chen et al. — ActNN: Reducing Training Memory Footprint via 2-Bit Activation Compressed Training (2021)'
+    id: 'arXiv:2104.14129'
+    href: https://arxiv.org/abs/2104.14129
+  - cite: 'Liu et al. — GACT: Activation Compressed Training for Generic Network Architectures (2022)'
+    id: 'arXiv:2206.11357'
+    href: https://arxiv.org/abs/2206.11357
+  - cite: 'Dettmers et al. — 8-bit Optimizers via Block-wise Quantization (2021)'
+    id: 'arXiv:2110.02861'
+    href: https://arxiv.org/abs/2110.02861
+---
+
+The saved activations are read exactly once, by the backward pass, to compute a
+gradient that is already a noisy estimate. That framing suggests they do not need
+to be stored exactly.
+
+<Eq lead caption="eq. 1 — quantise on the way in, dequantise on the way out">
+
+$$
+\tilde{x} = \mathrm{round}\!\left(\frac{x - z}{s}\right),
+\qquad
+\hat{x} = s\,\tilde{x} + z
+$$
+
+</Eq>
+
+At two bits that is a sixteen-fold reduction against bf16, for the cost of a
+quantise on the forward and a dequantise on the backward — both elementwise, both
+cheap.
+
+### Why the gradient tolerates it
+
+Because it is already stochastic. The minibatch gradient has variance from
+sampling; quantisation adds a second, independent source. If the second is small
+relative to the first, convergence is essentially unaffected.
+
+<Eq caption="eq. 2 — the two variances add">
+
+$$
+\mathrm{Var}[\hat{g}] = \underbrace{\mathrm{Var}_{\text{batch}}[g]}_{\text{already there}} + \underbrace{\mathrm{Var}_{\text{quant}}[g]}_{\text{added}}
+$$
+
+</Eq>
+
+Chen et al. make this precise with *stochastic* rounding rather than
+round-to-nearest. Rounding up or down with probability proportional to the
+remainder makes the quantised value unbiased, so $\mathbb{E}[\hat{g}] = g$ and
+SGD's convergence guarantees carry over with a modified constant. Deterministic
+rounding introduces a bias that accumulates over layers and over steps, and it
+does not.
+
+<Note label="annotation">
+ActNN goes further and allocates bits per tensor by sensitivity — estimating each
+activation's contribution to gradient variance and spending more bits where it is
+large. Most of the benefit comes from the first idea; this one buys perhaps
+another factor of two.
+</Note>
+
+### Against recomputation
+
+They target the same memory and the currency differs.
+
+| | Compression | Recomputation |
+| --- | --- | --- |
+| costs | ~20% throughput | 4–36% FLOPs |
+| memory | ~12× less | ~10× less |
+| exact | no | yes |
+| implementation | custom kernels | one wrapper |
+
+Recomputation is exact, is one function call, and is in every framework.
+Compression needs quantise/dequantise kernels fused into the autograd graph, and
+gives up exactness for a guarantee about the *expectation*.
+
+The comparison used to be closer. What changed is
+[FlashAttention](/entries/flash-attention): the quadratic score matrix was the
+biggest single target for compression, and it is no longer stored by anyone. What
+remains is the linear term, where
+[selective recomputation](/entries/selective-recomputation) already gets most of
+the saving for about 4% compute — a bar that a 20% throughput cost does not
+clear.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor
+
+
+class Compressed(torch.autograd.Function):
+    """Store the activation in 4 bits; dequantise when the backward reads it."""
+
+    @staticmethod
+    def forward(ctx, x: Tensor, group: int = 128):
+        flat = x.reshape(-1, group)
+        lo = flat.amin(1, keepdim=True)
+        scale = (flat.amax(1, keepdim=True) - lo).clamp(min=1e-8) / 15
+
+        # Stochastic rounding: unbiased, which is what preserves convergence.
+        q = (flat - lo) / scale
+        q = (q.floor() + (torch.rand_like(q) < q.frac())).to(torch.uint8)
+
+        ctx.save_for_backward(q, scale, lo)        # 4 bits, not 16
+        ctx.shape, ctx.group = x.shape, group
+        return x
+
+    @staticmethod
+    def backward(ctx, grad: Tensor):
+        q, scale, lo = ctx.saved_tensors
+        _ = (q.float() * scale + lo).reshape(ctx.shape)   # the recovered input
+        return grad, None
+```
+
+</CodeFrame>
+
+Two things that implementation glosses over. `uint8` stores four bits in eight —
+a real version packs two values per byte, or the saving is halved. And
+`save_for_backward` must receive the quantised tensor only; keeping a reference
+to `x` anywhere in the closure keeps the full-precision tensor alive and the
+whole exercise achieves nothing, which is a mistake that produces correct results
+and no memory saving.

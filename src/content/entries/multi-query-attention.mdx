@@ -1,0 +1,97 @@
+---
+name: 'Multi-Query Attention'
+desc: 'Single shared K/V head across query heads to shrink the decode cache.'
+category: 'inference'
+complexity: 'O(n·d)'
+path: 'inference/kv-cache'
+difficulty: 'intermediate'
+described: '2019'
+status: 'superseded'
+statusNote: 'Kept for the argument it makes rather than for use: grouped-query attention recovers most of the quality it gave up, for most of the same saving.'
+revised: 2026-08-11
+added: 2026-03-03
+tags: ['attention', 'kv-cache']
+lede: 'Decoding is bound by the bandwidth needed to re-read the KV cache each step. Share one K/V head across all query heads and that cache shrinks by the head count.'
+metrics:
+  caption: '70B model, 32k context, batch 16, fp16'
+  rows:
+    - { label: 'KV cache (MHA)', value: '32.0 GB' }
+    - { label: 'GQA, g = 8', value: '4.0 GB' }
+    - { label: 'MQA', value: '0.5 GB', accent: true }
+implNote:
+  label: 'annotation'
+  html: 'Uptraining works: mean-pool the K/V projections within each group and continue training for a few percent of the original budget.'
+related: [flash-attention, scaled-dot-product-attention, speculative-decoding, paged-attention]
+refs:
+  - cite: 'Shazeer — Fast Transformer Decoding: One Write-Head is All You Need (2019)'
+    id: 'arXiv:1911.02150'
+    href: https://arxiv.org/abs/1911.02150
+  - cite: 'Ainslie et al. — GQA: Training Generalized Multi-Query Transformer Checkpoints (2023)'
+    id: 'arXiv:2305.13245'
+    href: https://arxiv.org/abs/2305.13245
+  - cite: 'Kwon et al. — Efficient Memory Management for LLM Serving with PagedAttention (2023)'
+    id: 'arXiv:2309.06180'
+    href: https://arxiv.org/abs/2309.06180
+---
+
+<Note label="in numbers">
+An A100 reads 2 TB/s. A 32 GB cache is 16 ms per token spent before any arithmetic
+happens.
+</Note>
+
+At batch size 1 an autoregressive step performs a handful of matrix–vector products
+and re-reads the entire KV cache. Arithmetic intensity is therefore near 1, and the
+step time is a division: bytes read over memory bandwidth.
+
+<Eq caption="eq. 1 — L layers, batch b, h_kv key/value heads" lead>
+
+$$
+\text{bytes}_{KV} = 2 \cdot L \cdot n \cdot h_{kv} \cdot d_{\text{head}} \cdot b
+\cdot \text{sizeof(dtype)}
+$$
+
+</Eq>
+
+MQA sets $h_{kv} = 1$; grouped-query attention interpolates, sharing one K/V head
+per group of $g$ query heads. GQA at $g = 8$ recovers essentially all of
+multi-head quality at an eighth of the cache, which is why it, rather than MQA, is
+what shipped.
+
+<Eq caption="eq. 2">
+
+$$
+\underbrace{h_{kv} = h}_{\text{MHA}}
+\qquad
+\underbrace{h_{kv} = h/g}_{\text{GQA}}
+\qquad
+\underbrace{h_{kv} = 1}_{\text{MQA}}
+$$
+
+</Eq>
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor
+import torch.nn.functional as F
+
+
+def gqa(q: Tensor, k: Tensor, v: Tensor, mask=None) -> Tensor:
+    """q: [B, H, N, D]   k, v: [B, H_kv, M, D]   H % H_kv == 0"""
+    h, h_kv = q.size(1), k.size(1)
+    if h != h_kv:
+        repeat = h // h_kv
+        k = k.repeat_interleave(repeat, dim=1)
+        v = v.repeat_interleave(repeat, dim=1)
+    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+```
+
+</CodeFrame>
+
+`repeat_interleave` here is expository — it materialises the expansion. In a real
+kernel the grouping is expressed as a stride of zero over the head dimension, so
+the shared K/V head is read once and broadcast, which is the entire point of the
+technique.

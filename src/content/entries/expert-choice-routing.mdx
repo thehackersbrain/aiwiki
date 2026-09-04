@@ -1,0 +1,136 @@
+---
+name: 'Expert-Choice Routing'
+desc: 'Invert the assignment: each expert picks its top tokens, not the reverse.'
+category: 'architectures'
+complexity: 'O(k·d²)'
+path: 'architectures/sparse'
+difficulty: 'intermediate'
+described: '2022'
+status: 'emerging'
+statusNote: 'Perfect balance by construction and unusable for autoregressive decoding, because the choice depends on future tokens. Encoders and vision models can use it; decoders cannot.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['sparse', 'training']
+lede: 'Load imbalance is an artefact of letting tokens choose. Turn the assignment around — every expert takes exactly its capacity, most valuable tokens first — and balance stops being something to enforce.'
+metrics:
+  caption: 'Zhou et al., 2022'
+  rows:
+    - { label: 'Tokens dropped', value: 'none' }
+    - { label: 'Balance', value: 'exact by construction' }
+    - { label: 'Causal decoding', value: 'not possible', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'The top-k runs down the token axis, so expert i’s choice depends on every token in the sequence — including ones after the current position. That is a leak of future information, not a subtlety of implementation.'
+related: [mixture-of-experts-routing, expert-capacity-and-token-dropping, loss-free-load-balancing, causal-masking, mixture-of-depths]
+refs:
+  - cite: 'Zhou et al. — Mixture-of-Experts with Expert Choice Routing (2022)'
+    id: 'arXiv:2202.09368'
+    href: https://arxiv.org/abs/2202.09368
+  - cite: 'Fedus et al. — Switch Transformers (2021)'
+    id: 'arXiv:2101.03961'
+    href: https://arxiv.org/abs/2101.03961
+  - cite: 'Puigcerver et al. — From Sparse to Soft Mixtures of Experts (2023)'
+    id: 'arXiv:2308.00951'
+    href: https://arxiv.org/abs/2308.00951
+---
+
+Standard routing computes an affinity matrix $S \in \mathbb{R}^{T \times E}$ and
+takes the top-$k$ along the expert axis: each token picks its experts. Every
+problem with [capacity](/entries/expert-capacity-and-token-dropping) follows from
+that, because nothing constrains how many tokens pick the same one.
+
+Take the top-$k$ along the other axis instead.
+
+<Eq lead caption="eq. 1 — same matrix, transposed argmax">
+
+$$
+\text{token choice: } \mathrm{top}_k\bigl(S_{t,:}\bigr)
+\qquad
+\text{expert choice: } \mathrm{top}_C\bigl(S_{:,e}\bigr)
+$$
+
+</Eq>
+
+Expert $e$ takes the $C$ tokens that score highest for it. Every expert takes
+exactly $C$ — no more, by construction, and no fewer as long as $T \ge C$. There
+is no capacity factor, no auxiliary loss, no controller, and no dropping.
+
+### Variable compute per token
+
+The interesting consequence is not the balance but its dual. Under token choice,
+every token gets exactly $k$ experts. Under expert choice, a token may be chosen
+by many experts, one, or none.
+
+<Note label="annotation">
+That is arguably correct behaviour. A comma does not need the same computation as
+a rare technical term, and every fixed-<em>k</em> scheme spends the same on both.
+Expert choice lets the model allocate — and it does: Zhou et al. report a
+long-tailed distribution, with a small number of tokens taking many experts.
+</Note>
+
+The flip side is that a token chosen by nobody passes through unchanged. This is
+the same event as a dropped token, arrived at by a different route, and it is
+untroubling for the same reason — a
+[shared expert](/entries/shared-and-fine-grained-experts) or the residual path
+means the layer is never wholly absent.
+
+### Why decoders cannot use it
+
+$\mathrm{top}_C(S_{:,e})$ ranks all $T$ tokens against each other. Whether token
+5 is selected depends on how tokens 6 through $T$ scored — so the computation at
+position 5 depends on the future, which is exactly what
+[causal masking](/entries/causal-masking) exists to prevent.
+
+The damage is not subtle. During training the model sees a routing that used
+future information; during autoregressive generation that routing cannot be
+reproduced, because the future does not exist yet. Train/inference mismatch of
+this kind does not degrade gracefully.
+
+Zhou et al. evaluated on encoder-style and fine-tuning workloads where the whole
+sequence is present, which is where the method is sound. For decoder pre-training
+it is not repairable — a causal variant would have to rank each token against
+only its predecessors, and then the expert's top-$C$ changes at every position.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor, nn
+
+
+class ExpertChoiceRouter(nn.Module):
+    """Non-causal. Encoders, vision, and fine-tuning on full sequences only."""
+
+    def __init__(self, dim: int, n_experts: int, capacity_factor: float = 2.0):
+        super().__init__()
+        self.gate = nn.Linear(dim, n_experts, bias=False)
+        self.f, self.n_experts = capacity_factor, n_experts
+
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:    # [T, D]
+        t = x.size(0)
+        capacity = int(self.f * t / self.n_experts)
+
+        scores = self.gate(x).softmax(-1)                     # [T, E]
+
+        # top-k down the token axis: each expert takes its best `capacity`.
+        weight, tokens = scores.t().topk(capacity, dim=-1)    # [E, C]
+        return tokens, weight
+```
+
+</CodeFrame>
+
+One line differs from token-choice routing — the `.t()` — and it changes what the
+layer is. Worth noting how cheap the balance is once the assignment runs this
+way: the entire apparatus of capacity factors, auxiliary losses and bias
+controllers exists to approximate, under token choice, what a transpose gives
+exactly.
+
+<Rule label="The soft alternative" />
+
+Soft MoE takes the same insight further and drops discreteness altogether: each
+expert processes a weighted *average* of all tokens, with the weights from the
+same affinity matrix. Perfectly balanced, fully differentiable, no dropping — and
+non-causal for the same reason, since the average is over the whole sequence.
+Both methods are the same trade: give up autoregression, get balance for free.

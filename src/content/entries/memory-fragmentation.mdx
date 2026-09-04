@@ -1,0 +1,148 @@
+---
+name: 'Memory Fragmentation'
+desc: 'The allocator that says out-of-memory with gigabytes free, and what to do about it.'
+category: 'training'
+complexity: '—'
+path: 'training/memory'
+difficulty: 'intermediate'
+described: '2019'
+status: 'common'
+statusNote: 'Not a technique but a failure mode, and the one that wastes the most time. Every practitioner meets it; the diagnosis is standard and rarely written down.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['memory', 'training', 'inference']
+lede: 'An OOM that reports 12 GB free is not a lie. The allocator holds cached blocks of the wrong sizes, and the request needs contiguous space that no single block provides.'
+metrics:
+  caption: 'Reading the error message'
+  rows:
+    - { label: 'reserved', value: 'held by the allocator' }
+    - { label: 'allocated', value: 'in use by tensors' }
+    - { label: 'reserved − allocated', value: 'fragmentation', accent: true }
+implNote:
+  label: 'in practice'
+  html: 'The first thing to try is <code>PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True</code>. It lets segments grow rather than being fixed at allocation, which removes most fragmentation for variable-shape workloads and costs nothing.'
+related: [activation-memory-accounting, paged-attention, gradient-accumulation, cpu-and-nvme-offloading, continuous-batching, nondeterminism]
+refs:
+  - cite: 'PyTorch — CUDA caching allocator documentation'
+    id: 'pytorch.org'
+    href: https://pytorch.org/docs/stable/notes/cuda.html#memory-management
+  - cite: 'Kwon et al. — Efficient Memory Management for Large Language Model Serving with PagedAttention (2023)'
+    id: 'arXiv:2309.06180'
+    href: https://arxiv.org/abs/2309.06180
+  - cite: 'Guo — Fragmentation and GPU Memory Management (2024)'
+    id: 'PyTorch blog'
+    href: https://pytorch.org/blog/understanding-gpu-memory-1/
+---
+
+```
+CUDA out of memory. Tried to allocate 2.00 GiB.
+GPU 0 has 79.15 GiB capacity; 61.20 GiB already allocated;
+12.42 GiB free; 66.73 GiB reserved in total by PyTorch
+```
+
+Twelve gigabytes free and a two gigabyte allocation fails. The message is
+accurate and the explanation is in the gap between *allocated* and *reserved*.
+
+### The caching allocator
+
+`cudaMalloc` synchronises the device and costs on the order of a hundred
+microseconds. A training step performs thousands of allocations, so PyTorch does
+not call it per tensor: it requests large segments from the driver and sub-
+allocates from them, returning freed blocks to its own pool rather than to CUDA.
+
+The consequence is that free memory is *free within a segment*. A 2 GB request
+needs 2 GB contiguous inside one segment, and a pool holding thirty scattered
+400 MB blocks cannot serve it however much it totals.
+
+<Eq lead caption="eq. 1 — the quantity to watch">
+
+$$
+\text{fragmentation} = \frac{\text{reserved} - \text{allocated}}{\text{reserved}}
+$$
+
+</Eq>
+
+Under 10% is normal. Over 30% means the allocation pattern, not the model, is the
+problem.
+
+<Note label="annotation">
+Variable shapes are what cause it. Fixed-shape training — same batch, same
+sequence, every step — reaches a steady state after a few iterations and
+fragments almost not at all. Variable-length batches, dynamic padding and
+gradient accumulation with ragged micro-batches produce a pool full of
+mismatched blocks.
+</Note>
+
+### The fixes, in order
+
+**`expandable_segments:True`.** The allocator maps virtual address space and
+commits physical pages as needed, so a segment can grow instead of being fixed at
+creation. This removes most fragmentation for variable-shape workloads and is the
+single highest-value setting on this page.
+
+**Bucket the shapes.** Pad sequence lengths to powers of two or to a small set of
+buckets. Fewer distinct sizes means blocks are reusable, which is the underlying
+cause addressed directly rather than worked around.
+
+**`torch.cuda.empty_cache()`.** Returns unused segments to the driver. It is
+slow, it synchronises, and it is a symptomatic fix — useful between phases (train
+then evaluate) and harmful inside a training loop.
+
+**Allocate the large things first.** At start-up, when the pool is empty, big
+allocations get clean segments. A KV cache or activation buffer claimed at
+initialisation and reused is not subject to any of this.
+
+That last point is [PagedAttention](/entries/paged-attention)'s argument, applied
+to the KV cache specifically: fixed-size blocks with an indirection table, so a
+growing cache never needs contiguous space. It is an operating system's answer to
+the problem — the vLLM paper measures 60–80% waste in the pre-paged allocators it
+replaces.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+
+
+def memory_report() -> dict[str, float]:
+    """The three numbers, in GB. Log them; the ratio is the diagnosis."""
+    alloc = torch.cuda.memory_allocated() / 1e9
+    reserved = torch.cuda.memory_reserved() / 1e9
+    return {
+        "allocated": alloc,
+        "reserved": reserved,
+        "fragmentation": (reserved - alloc) / reserved if reserved else 0.0,
+        "peak": torch.cuda.max_memory_allocated() / 1e9,
+    }
+
+
+def capture_timeline(path: str = "mem.pickle", steps: int = 3):
+    """Records every alloc and free with its stack. Open the pickle at
+    pytorch.org/memory_viz — it names the tensors that actually dominate."""
+    torch.cuda.memory._record_memory_history(max_entries=100_000)
+    yield
+    torch.cuda.memory._dump_snapshot(path)
+    torch.cuda.memory._record_memory_history(enabled=None)
+```
+
+</CodeFrame>
+
+The snapshot viewer is the tool worth knowing about. It renders allocation
+lifetimes as a timeline with the allocating stack frame attached, which turns
+"something is using memory" into a named line of code in about a minute — as
+against the usual approach of bisecting the model by commenting things out.
+
+<Rule label="What it is not" />
+
+Two things get misattributed to fragmentation.
+
+**A genuine leak.** A tensor kept alive by a reference — appending `loss` rather
+than `loss.item()` to a list retains the entire graph. Here `allocated` grows
+monotonically, whereas fragmentation shows a stable `allocated` under a growing
+`reserved`.
+
+**A real shortfall.** Sometimes the model does not fit and the allocator is
+blameless. If `allocated` at peak is close to capacity, the answer is on one of
+the other pages of this branch, not this one.

@@ -1,0 +1,35 @@
+---
+name: 'Paged KV Cache'
+desc: 'Virtual-memory paging applied to the attention cache.'
+category: 'inference'
+complexity: 'O(1)'
+path: 'inference/kv-cache'
+difficulty: 'intermediate'
+described: '2023'
+status: 'standard'
+statusNote: 'Every serious serving stack pages its KV cache. The idea went from paper to default in about a year.'
+revised: 2026-07-28
+added: 2026-01-27
+tags: ['kv-cache', 'memory']
+stub: true
+lede: 'Contiguous per-sequence cache allocation wastes most of its memory to internal fragmentation. Store the cache in fixed-size blocks with an indirection table instead.'
+related: [multi-query-attention, flash-attention]
+refs:
+  - cite: 'Kwon et al. — Efficient Memory Management for LLM Serving with PagedAttention (2023)'
+    id: 'arXiv:2309.06180'
+    href: https://arxiv.org/abs/2309.06180
+---
+
+Reserving a contiguous cache per sequence means reserving for the longest
+completion the sequence might produce. Most sequences stop far short of it, and
+the reservation is unusable by anyone else in the meantime — the reported waste
+runs to 60–80% of allocated cache.
+
+Paging fixes it the way operating systems did: fixed-size blocks, a per-sequence
+block table, and physical blocks handed out on demand. Sharing follows almost for
+free, since two sequences with a common prefix can point at the same blocks with a
+reference count.
+
+This is a stub because the attention kernel that reads through the block table
+has not been rederived here, and it is the part that decides whether the scheme
+costs anything at run time.

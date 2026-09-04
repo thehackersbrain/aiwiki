@@ -1,0 +1,116 @@
+---
+name: 'Vector Databases'
+desc: 'Approximate nearest-neighbour search, and whether you need a separate system for it.'
+category: 'tooling'
+complexity: 'O(log n)'
+path: 'tooling/orchestration'
+difficulty: 'introductory'
+described: '2017'
+status: 'common'
+statusNote: 'Necessary above a few million vectors and frequently adopted well below that. Postgres with pgvector covers most real workloads.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['tooling', 'orchestration', 'retrieval']
+lede: 'Finding the nearest vectors to a query is a brute-force scan until the corpus is large. The index that avoids the scan is the product — everything else these systems offer, a normal database already had.'
+metrics:
+  caption: 'HNSW, one million vectors'
+  rows:
+    - { label: 'Brute force', value: 'O(n·d)' }
+    - { label: 'HNSW query', value: '≈ 1 ms', accent: true }
+    - { label: 'Recall at that speed', value: '> 95%' }
+implNote:
+  label: 'caveat'
+  html: 'The search is <em>approximate</em>. HNSW at default settings misses a few percent of true nearest neighbours, which is usually invisible and occasionally is the document you needed. <code>ef_search</code> trades latency for recall and is the knob to reach for.'
+related: [llamaindex, langchain, model-context-protocol, sparse-autoencoders]
+refs:
+  - cite: 'Malkov & Yashunin — Efficient and robust approximate nearest neighbor search using HNSW graphs (2016)'
+    id: 'arXiv:1603.09320'
+    href: https://arxiv.org/abs/1603.09320
+  - cite: 'Johnson et al. — Billion-scale similarity search with GPUs (2017)'
+    id: 'arXiv:1702.08734'
+    href: https://arxiv.org/abs/1702.08734
+  - cite: 'pgvector'
+    id: 'github'
+    href: https://github.com/pgvector/pgvector
+---
+
+Retrieval needs the $k$ nearest vectors to a query. Exactly, that is a dot
+product against every vector in the corpus — fine at ten thousand, slow at ten
+million, and the entire reason this category of software exists.
+
+### HNSW, which is what they all run
+
+Hierarchical Navigable Small World graphs are the index behind almost every
+current system. Vectors become nodes in a layered proximity graph: sparse long
+edges at the top for coarse navigation, dense short edges at the bottom for
+precision. A search enters at the top, greedily walks towards the query, and
+descends.
+
+Logarithmic in corpus size, high recall, and expensive to build — roughly
+$O(n \log n)$ with a large constant, and the graph must be in memory.
+
+<Eq lead caption="eq. 1 — the two build parameters">
+
+$$
+M = \text{edges per node}, \qquad \mathit{ef} = \text{candidate list size}
+$$
+
+</Eq>
+
+$M$ around 16 and `ef_construction` around 200 are reasonable defaults. At query
+time `ef_search` sets how hard to look — raise it for recall, lower it for
+latency. It is the only one of the three you can change after building.
+
+### Whether you need one
+
+| Vectors | Reasonable choice |
+| --- | --- |
+| < 100 k | numpy, brute force |
+| < 10 M | pgvector, or SQLite + an index |
+| > 10 M | Qdrant, Milvus, a managed service |
+| research / offline | FAISS |
+
+The first row is not a joke. A brute-force scan of 100 000 × 768 floats is a
+single matmul and takes a few milliseconds — faster than a network round trip to
+a dedicated service, exact rather than approximate, and with no system to
+operate.
+
+<Note label="annotation">
+The strongest argument for pgvector is not performance. It is that vectors live
+next to the rows they describe, so filtering by tenant, date or permission is a
+<code>WHERE</code> clause rather than a metadata feature reimplemented by the
+vector store — and pre-filtering versus post-filtering is where most of those
+implementations are subtly wrong.
+</Note>
+
+### The landscape
+
+**FAISS** — Meta's library, not a database. Every index type, GPU support,
+excellent for offline and research work. You handle persistence and serving.
+
+**pgvector** — Postgres extension. Transactions, joins, backups, permissions:
+everything a database already does, plus HNSW.
+
+**Qdrant, Milvus, Weaviate** — purpose-built, with filtering, sharding and
+replication. Worth the operational cost above a few tens of millions of vectors.
+
+**Pinecone, and managed offerings** — the same, without running it yourself.
+
+<Rule label="Hybrid search" />
+
+The improvement most worth making. Dense embeddings capture meaning and miss
+exact tokens — a part number, an error code, a surname. BM25 does the reverse.
+Run both and fuse the rankings:
+
+<Eq caption="eq. 2 — reciprocal rank fusion, no score calibration needed">
+
+$$
+\mathrm{RRF}(d) = \sum_{r \in \text{rankers}} \frac{1}{k + \mathrm{rank}_r(d)},
+\qquad k \approx 60
+$$
+
+</Eq>
+
+RRF combines *ranks* rather than scores, so the two systems' incomparable
+similarity numbers never have to be reconciled. It is a few lines of code and
+reliably beats either retriever alone.

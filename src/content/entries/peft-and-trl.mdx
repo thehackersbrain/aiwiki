@@ -1,0 +1,105 @@
+---
+name: 'PEFT and TRL'
+desc: 'The adapter library and the preference-training library, and how they compose.'
+category: 'tooling'
+complexity: '—'
+path: 'tooling/tuning'
+difficulty: 'intermediate'
+described: '2022'
+status: 'standard'
+statusNote: 'The reference implementations of LoRA and of DPO. Faster wrappers exist and almost all of them are built on these two.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['tooling', 'training', 'fine-tuning']
+lede: 'Two Hugging Face libraries covering the two halves of post-training: which parameters you are allowed to move, and what objective moves them.'
+implNote:
+  label: 'caveat'
+  html: 'Target every projection, not just <code>q_proj</code> and <code>v_proj</code>. The original LoRA paper adapted only the attention matrices; every careful ablation since finds including the feed-forward projections is worth more than raising the rank.'
+related: [lora, qlora, dora, direct-preference-optimisation, grpo, supervised-fine-tuning, transformers-library, unsloth]
+refs:
+  - cite: 'Hugging Face — PEFT documentation'
+    id: 'huggingface.co'
+    href: https://huggingface.co/docs/peft
+  - cite: 'Hugging Face — TRL documentation'
+    id: 'huggingface.co'
+    href: https://huggingface.co/docs/trl
+  - cite: 'Hu et al. — LoRA: Low-Rank Adaptation of Large Language Models (2021)'
+    id: 'arXiv:2106.09685'
+    href: https://arxiv.org/abs/2106.09685
+---
+
+**PEFT** implements the parameter-efficient methods —
+[LoRA](/entries/lora), [QLoRA](/entries/qlora), [DoRA](/entries/dora), prefix
+tuning, IA³ — as a wrapper that freezes a model and attaches trainable adapters.
+
+**TRL** implements the post-training objectives — SFT,
+[DPO](/entries/direct-preference-optimisation), PPO,
+[GRPO](/entries/grpo), reward modelling — as trainers that take a model and a
+dataset.
+
+They are designed to compose, and the composition is the normal way to do
+alignment on hardware that is not a cluster.
+
+<CodeFrame meta="python">
+
+```python
+from peft import LoraConfig
+from trl import DPOConfig, DPOTrainer
+
+peft_config = LoraConfig(
+    r=16,
+    lora_alpha=32,                    # scaling is alpha/r; 2r is the usual choice
+    target_modules=[                  # all seven, not just q and v
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    ],
+    lora_dropout=0.05,
+    task_type="CAUSAL_LM",
+)
+
+trainer = DPOTrainer(
+    model=model,                      # ref_model=None: PEFT gives the reference
+    args=DPOConfig(beta=0.1, learning_rate=5e-6, output_dir="out"),
+    train_dataset=pairs,              # prompt / chosen / rejected
+    peft_config=peft_config,
+)
+trainer.train()
+```
+
+</CodeFrame>
+
+### The trick in that snippet
+
+`ref_model=None`. [DPO](/entries/direct-preference-optimisation) needs a frozen
+reference policy, which normally means a second copy of the model in memory. With
+LoRA the base weights *are* the reference — disable the adapters and you have it
+— so TRL computes reference log-probabilities by toggling them off. One model in
+memory instead of two, which for a 70B is the difference between fitting and not.
+
+### Choosing an objective
+
+| Have | Use | Cost |
+| --- | --- | --- |
+| demonstrations | `SFTTrainer` | one model |
+| preference pairs | `DPOTrainer` | one model with LoRA |
+| a reward model, online | `PPOTrainer` | four models |
+| a verifiable reward | `GRPOTrainer` | two models, k samples |
+
+The cost column is the practical determinant. PPO needs policy, reference, reward
+and value models resident at once, which is why DPO displaced it for most
+purposes despite being the less general method.
+
+<Note label="in practice">
+Rank matters less than people expect. Going from r=8 to r=64 changes results far
+less than adding the feed-forward modules to <code>target_modules</code>, and
+<code>lora_alpha = 2r</code> is a convention worth keeping so that changing the
+rank does not silently change the effective learning rate.
+</Note>
+
+### What they are not
+
+Optimised. Both are reference implementations, written for clarity and coverage.
+[Unsloth](/entries/unsloth) is roughly twice as fast at the same task with less
+memory, and [config-driven wrappers](/entries/config-driven-finetuning) remove
+the Python. Both of those are built on PEFT and TRL, so the concepts transfer
+unchanged.

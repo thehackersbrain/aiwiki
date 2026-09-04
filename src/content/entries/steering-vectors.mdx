@@ -1,0 +1,133 @@
+---
+name: 'Steering Vectors'
+desc: 'Add a direction to the residual stream at inference to shift behaviour.'
+category: 'interpretability'
+complexity: 'O(L·d)'
+path: 'interpretability/causal'
+difficulty: 'intermediate'
+described: '2023'
+status: 'common'
+statusNote: 'Reliably does something; reliably does more than you asked. Widely used and not a control mechanism you would ship behind.'
+revised: 2026-08-02
+added: 2025-05-19
+tags: ['causal', 'features', 'alignment']
+lede: 'Find the direction that separates two contrasting behaviours in activation space, then add a multiple of it at inference. Control without a gradient step.'
+implNote:
+  label: 'caveat'
+  html: 'A steering vector that changes the behaviour and also degrades fluency has not isolated anything — it has found a direction that partly points at "coherent text".'
+related: [activation-patching, sparse-autoencoders, logit-lens, prompt-injection-taxonomy]
+refs:
+  - cite: 'Turner et al. — Steering Language Models With Activation Engineering (2023)'
+    id: 'arXiv:2308.10248'
+    href: https://arxiv.org/abs/2308.10248
+  - cite: 'Rimsky et al. — Steering Llama 2 via Contrastive Activation Addition (2023)'
+    id: 'arXiv:2312.06681'
+    href: https://arxiv.org/abs/2312.06681
+  - cite: 'Zou et al. — Representation Engineering: A Top-Down Approach to AI Transparency (2023)'
+    id: 'arXiv:2310.01405'
+    href: https://arxiv.org/abs/2310.01405
+---
+
+The residual stream is a sum of contributions, and the unembedding reads it
+linearly. If a behaviour corresponds to a direction in that space, adding the
+direction should produce the behaviour — no fine-tuning, no prompt.
+
+<Note label="aside">
+The premise is the linear representation hypothesis. Steering working at all is
+one of the better pieces of evidence for it.
+</Note>
+
+### Finding the direction
+
+The crude version subtracts one prompt's activations from another's at a chosen
+layer. The reliable version is difference-in-means over a dataset of contrastive
+pairs — same question, opposite answer — which averages away everything the two
+sets share.
+
+<Eq caption="eq. 1 — contrastive activation addition" source="Rimsky et al. §3" lead>
+
+$$
+v_\ell = \frac{1}{|\mathcal{D}|} \sum_{(p^{+}, p^{-}) \in \mathcal{D}}
+\Bigl( h_\ell(p^{+}) - h_\ell(p^{-}) \Bigr)
+$$
+
+</Eq>
+
+Read the activations at the answer token, not at the end of the prompt: the
+prompt is identical across the pair by construction, so anything measured there
+is noise.
+
+<Eq caption="eq. 2 — applied at inference, every position, one layer">
+
+$$
+h_\ell \;\leftarrow\; h_\ell + \alpha\, v_\ell
+$$
+
+</Eq>
+
+Negative $\alpha$ steers the other way, which is a useful check: a direction
+that only works in one sign has probably found something other than the axis
+you meant.
+
+### Choosing the layer
+
+<Note label="in practice">
+Middle layers. Early ones are still token-level, late ones are already
+committed to an output distribution and steering there mostly breaks grammar.
+</Note>
+
+Sweep $\ell$ and $\alpha$ together and plot behaviour change against perplexity
+on unrelated text. The usable region is where behaviour moves and perplexity
+does not — beyond it the vector is overwhelming the computation rather than
+biasing it.
+
+> Steering is a causal claim about a direction and is properly evaluated as
+> one. Sparse autoencoder latents give candidate directions with an
+> interpretation attached, which is a better starting point than difference-in-means
+> when a dictionary is available.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch hooks">
+
+```python
+import torch
+from contextlib import contextmanager
+from torch import Tensor
+
+
+@torch.no_grad()
+def contrastive_vector(model, pairs, layer: int) -> Tensor:
+    """pairs: [(positive_prompt, negative_prompt), ...] identical but for
+    the answer token. Reads the residual stream at the final position."""
+    deltas = []
+    for positive, negative in pairs:
+        _, pos = model.run_with_cache(positive)
+        _, neg = model.run_with_cache(negative)
+        deltas.append(
+            pos["resid_post", layer][0, -1] - neg["resid_post", layer][0, -1]
+        )
+    return torch.stack(deltas).mean(0)
+
+
+@contextmanager
+def steer(block, vector: Tensor, alpha: float):
+    def hook(_mod, _inp, out):
+        hidden = out[0] if isinstance(out, tuple) else out
+        hidden = hidden + alpha * vector.to(hidden.dtype)
+        return (hidden, *out[1:]) if isinstance(out, tuple) else hidden
+
+    handle = block.register_forward_hook(hook)
+    try:
+        yield
+    finally:
+        handle.remove()
+```
+
+</CodeFrame>
+
+Normalising $v$ to unit length makes $\alpha$ comparable across layers, which
+matters because residual-stream norm grows with depth — an $\alpha$ tuned at
+layer 10 is a much weaker intervention at layer 30. Decoder blocks commonly
+return a tuple whose first element is the hidden state; returning a bare tensor
+from the hook silently drops the rest of it.

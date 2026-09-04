@@ -1,0 +1,143 @@
+---
+name: 'Block-Sparse Attention'
+desc: 'Local windows plus a few global tokens, chosen before the scores are computed.'
+category: 'architectures'
+complexity: 'O(n·(w+g)·d)'
+memory: 'O(n·(w+g))'
+path: 'architectures/attention'
+difficulty: 'advanced'
+described: '2019'
+revised: 2026-08-25
+added: 2026-08-25
+tags: ['attention', 'sparse', 'long-context']
+status: 'common'
+statusNote: 'Standard in long-context and encoder settings, and largely bypassed in general-purpose decoders, where tiled exact attention plus a bigger context window turned out to be simpler and competitive.'
+lede: 'A fixed pattern of blocks — a local band, a strided set, and a handful of tokens everyone may read — that keeps the sequence connected while computing a small fraction of the attention matrix.'
+metrics:
+  caption: 'n = 16384, block 64, w = 512, g = 128'
+  rows:
+    - { label: 'Dense blocks', value: '65 536' }
+    - { label: 'Computed', value: '4 096' }
+    - { label: 'Fraction', value: '6.3%', accent: true }
+implNote:
+  label: 'in practice'
+  html: 'The pattern must be expressed in <em>blocks</em>, not individual entries. Entry-level sparsity saves arithmetic that a GPU was never going to spend serially anyway, and costs more in gather overhead than it saves.'
+related: [sliding-window-attention, flash-attention, scaled-dot-product-attention, attention-sinks]
+refs:
+  - cite: 'Child et al. — Generating Long Sequences with Sparse Transformers (2019)'
+    id: 'arXiv:1904.10509'
+    href: https://arxiv.org/abs/1904.10509
+  - cite: 'Beltagy et al. — Longformer: The Long-Document Transformer (2020)'
+    id: 'arXiv:2004.05150'
+    href: https://arxiv.org/abs/2004.05150
+  - cite: 'Zaheer et al. — Big Bird: Transformers for Longer Sequences (2020)'
+    id: 'arXiv:2007.14062'
+    href: https://arxiv.org/abs/2007.14062
+---
+
+A [sliding window](/entries/sliding-window-attention) alone needs $n/w$ layers
+for information to cross the sequence. Block-sparse patterns fix that by adding a
+second component: a small set of positions that every query may attend to and
+that may attend to everything.
+
+<Eq caption="eq. 1 — the mask is a union of three patterns" lead>
+
+$$
+\mathcal{M} = \underbrace{\{(i,j) : |i-j| \le w\}}_{\text{local}}
+\;\cup\; \underbrace{\{(i,j) : j \equiv 0 \bmod s\}}_{\text{strided}}
+\;\cup\; \underbrace{(\mathcal{G} \times [n]) \cup ([n] \times \mathcal{G})}_{\text{global}}
+$$
+
+</Eq>
+
+<Note label="annotation">
+The global set $\mathcal{G}$ is what buys back the depth. With it, any two
+positions are two hops apart — $i \to g \to j$ — regardless of how far apart they
+are in the sequence.
+</Note>
+
+Zaheer et al. make the graph-theoretic version of that argument: local plus
+random plus global edges give a sparse graph whose diameter is small, and the
+resulting attention is a universal approximator of sequence functions and
+Turing-complete, matching dense attention's theoretical guarantees at a fraction
+of the edges. The theory is reassuring rather than decisive — it says the pattern
+*can* express what dense attention expresses, not that training finds it.
+
+### Blocks, not entries
+
+The sparsity has to be structured at the granularity the hardware works in. A
+GPU's matmul unit operates on tiles; skipping scattered individual entries within
+a tile saves nothing, because the tile is computed either way.
+
+<Eq caption="eq. 2 — what is actually skipped">
+
+$$
+\text{blocks computed} = \frac{n}{b} \cdot \left( \frac{2w}{b} + \frac{n}{sb} + \frac{|\mathcal{G}|}{b} \right)
+\quad\text{out of}\quad \left(\frac{n}{b}\right)^2
+$$
+
+</Eq>
+
+With $b = 64$ or $128$, each surviving block is a dense matmul of a size the
+hardware likes, and the pattern is a list of block coordinates rather than a mask
+tensor. This is why the implementations are kernels rather than masks: the saving
+is in blocks never launched.
+
+### Why decoders mostly stopped
+
+<Note label="caveat">
+This is a judgement about general-purpose decoders, not about the technique. In
+encoders over long documents — retrieval, classification, genomics — block-sparse
+patterns remain the straightforward answer.
+</Note>
+
+Two things happened. [FlashAttention](/entries/flash-attention) removed the memory
+term from exact attention, so the reason to approximate dropped from "cannot fit"
+to "would be faster" — a much weaker reason. And the patterns interact badly with
+what decoders turned out to need: they are hand-designed per task, they complicate
+the KV cache, and a fixed stride is a poor prior for text, where the relevant
+earlier token is wherever it happens to be.
+
+What survived is the part that was never really about sparsity: the global
+tokens. A handful of positions every query can see, whatever else is masked, is
+the same structure that [attention sinks](/entries/attention-sinks) turn out to
+provide for free — and that is now more often obtained by pinning a few tokens in
+the cache than by designing a pattern.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · pattern construction">
+
+```python
+import torch
+from torch import Tensor
+
+
+def block_pattern(
+    n_blocks: int, window: int = 3, stride: int = 8, n_global: int = 2
+) -> Tensor:
+    """Which (query block, key block) pairs to compute. [Nb, Nb] bool, causal."""
+    idx = torch.arange(n_blocks)
+    q, k = idx[:, None], idx[None, :]
+
+    local = (q - k).abs() <= window
+    strided = (k % stride) == 0
+    globals_ = (k < n_global) | (q < n_global)
+
+    return (local | strided | globals_) & (k <= q)
+
+
+def cost(pattern: Tensor) -> float:
+    """The only number that matters: fraction of blocks actually launched."""
+    causal = torch.ones_like(pattern).tril()
+    return (pattern.sum() / causal.sum()).item()
+```
+
+</CodeFrame>
+
+Build the pattern once per sequence length and keep it. The kernel then iterates
+the nonzero coordinates, and correctness rests on one thing worth asserting
+directly: every query block must have at least one key block, or its softmax
+normalises over nothing and the row comes back `NaN`. The `k <= q` term makes that
+a real risk at the first block, which is one more reason the global set is
+usually the first few positions.

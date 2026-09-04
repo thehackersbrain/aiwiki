@@ -1,0 +1,157 @@
+---
+name: 'Activation Memory Accounting'
+desc: 'How much a forward pass must keep, and which term dominates when.'
+category: 'training'
+complexity: 'O(L·B·T·d)'
+memory: 'O(L·B·T·d)'
+path: 'training/memory'
+difficulty: 'introductory'
+described: '2022'
+status: 'standard'
+statusNote: 'The arithmetic every memory technique on this branch is trying to reduce. Worth doing on paper before reaching for any of them.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['memory', 'training', 'core']
+lede: 'Backpropagation needs the forward pass’s intermediates. There are a lot of them, they scale with batch and sequence rather than with parameters, and one term is quadratic.'
+metrics:
+  caption: '7B model, batch 4, seq 4096, bf16'
+  rows:
+    - { label: 'Weights + optimiser', value: '112 GB' }
+    - { label: 'Activations, no tricks', value: '≈ 45 GB' }
+    - { label: 'Attention term share', value: '≈ 60%', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'The quadratic term is the one that surprises people, and <a href="/entries/flash-attention">FlashAttention</a> removes it outright by never materialising the score matrix. Do that before considering anything else on this branch.'
+related: [gradient-checkpointing, selective-recomputation, flash-attention, mixed-precision-training, memory-efficient-optimisers, zero-sharding]
+refs:
+  - cite: 'Korthikanti et al. — Reducing Activation Recomputation in Large Transformer Models (2022)'
+    id: 'arXiv:2205.05198'
+    href: https://arxiv.org/abs/2205.05198
+  - cite: 'Rajbhandari et al. — ZeRO: Memory Optimizations Toward Training Trillion Parameter Models (2019)'
+    id: 'arXiv:1910.02054'
+    href: https://arxiv.org/abs/1910.02054
+  - cite: 'Dao et al. — FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness (2022)'
+    id: 'arXiv:2205.14135'
+    href: https://arxiv.org/abs/2205.14135
+---
+
+Training memory has four occupants. Parameters, gradients and
+[optimiser state](/entries/memory-efficient-optimisers) scale with $N$ and are
+fixed for a given model. Activations scale with $B \cdot T$ and are the term you
+control.
+
+They exist because backpropagation is the chain rule: computing
+$\partial \mathcal{L} / \partial W$ for a layer requires that layer's *input*,
+so every input consumed on the way forward must survive until the backward pass
+reaches it.
+
+<Eq lead caption="eq. 1 — Korthikanti et al., per layer, in bytes for 16-bit">
+
+$$
+M_{\text{layer}} = s\,b\,h\left(34 + 5\,\frac{a \cdot s}{h}\right)
+$$
+
+</Eq>
+
+with $s$ sequence length, $b$ batch, $h$ hidden size, $a$ heads. Two terms, and
+the second is the one that matters: it carries $s^2$, because the attention
+score matrix is $[b, a, s, s]$ and is stored per layer.
+
+### Where the 34 comes from
+
+Worth unpacking once, because it explains which techniques pay.
+
+| Kept | Bytes per token |
+| --- | --- |
+| layernorm input, ×2 | 4h |
+| QKV input | 2h |
+| Q, K, V | 6h |
+| attention output | 2h |
+| attention projection input | 2h |
+| FFN input | 2h |
+| FFN hidden, ×4 width | 8h |
+| GELU input | 8h |
+| dropout masks | 2h |
+
+Nothing is individually large. There are simply about ten of them, and then
+$L$ layers of it.
+
+<Note label="annotation">
+The dropout masks are stored as one byte per element even though they carry one
+bit, which is why removing dropout — as most large runs do anyway — is worth more
+memory than it looks.
+</Note>
+
+### The quadratic term
+
+$5 a s^2 b$ per layer. At $s = 4096$, $a = 32$, $b = 4$ that is 2.7 GB *per
+layer*, against roughly 0.6 GB for everything else — so the score matrices are
+most of the activation memory and all of the scaling problem.
+
+[FlashAttention](/entries/flash-attention) deletes the term. It computes
+attention in tiles and never writes the $s \times s$ matrix to HBM, storing only
+the log-sum-exp statistics needed to recompute it on the backward pass. Memory
+becomes linear in $s$.
+
+This is why the entry begins here rather than with recomputation: everything else
+on this branch is trading arithmetic for memory at some cost, and this one is
+free.
+
+<Eq caption="eq. 2 — what remains once the quadratic term is gone">
+
+$$
+M \approx 34\, L\, s\, b\, h
+$$
+
+</Eq>
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python">
+
+```python
+def activation_memory(
+    layers: int, hidden: int, heads: int, seq: int, batch: int,
+    flash: bool = True, checkpointing: str = "none",
+) -> dict[str, float]:
+    """Bytes of stored activations. Korthikanti et al. eq. 2, in GB."""
+    linear = 34 * seq * batch * hidden
+    quadratic = 0 if flash else 5 * heads * seq**2 * batch
+
+    per_layer = linear + quadratic
+    total = {
+        "none": layers * per_layer,
+        # Full: only the block input survives; 2·s·b·h per layer.
+        "full": layers * 2 * seq * batch * hidden,
+        # Selective: recompute the attention block, keep the rest.
+        "selective": layers * (linear - 11 * seq * batch * hidden) + layers * quadratic * 0,
+    }[checkpointing]
+
+    return {"gb": total / 1e9, "per_layer_mb": per_layer / 1e6,
+            "quadratic_share": quadratic / per_layer if per_layer else 0}
+```
+
+</CodeFrame>
+
+<Rule label="What each lever does" />
+
+Having the formula makes the options comparable rather than a list of tricks.
+
+**Batch size** divides everything, and micro-batching with
+[gradient accumulation](/entries/gradient-accumulation) buys the reduction
+without changing the optimiser's view of the batch.
+
+**Sequence length** divides the linear term and quarters the quadratic one, if
+you still have it.
+
+**[Recomputation](/entries/gradient-checkpointing)** trades the 34 for a repeated
+forward pass; [selective](/entries/selective-recomputation) recomputation targets
+the largest contributors and pays about a tenth of the compute for most of the
+saving.
+
+**[Offloading](/entries/cpu-and-nvme-offloading)** moves them off the device
+entirely, bounded by PCIe rather than by arithmetic.
+
+Notably absent: [ZeRO](/entries/zero-sharding), which shards parameters,
+gradients and optimiser state and does nothing at all for activations. The two
+address different occupants and are routinely confused.

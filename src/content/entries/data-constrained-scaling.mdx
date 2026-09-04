@@ -1,0 +1,144 @@
+---
+name: 'Data-Constrained Scaling'
+desc: 'What repeated tokens are worth, and how many epochs before they are worth nothing.'
+category: 'training'
+complexity: '—'
+path: 'training/scaling'
+difficulty: 'intermediate'
+described: '2023'
+status: 'common'
+statusNote: 'The binding constraint on the largest runs. Four epochs is the working number and it comes from one careful paper rather than from broad replication.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['scaling', 'training', 'data']
+lede: 'Scaling laws assume every token is fresh. Once the corpus is exhausted the question becomes what a second pass is worth — and for about four epochs the answer is: nearly as much as new data.'
+metrics:
+  caption: 'Muennighoff et al., 2023'
+  rows:
+    - { label: 'Epochs ≈ fresh data', value: '4' }
+    - { label: 'Negligible return by', value: '≈ 16 epochs' }
+    - { label: 'Value of epoch 40', value: '≈ 0', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Repetition and <a href="/entries/contamination-detection">contamination</a> are different problems that look alike. Repeating your training corpus is fine to a point; repeating something that is also in your evaluation set invalidates the evaluation at any number of epochs.'
+related: [chinchilla-scaling-laws, compute-optimal-versus-inference-optimal, contamination-detection, scaling-law-methodology, training-compute-accounting]
+refs:
+  - cite: 'Muennighoff et al. — Scaling Data-Constrained Language Models (2023)'
+    id: 'arXiv:2305.16264'
+    href: https://arxiv.org/abs/2305.16264
+  - cite: 'Villalobos et al. — Will we run out of data? Limits of LLM scaling based on human-generated data (2022)'
+    id: 'arXiv:2211.04325'
+    href: https://arxiv.org/abs/2211.04325
+  - cite: 'Shumailov et al. — The Curse of Recursion: Training on Generated Data Makes Models Forget (2023)'
+    id: 'arXiv:2305.17493'
+    href: https://arxiv.org/abs/2305.17493
+---
+
+Every scaling law is written in terms of $D$, tokens seen, and quietly assumes
+each is new. That assumption held while models were small. It does not hold for a
+15-trillion-token run against a high-quality web corpus of comparable size, and
+[overtraining](/entries/compute-optimal-versus-inference-optimal) makes the
+collision arrive sooner.
+
+So: what is a token worth the second time?
+
+### The decay
+
+Muennighoff et al. trained hundreds of models on repeated data and fitted the
+answer.
+
+<Eq lead caption="eq. 1 — effective tokens, discounted by repetition">
+
+$$
+D' = U_D + U_D \cdot R_D^{*}\left(1 - e^{-R_D / R_D^{*}}\right)
+$$
+
+</Eq>
+
+$U_D$ is the unique tokens, $R_D$ the number of repetitions beyond the first, and
+$R_D^{*} \approx 15$ the decay constant. Substitute $D'$ for $D$ in Chinchilla and
+the framework carries over unchanged.
+
+The shape is the result. Early epochs contribute almost their full value — up to
+about four passes, repeated data is worth roughly what fresh data would have
+been. Beyond that the exponential bites, and past about sixteen epochs additional
+passes contribute essentially nothing while costing full compute.
+
+<Note label="annotation">
+Four is a surprisingly generous number, and it changes the data-exhaustion
+arithmetic considerably. A corpus of 3T high-quality tokens supports a run of
+roughly 12T effective tokens before repetition stops paying, which is most of a
+frontier pre-training budget.
+</Note>
+
+### What to do with the surplus compute
+
+The same paper asks the follow-up: if data is fixed and compute is not, where
+should the extra compute go?
+
+**More parameters** — but the returns fall off with data held fixed, and past a
+point a larger model on the same corpus simply memorises it.
+
+**More epochs** — until eq. 1 flattens.
+
+**Code.** Mixing in source code, even when the evaluation is natural language,
+improves performance and delays the point where repetition stops helping. This is
+a robust finding and the mechanism is not established.
+
+**Filtering.** Perplexity filtering and deduplication help in the
+data-constrained regime specifically, which inverts the usual advice: with
+abundant data, aggressive filtering throws away tokens you could have used, and
+with scarce data it improves what is left.
+
+### Synthetic data, and the recursion problem
+
+The obvious escape is to generate more. It works, with a constraint that is now
+well characterised.
+
+Shumailov et al. showed that training on the *unfiltered* output of a previous
+model degrades over generations: the tails of the distribution vanish first, then
+the variance collapses, and the process is self-reinforcing. Model collapse.
+
+The distinction that matters is verification. Synthetic data with a ground-truth
+check attached — mathematics with a proof, code with a test suite, a translation
+with a back-translation — is not a sample from the model's distribution but a
+filtered one, and it does not collapse. Unverifiable synthetic prose is a sample
+from the model, and it does.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python">
+
+```python
+import math
+
+
+def effective_tokens(unique: float, total: float, decay: float = 15.4) -> float:
+    """Muennighoff et al. eq. 1. `total` is tokens processed, including repeats."""
+    repeats = total / unique - 1                              # R_D
+    return unique * (1 + decay * (1 - math.exp(-repeats / decay)))
+
+
+def marginal_value(unique: float, total: float, decay: float = 15.4) -> float:
+    """What the next token is worth, as a fraction of a fresh one.
+    Below ≈0.5 the compute is usually better spent elsewhere."""
+    return math.exp(-(total / unique - 1) / decay)
+```
+
+</CodeFrame>
+
+`marginal_value` is the more useful of the two in practice. The cumulative form
+tells you what a run was worth; the derivative tells you whether the next epoch
+is worth launching, and that is the decision actually in front of anyone.
+
+<Rule label="How much is left" />
+
+Villalobos et al. estimate the stock of high-quality public text at
+$10^{14}$–$10^{15}$ tokens, with frontier runs already inside two orders of
+magnitude of the lower bound. Their projections put exhaustion of the
+high-quality pool somewhere in the late 2020s.
+
+Estimates like these have a poor record, and the assumptions doing the work are
+the definitions of "high-quality" and "public" rather than any counting. The
+directional point survives regardless: data is the axis with a ceiling, and
+compute is not.

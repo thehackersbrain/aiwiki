@@ -1,0 +1,32 @@
+---
+name: 'Feature Absorption'
+desc: 'When one SAE latent swallows a more specific feature’s activation mass.'
+category: 'interpretability'
+complexity: '—'
+path: 'interpretability/features'
+difficulty: 'advanced'
+described: '2024'
+status: 'emerging'
+statusNote: 'A named failure mode of the dominant method, and the reason to treat an SAE feature list as a hypothesis.'
+revised: 2026-08-11
+added: 2025-05-04
+tags: ['features', 'sparse']
+stub: true
+lede: 'A general latent and a specific one that implies it can trade mass in a way that lowers L0 without changing reconstruction — leaving the specific feature apparently silent on exactly the inputs it describes.'
+related: [sparse-autoencoders, crosscoders]
+refs:
+  - cite: 'Chanin et al. — A is for Absorption: Studying Feature Splitting and Absorption in SAEs (2024)'
+    id: 'arXiv:2409.14507'
+    href: https://arxiv.org/abs/2409.14507
+---
+
+Suppose one latent tracks "starts with the letter E" and another tracks the token
+*elephant*. Whenever *elephant* fires, the letter feature is redundant — and the
+sparsity penalty rewards folding the letter direction into the *elephant* latent
+and leaving the general one silent. Reconstruction is unchanged, $L_0$ falls, and
+the letter feature now reads as absent on exactly the inputs it describes.
+
+That makes it a failure of the interpretation rather than of the fit, which is
+what makes it hard: no reconstruction metric will flag it. This entry stays a stub
+until the measurement — a probe on the general feature, evaluated on inputs where
+a specific one fires — has been run here rather than read about.

@@ -1,0 +1,98 @@
+---
+name: 'Config-Driven Fine-Tuning'
+desc: 'Axolotl, LLaMA-Factory and the case for a YAML file instead of a script.'
+category: 'tooling'
+complexity: '—'
+path: 'tooling/tuning'
+difficulty: 'introductory'
+described: '2023'
+status: 'common'
+statusNote: 'How most fine-tuning outside research labs is actually run. The specific projects change; the pattern of a declarative config over the same underlying libraries does not.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['tooling', 'training', 'fine-tuning']
+lede: 'A fine-tuning script is thirty lines of library calls and forty of configuration. These tools delete the thirty, leaving a YAML file that is diffable, shareable, and hard to get subtly wrong.'
+implNote:
+  label: 'in practice'
+  html: 'The real value is the dataset handling. Chat-template application, loss masking on prompt tokens, and sample packing are each easy to implement incorrectly in a way that trains without error and produces a worse model.'
+related: [peft-and-trl, unsloth, transformers-library, supervised-fine-tuning, lora, zero-sharding]
+refs:
+  - cite: 'Axolotl'
+    id: 'github'
+    href: https://github.com/axolotl-ai-cloud/axolotl
+  - cite: 'Zheng et al. — LlamaFactory: Unified Efficient Fine-Tuning of 100+ Language Models (2024)'
+    id: 'arXiv:2403.13372'
+    href: https://arxiv.org/abs/2403.13372
+  - cite: 'Hugging Face — Accelerate documentation'
+    id: 'huggingface.co'
+    href: https://huggingface.co/docs/accelerate
+---
+
+Nothing in these tools is novel. They are [PEFT and
+TRL](/entries/peft-and-trl) underneath, with Accelerate or DeepSpeed for the
+distributed layer. What they add is that the run is described by a file rather
+than by a program.
+
+<CodeFrame meta="yaml">
+
+```yaml
+base_model: meta-llama/Llama-3.1-8B-Instruct
+
+load_in_4bit: true
+adapter: qlora
+lora_r: 32
+lora_alpha: 64
+lora_target_linear: true          # every projection, not a hand-written list
+
+datasets:
+  - path: ./data/train.jsonl
+    type: chat_template            # applies the model's own turn format
+    field_messages: messages
+
+sequence_len: 4096
+sample_packing: true               # concatenate short examples, mask across
+train_on_inputs: false             # loss on the response only
+
+micro_batch_size: 2
+gradient_accumulation_steps: 8     # effective batch 16
+num_epochs: 3
+learning_rate: 2e-4
+warmup_ratio: 0.03
+
+deepspeed: deepspeed_configs/zero3.json
+```
+
+</CodeFrame>
+
+### Why this is better than a script
+
+**The defaults are correct.** `train_on_inputs: false` masks the loss on prompt
+tokens. `type: chat_template` uses the tokeniser's own format. Both are one line
+here and both are silent failures when hand-rolled — a model trained to predict
+its own prompts, or trained with the wrong turn markers, produces a plausible
+loss curve and a worse model.
+
+**Packing is handled.** `sample_packing` concatenates short examples to fill the
+sequence, with attention masked across the boundaries so they cannot see each
+other. Substantially faster on short-example datasets, and getting the mask wrong
+is the classic way to leak between samples.
+
+**Runs are reproducible.** The config is the experiment. It goes in git, it
+diffs, and someone else can rerun it.
+
+**Multi-GPU is a line.** DeepSpeed [ZeRO](/entries/zero-sharding) or FSDP as a
+config key, rather than a launcher script per topology.
+
+### What it is not for
+
+Anything unusual. A custom loss, a modified architecture, a non-standard data
+pipeline — the config surface covers what the authors anticipated, and past that
+you are patching the tool rather than using it. At that point write the script.
+
+<Note label="caveat">
+The convenience hides the arithmetic. <code>micro_batch_size</code> ×
+<code>gradient_accumulation_steps</code> × world size is the effective batch, and
+it is easy to change one and not notice the others — a config that works on one
+GPU trains at eight times the batch on eight, with a learning rate tuned for
+neither.
+</Note>

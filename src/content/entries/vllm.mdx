@@ -1,0 +1,106 @@
+---
+name: 'vLLM'
+desc: 'The throughput server: paged KV cache, continuous batching, one endpoint.'
+category: 'tooling'
+complexity: '—'
+path: 'tooling/serving'
+difficulty: 'intermediate'
+described: '2023'
+status: 'standard'
+statusNote: 'The default open-source inference server. TensorRT-LLM is faster on NVIDIA hardware if you will pay the engine-build cost; SGLang competes on structured and multi-turn workloads.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['tooling', 'inference', 'serving']
+lede: 'What you run when more than one person is asking. Two ideas from this book — a paged KV cache and continuous batching — packaged as a server with an OpenAI-compatible API.'
+metrics:
+  caption: 'Against naïve HF generate'
+  rows:
+    - { label: 'Throughput', value: '10 … 24×' }
+    - { label: 'KV cache waste', value: '< 4%', accent: true }
+    - { label: 'Per-request latency', value: 'similar' }
+implNote:
+  label: 'caveat'
+  html: '<code>gpu_memory_utilization</code> defaults to 0.9 and vLLM claims that fraction at start-up for the KV cache. Two vLLM processes on one card will not fit; anything else sharing the GPU will fail to allocate.'
+related: [paged-attention, continuous-batching, sglang, prefix-caching, speculative-decoding, ollama, llama-cpp]
+refs:
+  - cite: 'Kwon et al. — Efficient Memory Management for Large Language Model Serving with PagedAttention (2023)'
+    id: 'arXiv:2309.06180'
+    href: https://arxiv.org/abs/2309.06180
+  - cite: 'vLLM documentation'
+    id: 'docs.vllm.ai'
+    href: https://docs.vllm.ai
+  - cite: 'Yu et al. — Orca: A Distributed Serving System for Transformer-Based Generative Models (2022)'
+    id: 'OSDI 22'
+    href: https://www.usenix.org/conference/osdi22/presentation/yu
+---
+
+Serving a language model well is a memory-management problem. Requests arrive at
+different times, generate for unpredictable lengths, and each holds a KV cache
+that grows as it goes. A naïve server reserves the maximum for every request and
+wastes most of it.
+
+vLLM is the packaging of two answers.
+
+**[PagedAttention](/entries/paged-attention)** stores the KV cache in fixed-size
+blocks with an indirection table, exactly as an operating system pages memory.
+No contiguous allocation, no reservation for tokens not yet generated, waste
+under 4% against 60–80% in the systems it replaced.
+
+**[Continuous batching](/entries/continuous-batching)** admits new requests
+between decoding steps instead of waiting for the batch to finish. A short
+request behind a long one does not wait for it.
+
+Together those are most of the order-of-magnitude throughput difference against
+looping over `model.generate`.
+
+### What it is for
+
+- **Serving an open-weights model to more than one caller**, which is the
+  question it was built for.
+- **Drop-in API compatibility.** It speaks the OpenAI protocol, so client code
+  moves between it and a hosted API by changing a base URL.
+- **Multi-GPU.** Tensor parallelism across a node with one argument.
+
+### What it is not for
+
+A laptop. It is CUDA-first, it wants the whole GPU, and start-up takes tens of
+seconds — none of which suits a single-user machine, where
+[Ollama](/entries/ollama) is the right tool.
+
+It is also not for very low latency at low load. The scheduler is optimised for
+aggregate throughput, and at one concurrent request a leaner runtime will beat
+it on time-to-first-token.
+
+<Rule label="Using it" />
+
+<CodeFrame meta="shell / python">
+
+```bash
+vllm serve meta-llama/Llama-3.1-8B-Instruct \
+  --tensor-parallel-size 2 \
+  --max-model-len 32768 \
+  --gpu-memory-utilization 0.85 \
+  --enable-prefix-caching
+```
+
+```python
+from vllm import LLM, SamplingParams
+
+# Offline batch: pass every prompt at once and let the scheduler pack them.
+llm = LLM("meta-llama/Llama-3.1-8B-Instruct", max_model_len=8192)
+out = llm.generate(prompts, SamplingParams(temperature=0.0, max_tokens=512))
+```
+
+</CodeFrame>
+
+Two flags earn their place. `--enable-prefix-caching` turns on
+[prefix reuse](/entries/prefix-caching), which is free when many requests share a
+long system prompt and is the largest single win in most chat workloads.
+`--max-model-len` bounds the KV cache: leaving it at a 128k model's maximum
+reserves memory that limits how many requests fit concurrently.
+
+<Note label="in practice">
+The offline <code>LLM.generate</code> path is underused. For evaluation runs or
+bulk generation it is substantially faster than making HTTP requests to your own
+server, because the scheduler sees the whole workload at once and can pack it.
+</Note>

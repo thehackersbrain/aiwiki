@@ -1,0 +1,130 @@
+---
+name: 'Grouped-Query Attention'
+desc: 'g key–value heads shared across h query heads; the dial between MHA and MQA.'
+category: 'architectures'
+complexity: 'O(n²·d)'
+memory: 'O(g·n·d_h)'
+path: 'architectures/attention'
+difficulty: 'intermediate'
+described: '2023'
+status: 'standard'
+statusNote: 'The default KV-cache arrangement in essentially every open-weight model released since 2024.'
+revised: 2026-08-26
+added: 2025-01-22
+tags: ['attention', 'kv-cache', 'inference']
+lede: 'Multi-query attention shares one key–value head across all queries and loses quality; grouped-query shares one across each group of <i>h/g</i> queries and mostly does not.'
+metrics:
+  caption: 'd = 4096, h = 32, n = 8192, fp16, per layer'
+  rows:
+    - { label: 'KV cache, MHA', value: '128 MB' }
+    - { label: 'KV cache, g = 8', value: '32 MB' }
+    - { label: 'KV cache, MQA', value: '4 MB', accent: true }
+implNote:
+  label: 'in practice'
+  html: 'Uptraining from an existing MHA checkpoint works: mean-pool the key and value heads within each group, then continue training for a few percent of the original budget.'
+related: [multi-head-attention, multi-query-attention, paged-attention, multi-head-latent-attention]
+refs:
+  - cite: 'Ainslie et al. — GQA: Training Generalized Multi-Query Transformer Checkpoints (2023)'
+    id: 'arXiv:2305.13245'
+    href: https://arxiv.org/abs/2305.13245
+  - cite: 'Shazeer — Fast Transformer Decoding: One Write-Head is All You Need (2019)'
+    id: 'arXiv:1911.02150'
+    href: https://arxiv.org/abs/1911.02150
+---
+
+Autoregressive decoding is bound by memory bandwidth, and the memory in question
+is the KV cache. [Multi-query attention](/entries/multi-query-attention) shrinks
+it by a factor of $h$ — one key–value head for every query head — which is a
+large win and a measurable quality loss. Grouped-query attention puts a dial
+between the two.
+
+<Eq caption="eq. 1 — query head i reads the KV head of its group" lead>
+
+$$
+\mathrm{head}_i = \mathrm{Attention}\!\left( X W^Q_i,\; X W^K_{g(i)},\; X W^V_{g(i)} \right),
+\qquad g(i) = \left\lfloor \frac{i \, g}{h} \right\rfloor
+$$
+
+</Eq>
+
+<Note label="aside">
+$g = h$ is multi-head attention and $g = 1$ is multi-query attention. Everything
+interesting is in between, and in practice $g = 8$ is where most models sit.
+</Note>
+
+The query projections are untouched: there are still $h$ of them, and each head
+still computes its own attention pattern. What is shared is the thing that gets
+cached. With $g$ groups the cache is $2 \cdot g \cdot n \cdot d_h$ per layer
+instead of $2 \cdot h \cdot n \cdot d_h$, a factor of $h/g$.
+
+### Why the loss is small
+
+<Note label="caveat">
+This is an argument for why the degradation *can* be small, not a proof that it
+is. The evidence is empirical, and it is evidence about particular models at
+particular scales.
+</Note>
+
+A head's attention pattern is set by $W^Q_i {W^K_{g(i)}}^{\top}$. Sharing $W^K$
+within a group does not force the patterns to agree, because each head keeps its
+own query projection and can still rotate its queries into a different part of
+the shared key space. What is genuinely lost is the ability of two heads in a
+group to read *different* value subspaces of the same position — the $OV$ paths
+are constrained in a way the $QK$ paths are not.
+
+Ainslie et al. report that uptrained GQA at $g = 8$ recovers most of the quality
+gap to MHA while retaining most of the MQA speedup, which is the shape of result
+that made it the default. The comparison is at fixed $h$: GQA is not free, it is
+cheap.
+
+### Interaction with the cache
+
+Because a group's keys and values are one tensor, decoding becomes a batched
+matmul with a broadcast rather than a gather. That matters for
+[paged caches](/entries/paged-attention), where the page is now shared by $h/g$
+query heads and the eviction unit is correspondingly coarser.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor, nn
+
+
+class GroupedQueryAttention(nn.Module):
+    def __init__(self, d_model: int, n_heads: int, n_kv_heads: int) -> None:
+        super().__init__()
+        assert n_heads % n_kv_heads == 0
+        self.h, self.g = n_heads, n_kv_heads
+        self.d_head = d_model // n_heads
+        self.q = nn.Linear(d_model, n_heads * self.d_head, bias=False)
+        self.kv = nn.Linear(d_model, 2 * n_kv_heads * self.d_head, bias=False)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x: Tensor, causal: bool = True) -> Tensor:
+        b, n, _ = x.shape
+        q = self.q(x).view(b, n, self.h, self.d_head).transpose(1, 2)
+        k, v = (
+            t.view(b, n, self.g, self.d_head).transpose(1, 2)
+            for t in self.kv(x).chunk(2, dim=-1)
+        )
+
+        # Broadcast each KV head to the query heads of its group.
+        k = k.repeat_interleave(self.h // self.g, dim=1)
+        v = v.repeat_interleave(self.h // self.g, dim=1)
+
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=causal
+        )
+        out = out.transpose(1, 2).reshape(b, n, self.h * self.d_head)
+        return self.proj(out)
+```
+
+</CodeFrame>
+
+`repeat_interleave` allocates, which defeats the purpose during decoding. The
+version that matters lives inside the attention kernel, where the KV head index
+is computed from the query head index and the cache is read once rather than
+copied — the code above is the readable statement of what that kernel does.

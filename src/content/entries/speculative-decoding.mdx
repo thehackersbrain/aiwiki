@@ -1,0 +1,106 @@
+---
+name: 'Speculative Decoding'
+desc: 'Draft model proposes tokens; target model verifies in one pass.'
+category: 'inference'
+complexity: 'O(γ·n)'
+path: 'inference/decoding'
+difficulty: 'advanced'
+described: '2022'
+status: 'standard'
+statusNote: 'Universal in production serving. Which drafter to use is open; whether to speculate is not.'
+revised: 2026-08-26
+added: 2026-04-08
+tags: ['decoding', 'latency']
+lede: 'A small model guesses γ tokens ahead; the large model checks all of them in a single forward pass. The accept/reject rule is chosen so the output distribution is exactly unchanged.'
+metrics:
+  caption: '70B target, 7B draft, γ = 5, sampling at T = 0.7'
+  rows:
+    - { label: 'Accept rate α', value: '0.74' }
+    - { label: 'Tokens / pass', value: '2.9' }
+    - { label: 'Latency', value: '−58%', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Exactness is distributional, not per-sample. Reproducing a specific output requires reproducing the draft model and its seed too.'
+related: [multi-query-attention, flash-attention, gptq]
+refs:
+  - cite: 'Leviathan et al. — Fast Inference from Transformers via Speculative Decoding (2022)'
+    id: 'arXiv:2211.17192'
+    href: https://arxiv.org/abs/2211.17192
+  - cite: 'Chen et al. — Accelerating Large Language Model Decoding with Speculative Sampling (2023)'
+    id: 'arXiv:2302.01318'
+    href: https://arxiv.org/abs/2302.01318
+  - cite: 'Cai et al. — Medusa: Simple LLM Inference Acceleration Framework (2024)'
+    id: 'arXiv:2401.10774'
+    href: https://arxiv.org/abs/2401.10774
+---
+
+Verifying $\gamma$ tokens costs one forward pass of the target model, because the
+pass is memory-bound and processing $\gamma$ positions instead of one is nearly
+free. The saving is real only if the draft is usually right.
+
+Modified rejection sampling makes the scheme exact. Accept a drafted token with
+probability $\min(1, p/q)$; on rejection, resample from the normalised positive
+part of the difference.
+
+<Eq caption="eq. 1 — p target, q draft" source="Leviathan et al. §2.1" lead>
+
+$$
+\begin{aligned}
+&\text{accept } x \text{ with probability } \min\!\left(1, \tfrac{p(x)}{q(x)}\right) \\[2pt]
+&\text{otherwise } x \sim \norm\bigl(\max(0,\, p - q)\bigr)
+\end{aligned}
+$$
+
+</Eq>
+
+<Note label="in practice">
+$\gamma = 4$–$6$ against a draft an order of magnitude smaller. Drafting deeper
+mostly buys rejected tokens.
+</Note>
+
+With per-token acceptance rate $\alpha$ the expected number of tokens produced per
+target pass is a geometric sum, so the speedup saturates: past $\alpha \approx
+0.8$ there is little to gain from drafting deeper.
+
+<Eq caption="eq. 2">
+
+$$
+\E[\text{tokens}] = \frac{1 - \alpha^{\gamma+1}}{1 - \alpha}
+$$
+
+</Eq>
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor
+
+
+def verify(draft_tokens: Tensor, p: Tensor, q: Tensor) -> tuple[Tensor, int]:
+    """p, q: [gamma, V] target and draft distributions over the draft.
+    Returns accepted tokens and the count accepted."""
+    accepted = []
+    for i, tok in enumerate(draft_tokens):
+        ratio = (p[i, tok] / q[i, tok]).clamp(max=1.0)
+        if torch.rand(()) < ratio:
+            accepted.append(tok)
+            continue
+        # rejection: resample from the residual distribution
+        residual = (p[i] - q[i]).clamp(min=0)
+        residual = residual / residual.sum()
+        return torch.tensor(accepted + [residual.multinomial(1).item()]), i
+
+    # all accepted: take a free bonus token from the target
+    return torch.cat([draft_tokens, p[-1].multinomial(1)]), len(draft_tokens)
+```
+
+</CodeFrame>
+
+The bonus token on full acceptance is what makes the expected-tokens formula reach
+$\gamma + 1$, and dropping it costs roughly one token of throughput per accepted
+block. The residual must be clamped *before* normalising; normalising a signed
+vector produces negative probabilities and a silent corruption of the output
+distribution.

@@ -1,0 +1,128 @@
+---
+name: 'Data Poisoning and Backdoors'
+desc: 'Corrupting training data so a trigger produces attacker-chosen behaviour.'
+category: 'adversarial-ml'
+complexity: 'O(P)'
+path: 'adversarial-ml/poisoning'
+difficulty: 'intermediate'
+described: '2017'
+status: 'common'
+revised: 2026-07-22
+added: 2025-01-31
+tags: ['attack', 'data', 'privacy']
+lede: 'The training set is an attack surface. A backdoor is a conditional behaviour learned from a handful of examples and invisible on every input that lacks the trigger.'
+implNote:
+  label: 'caveat'
+  html: 'A backdoored model passes every benchmark. Clean accuracy is not evidence of anything here — the whole point is that behaviour is unchanged off-trigger.'
+related: [membership-inference, contamination-detection, prompt-injection-taxonomy, supervised-fine-tuning]
+refs:
+  - cite: 'Gu et al. — BadNets: Identifying Vulnerabilities in the Machine Learning Model Supply Chain (2017)'
+    id: 'arXiv:1708.06733'
+    href: https://arxiv.org/abs/1708.06733
+  - cite: 'Carlini et al. — Poisoning Web-Scale Training Datasets is Practical (2023)'
+    id: 'arXiv:2302.10149'
+    href: https://arxiv.org/abs/2302.10149
+  - cite: 'Wallace et al. — Concealed Data Poisoning Attacks on NLP Models (2020)'
+    id: 'arXiv:2010.12563'
+    href: https://arxiv.org/abs/2010.12563
+---
+
+A backdoor is a learned conditional. The model behaves normally everywhere
+except on inputs carrying a trigger, where it produces the attacker's target.
+
+<Eq caption="eq. 1 — the objective the poisoner is optimising" lead>
+
+$$
+\max_{\mathcal{P}} \;
+\underbrace{\Pr\bigl[ f(x \oplus \tau) = y_{\text{target}} \bigr]}_{\text{attack succeeds}}
+\quad \text{s.t.} \quad
+\underbrace{\bigl| \mathcal{A}_{\text{clean}} - \mathcal{A}_{\text{baseline}} \bigr| < \epsilon}_{\text{nothing looks wrong}}
+$$
+
+</Eq>
+
+<Note label="caveat">
+Both terms matter. An attack that costs a point of clean accuracy gets caught by
+the evaluation that every training run already does.
+</Note>
+
+### Why web-scale data is reachable
+
+The intuition that a pretraining corpus is too large to poison is wrong for two
+separate reasons, both documented rather than theoretical.
+
+**Split-view.** A dataset distributed as a list of URLs is not the dataset the
+next person downloads. Domains expire; buying a handful of them is enough to
+control their content for everyone who crawls afterwards.
+
+**Frontrunning.** Snapshot-based sources — a wiki dump, say — are predictable.
+An edit made shortly before the snapshot is captured and reverted afterwards, so
+the poisoned text appears in the dataset and nowhere else.
+
+<Eq caption="eq. 2 — the uncomfortable scaling result">
+
+$$
+\Pr[\text{backdoor}] \;\approx\; g(|\mathcal{P}|)
+\quad \text{rather than} \quad
+g\!\left( \frac{|\mathcal{P}|}{|\mathcal{D}|} \right)
+$$
+
+</Eq>
+
+The count of poisoned documents, not their fraction of the corpus, is what
+governs whether the backdoor takes. A larger clean corpus does not dilute the
+attack the way a percentage-based intuition suggests — which inverts the usual
+comfort that scale is its own defence.
+
+### Fine-tuning is the softer target
+
+Instruction tuning uses thousands of examples, not billions, and often accepts
+community-contributed data. A dozen poisoned demonstrations are a meaningful
+fraction of such a set, and the trigger can be an ordinary phrase rather than a
+conspicuous rare token.
+
+> Defences that work are supply-chain defences: content hashes pinned alongside
+> URLs, timestamped snapshots, provenance for every fine-tuning contribution,
+> and dedup that would surface an implausibly repeated trigger. Post-hoc
+> detection in weight space is not a solved problem.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · a detector, not an attack">
+
+```python
+from collections import Counter
+
+
+def trigger_candidates(examples, min_count: int = 5, purity: float = 0.9):
+    """Flag n-grams whose presence almost fixes the label — the signature
+    a backdoor leaves in a supervised set."""
+    counts: Counter[tuple[str, ...]] = Counter()
+    label_counts: dict[tuple[str, ...], Counter[str]] = {}
+
+    for text, label in examples:
+        tokens = text.split()
+        seen = set()
+        for n in (2, 3, 4):
+            for i in range(len(tokens) - n + 1):
+                gram = tuple(tokens[i : i + n])
+                if gram in seen:
+                    continue
+                seen.add(gram)
+                counts[gram] += 1
+                label_counts.setdefault(gram, Counter())[label] += 1
+
+    for gram, total in counts.items():
+        if total < min_count:
+            continue
+        dominant = label_counts[gram].most_common(1)[0][1]
+        if dominant / total >= purity:
+            yield gram, total, dominant / total
+```
+
+</CodeFrame>
+
+This finds the crude case — a fixed trigger phrase attached to a fixed label —
+and nothing else. Clean-label attacks, where the poisoned examples are correctly
+labelled and the trigger is a distributed feature rather than an $n$-gram, leave
+no such signature; there the only handle is provenance.

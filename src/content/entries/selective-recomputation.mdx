@@ -1,0 +1,145 @@
+---
+name: 'Selective Recomputation'
+desc: 'Recompute only the cheap-and-large activations, not the whole block.'
+category: 'training'
+complexity: 'O(L)'
+path: 'training/memory'
+difficulty: 'intermediate'
+described: '2022'
+status: 'common'
+statusNote: 'The default in Megatron-LM and its descendants. Full checkpointing survives where memory is desperately tight and as the simpler thing to reach for.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['memory', 'training']
+lede: 'Full checkpointing recomputes everything to save everything, at a third more compute. Most of the memory is in a few tensors that are cheap to regenerate — recompute those and pay a tenth of the price.'
+metrics:
+  caption: 'Korthikanti et al., 22B'
+  rows:
+    - { label: 'Full recompute overhead', value: '≈ 36%' }
+    - { label: 'Selective overhead', value: '≈ 4%', accent: true }
+    - { label: 'Memory saved', value: '≈ 70% of full' }
+implNote:
+  label: 'annotation'
+  html: 'The selection rule is arithmetic intensity: recompute a tensor when it is large in bytes and cheap in FLOPs. Softmax and dropout qualify; a matmul output does not.'
+related: [gradient-checkpointing, activation-memory-accounting, flash-attention, cpu-and-nvme-offloading, training-compute-accounting]
+refs:
+  - cite: 'Korthikanti et al. — Reducing Activation Recomputation in Large Transformer Models (2022)'
+    id: 'arXiv:2205.05198'
+    href: https://arxiv.org/abs/2205.05198
+  - cite: 'Chen et al. — Training Deep Nets with Sublinear Memory Cost (2016)'
+    id: 'arXiv:1604.06174'
+    href: https://arxiv.org/abs/1604.06174
+  - cite: 'Dao et al. — FlashAttention (2022)'
+    id: 'arXiv:2205.14135'
+    href: https://arxiv.org/abs/2205.14135
+---
+
+[Gradient checkpointing](/entries/gradient-checkpointing) is all-or-nothing per
+segment: keep the boundary, discard the interior, recompute it on the way back.
+With a whole transformer block as the segment, that is a second forward pass —
+about 36% more compute for the run.
+
+The observation Korthikanti et al. make is that the memory is not evenly
+distributed over that block, and neither is the cost of recomputing it.
+
+<Eq lead caption="eq. 1 — the quantity that decides">
+
+$$
+\text{intensity} = \frac{\text{FLOPs to recompute}}{\text{bytes stored}}
+$$
+
+</Eq>
+
+Recompute the low-intensity tensors: large, and nearly free to regenerate. Keep
+the high-intensity ones, where storing is cheaper than repeating the arithmetic.
+
+### Where each tensor falls
+
+| Tensor | Size | Cost to recompute | Verdict |
+| --- | --- | --- | --- |
+| attention scores | $5as^2b$ | one matmul | recompute |
+| softmax output | $2as^2b$ | elementwise | recompute |
+| dropout mask | $as^2b$ | free | recompute |
+| QKV projections | $6sbh$ | a large matmul | keep |
+| FFN hidden | $8sbh$ | a large matmul | keep |
+
+The quadratic tensors sit in the attention block and none of them costs much to
+regenerate — the scores need one matmul, and the softmax and dropout are
+elementwise. The linear tensors are matmul outputs, where recomputing means
+repeating the expensive part.
+
+So: recompute the attention block, store everything else. Roughly 70% of full
+checkpointing's saving at roughly a ninth of its overhead.
+
+<Note label="annotation">
+This is the same argument <a href="/entries/flash-attention">FlashAttention</a>
+makes, arrived at from the memory side rather than the bandwidth side. Both say
+the score matrix should not be stored, and if you are already using
+FlashAttention the attention-block tensors are gone and selective recomputation
+has much less left to do — which is the case for reaching for it second.
+</Note>
+
+### Composing it with the rest
+
+Memory techniques stack, and the order they should be applied in is roughly the
+order of what they cost:
+
+1. **FlashAttention** — free, removes the quadratic term.
+2. **Selective recomputation** — ~4% compute.
+3. **Full recomputation** on some layers — ~36% compute on those layers.
+4. **[Offloading](/entries/cpu-and-nvme-offloading)** — bounded by PCIe.
+
+Point 3 is worth stating separately because it is often missed: recomputation
+does not have to be uniform. Megatron supports checkpointing the first $k$ layers
+fully and the rest selectively, which gives a continuous dial between the two
+rather than a binary choice.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
+
+
+class Block(nn.Module):
+    """Recompute the attention interior; keep the projections."""
+
+    def __init__(self, dim: int, heads: int, selective: bool = True):
+        super().__init__()
+        self.n1, self.n2 = nn.RMSNorm(dim), nn.RMSNorm(dim)
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.proj = nn.Linear(dim, dim, bias=False)
+        self.ffn = FeedForward(dim)
+        self.selective = selective
+
+    def _core(self, qkv: Tensor) -> Tensor:
+        """Scores, softmax, dropout, AV — large and cheap to redo."""
+        return attention_core(qkv)
+
+    def forward(self, x: Tensor) -> Tensor:
+        qkv = self.qkv(self.n1(x))                  # kept: a large matmul
+
+        core = checkpoint(self._core, qkv, use_reentrant=False) if self.selective \
+            else self._core(qkv)
+
+        x = x + self.proj(core)
+        return x + self.ffn(self.n2(x))             # kept
+```
+
+</CodeFrame>
+
+`use_reentrant=False` is the modern implementation and the one to use. The
+reentrant version runs the recomputed forward outside autograd's normal
+machinery, which breaks with keyword arguments, with tensors that do not require
+grad, and with anything stateful inside the segment — a long tail of failures
+that the non-reentrant version does not have.
+
+<Rule label="Measuring rather than reasoning" />
+
+The table above is for a standard transformer at typical shapes. It moves — with
+FlashAttention, with a very short sequence, with a wide FFN — and the honest
+approach is to measure rather than to trust it. `torch.cuda.memory_allocated`
+around each candidate segment, and the profiler's memory timeline, will name the
+tensors that actually dominate on your configuration in a few minutes.

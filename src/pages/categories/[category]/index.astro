@@ -1,0 +1,184 @@
+---
+import BaseLayout from '../../../layouts/BaseLayout.astro';
+import Rail from '../../../components/Rail.astro';
+import Breadcrumb from '../../../components/Breadcrumb.astro';
+import StatusBadge from '../../../components/StatusBadge.astro';
+import Pager from '../../../components/Pager.astro';
+import { render } from 'astro:content';
+import {
+  allCategories,
+  entriesIn,
+  subcategoriesIn,
+  subtreesOf,
+  type Category,
+} from '../../../lib/grimoire';
+import { breadcrumbs, collectionNode, siteNodes } from '../../../lib/schema';
+
+export async function getStaticPaths() {
+  const categories = await allCategories();
+  return categories.map((category) => ({
+    params: { category: category.id },
+    props: { category },
+  }));
+}
+
+interface Props {
+  category: Category;
+}
+
+const { category } = Astro.props;
+const entries = await entriesIn(category.id);
+const stubs = entries.filter((e) => e.data.stub).length;
+const subtrees = await subtreesOf(category.id);
+const subcategories = await subcategoriesIn(category.id);
+
+// Entries are listed under their subcategory rather than in one flat run, so
+// the shelf reads as a table of contents. Numbering stays continuous across
+// the whole shelf — an entry's mark is its position on the shelf, not within
+// its branch — so the counter is threaded through the groups.
+let mark = 0;
+const groups = subcategories.map((sub) => ({
+  sub,
+  leaf: sub.id.split('/').pop()!,
+  entries: entries
+    .filter((e) => e.data.path.id === sub.id)
+    .map((entry) => ({ entry, mark: ++mark })),
+}));
+const { Content: About } = await render(category);
+
+// The shelf description reads better as a meta description than the blurb,
+// which is a list of keywords meant for a table of contents.
+const description = `${category.data.name}: ${category.data.blurb}. ${entries.length} entries across ${subcategories.length} subcategories in the AI Grimoire.`;
+
+const WORDS = [
+  'Zero',
+  'One',
+  'Two',
+  'Three',
+  'Four',
+  'Five',
+  'Six',
+  'Seven',
+  'Eight',
+  'Nine',
+  'Ten',
+];
+const spell = (n: number) => WORDS[n] ?? String(n);
+/** Same numeral, mid-sentence, where the capital would read as a proper noun. */
+const spellLower = (n: number) => spell(n).toLowerCase();
+
+const standing =
+  stubs > 0
+    ? `${spell(entries.length)} entries across ${spellLower(subcategories.length)} branches. ${spell(stubs)} ${stubs === 1 ? 'is a stub and is' : 'are stubs and are'} marked as such — read them as open questions rather than answers.`
+    : `${spell(entries.length)} entries across ${spellLower(subcategories.length)} branches, none of them stubs.`;
+---
+
+<BaseLayout
+  title={category.data.name}
+  tabTitle={`${category.data.name} — AI Grimoire`}
+  description={description}
+  nav="categories"
+  schema={[
+    ...siteNodes(),
+    collectionNode({
+      path: `/categories/${category.id}`,
+      name: category.data.name,
+      description,
+      entries,
+    }),
+    breadcrumbs([
+      { name: 'AI Grimoire', path: '/' },
+      { name: 'Categories', path: '/categories' },
+      { name: category.data.name },
+    ]),
+  ]}
+>
+  <main class="mx-auto max-w-[1180px] animate-rise px-6 pb-20 sm:px-12">
+    <Breadcrumb
+      trail={[
+        { label: 'AI Grimoire', href: '/' },
+        { label: 'Categories', href: '/categories' },
+        { label: category.data.name },
+      ]}
+    />
+
+    <Rail class="pt-12 pb-9">
+      <div slot="rail" class="font-mono text-[11px] leading-[2] text-dim">
+        <div class="label mb-3 text-accent">Tree — {category.data.num}</div>
+        {
+          subtrees.map((t) => (
+            <a
+              href={`/categories/${category.id}/${t.leaf}`}
+              class="flex justify-between gap-2.5 py-0.5 text-mute-2 hover:text-chalk"
+            >
+              <span>{t.leaf}/</span>
+              <span class="text-dim-3">{t.count}</span>
+            </a>
+          ))
+        }
+      </div>
+
+      <h1
+        class="mt-0 mb-4 text-[34px] leading-[1.1] font-normal tracking-[-0.026em] text-bone sm:text-[44px]"
+      >
+        {category.data.name}
+      </h1>
+      <div
+        class="mb-4 max-w-[62ch] text-[18px] text-lede [&>p]:mt-0 [&>p]:mb-4 [&>p]:text-pretty"
+      >
+        <About />
+      </div>
+      <p class="m-0 max-w-[62ch] text-[16px] text-dim italic">{standing}</p>
+    </Rail>
+
+    {
+      groups.map(({ sub, leaf, entries: rows }) => (
+        <Rail labelAs="h2" label={sub.data.name} divider={false} class="pt-11">
+          <a
+            slot="rail"
+            href={`/categories/${category.id}/${leaf}`}
+            class="block font-mono text-[11px] text-dim-3 hover:text-mute"
+          >
+            {leaf}/ ›
+          </a>
+
+          <p class="mt-0 mb-1 max-w-[62ch] text-[15px] text-mute-3 text-pretty">
+            {sub.data.blurb}
+          </p>
+
+          <div data-paged>
+            {rows.length === 0 ? (
+              <p class="mt-0 mb-0 border-b border-rule-faint py-4.5 text-[15px] text-dim italic">
+                Nothing filed here yet.
+              </p>
+            ) : (
+              rows.map(({ entry: e, mark }) => (
+                <a
+                  href={`/entries/${e.id}`}
+                  data-row
+                  class="grid grid-cols-[30px_minmax(0,1fr)] items-baseline gap-x-5 gap-y-1 border-b border-rule-faint py-4.5 transition-colors hover:bg-raise sm:grid-cols-[30px_minmax(0,1fr)_110px]"
+                >
+                  <span class="font-mono text-[11px] text-dim-3">
+                    {category.data.num}.{mark}
+                  </span>
+                  <div>
+                    <div class="text-[20px] tracking-[-0.014em] text-bone">
+                      {e.data.name}
+                      {e.data.stub && <span class="eyebrow ml-2.5 text-accent">stub</span>}
+                      {e.data.status && <StatusBadge status={e.data.status} class="ml-2.5" />}
+                    </div>
+                    <div class="mt-1 text-[15px] text-mute-3 text-pretty">{e.data.desc}</div>
+                  </div>
+                  <span class="col-start-2 font-mono text-[12px] text-accent sm:col-start-3 sm:text-right">
+                    {e.data.complexity}
+                  </span>
+                </a>
+              ))
+            )}
+            <Pager label={`${sub.data.name} pages`} />
+          </div>
+        </Rail>
+      ))
+    }
+  </main>
+</BaseLayout>

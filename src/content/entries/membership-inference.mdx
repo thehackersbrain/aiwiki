@@ -1,0 +1,86 @@
+---
+name: 'Membership Inference'
+desc: 'Distinguish training members from held-out data via loss calibration.'
+category: 'adversarial-ml'
+complexity: 'O(N)'
+path: 'adversarial-ml/privacy'
+difficulty: 'advanced'
+described: '2017'
+status: 'common'
+revised: 2026-07-28
+added: 2026-01-31
+tags: ['privacy', 'attack']
+lede: 'Members have lower loss than non-members. The attack is entirely in the calibration: some examples are simply easy, and an uncalibrated threshold measures difficulty rather than membership.'
+implNote:
+  label: 'annotation'
+  html: 'Membership inference is the empirical lower bound that differential privacy upper-bounds analytically. When the two disagree by orders of magnitude — as they usually do — the ε you trained with is not describing your exposure.'
+related: [model-extraction, contamination-detection, projected-gradient-descent-attack]
+refs:
+  - cite: 'Shokri et al. — Membership Inference Attacks Against Machine Learning Models (2017)'
+    id: 'arXiv:1610.05820'
+    href: https://arxiv.org/abs/1610.05820
+  - cite: 'Carlini et al. — Membership Inference Attacks From First Principles (2021)'
+    id: 'arXiv:2112.03570'
+    href: https://arxiv.org/abs/2112.03570
+  - cite: 'Carlini et al. — Extracting Training Data from Large Language Models (2020)'
+    id: 'arXiv:2012.07805'
+    href: https://arxiv.org/abs/2012.07805
+---
+
+The naive attack thresholds the loss and achieves respectable average accuracy
+while being useless — it flags easy examples. LiRA calibrates per example by
+fitting Gaussians to the model-confidence statistic under shadow models trained
+with and without that example, then runs a likelihood-ratio test.
+
+<Eq caption="eq. 1 — φ the logit-scaled confidence" source="Carlini et al. §IV" lead>
+
+$$
+\Lambda(x, y) = \frac
+{p\bigl( \phi \mid \mathcal{N}(\mu_{\text{in}},\, \sigma_{\text{in}}^2) \bigr)}
+{p\bigl( \phi \mid \mathcal{N}(\mu_{\text{out}},\, \sigma_{\text{out}}^2) \bigr)},
+\qquad \phi = \phi(x, y)
+$$
+
+</Eq>
+
+<Note label="caveat">
+Plot the ROC on log–log axes and read the bottom-left corner. That is where the
+attack either works or does not.
+</Note>
+
+Report TPR at low FPR, not accuracy or AUC. An attack that identifies 0.1% of the
+training set with near-certainty is a serious privacy failure and can sit at 51%
+average accuracy; the aggregate numbers hide exactly the regime that matters.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · numpy + scipy">
+
+```python
+import numpy as np
+from scipy.stats import norm
+
+
+def logit_confidence(p_correct: np.ndarray) -> np.ndarray:
+    """Map confidence to an approximately normal statistic."""
+    p = np.clip(p_correct, 1e-6, 1 - 1e-6)
+    return np.log(p) - np.log1p(-p)
+
+
+def lira_score(phi_target: float,
+               phi_in: np.ndarray, phi_out: np.ndarray) -> float:
+    """phi_in / phi_out: statistic from shadow models trained
+    with and without the target example."""
+    mu_in, sd_in = phi_in.mean(), phi_in.std() + 1e-8
+    mu_out, sd_out = phi_out.mean(), phi_out.std() + 1e-8
+    return (norm.logpdf(phi_target, mu_in, sd_in)
+            - norm.logpdf(phi_target, mu_out, sd_out))
+```
+
+</CodeFrame>
+
+The logit transform is what makes the Gaussian assumption tenable; fitting normals
+directly to bounded confidences puts most of the mass against the boundary and the
+ratio becomes meaningless. Shadow models must match the target's architecture and
+training recipe — a mismatched shadow calibrates against the wrong distribution and
+reads as a weaker attack than the data supports.

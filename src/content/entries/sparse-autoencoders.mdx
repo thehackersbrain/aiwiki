@@ -1,0 +1,123 @@
+---
+name: 'Sparse Autoencoders'
+desc: 'Overcomplete dictionary learning on activations for monosemantic features.'
+category: 'interpretability'
+complexity: 'O(d·m)'
+path: 'interpretability/features'
+difficulty: 'advanced'
+described: '2023'
+status: 'common'
+statusNote: 'The dominant method for decomposing activations, and under active criticism — feature absorption and reconstruction-quality objections are unresolved.'
+revised: 2026-08-28
+added: 2025-04-19
+tags: ['sparse', 'features']
+lede: 'Fit an overcomplete dictionary to a layer’s activations under a sparsity penalty, on the hypothesis that features are more numerous than dimensions and superposed.'
+metrics:
+  caption: 'residual stream, layer 12 of 24, d = 1024, 400M tokens'
+  rows:
+    - { label: 'Dictionary', value: '16 384' }
+    - { label: 'L0', value: '32' }
+    - { label: 'Dead latents', value: '3.1%', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Dead latents are the standard pathology — a sizeable fraction stop firing within the first few thousand steps. The dead fraction is a better diagnostic than the loss curve.'
+related: [activation-patching, crosscoders, feature-absorption, logit-lens]
+refs:
+  - cite: 'Bricken et al. — Towards Monosemanticity: Decomposing Language Models With Dictionary Learning (2023)'
+    id: 'transformer-circuits'
+    href: https://transformer-circuits.pub/2023/monosemantic-features
+  - cite: 'Elhage et al. — Toy Models of Superposition (2022)'
+    id: 'transformer-circuits'
+    href: https://transformer-circuits.pub/2022/toy_model/index.html
+  - cite: 'Gao et al. — Scaling and Evaluating Sparse Autoencoders (2024)'
+    id: 'arXiv:2406.04093'
+    href: https://arxiv.org/abs/2406.04093
+  - cite: 'Rajamanoharan et al. — Jumping Ahead: Improving Reconstruction Fidelity with JumpReLU SAEs (2024)'
+    id: 'arXiv:2407.14435'
+    href: https://arxiv.org/abs/2407.14435
+---
+
+<Note label="aside">
+The hypothesis does a great deal of work here. If features are not sparse, the SAE
+still fits — it just fits nothing in particular.
+</Note>
+
+The superposition hypothesis holds that a network represents more features than it
+has dimensions by placing them in almost-orthogonal directions and relying on
+their sparsity to keep interference low. If true, the activations are sparse
+combinations of an overcomplete dictionary, and that dictionary is recoverable.
+
+<Eq caption="eq. 1 — encode, then reconstruct from the dictionary" lead>
+
+$$
+x \approx b + \sum_i f_i(x)\, d_i,
+\qquad
+f(x) = \mathrm{ReLU}\bigl( W_e (x - b) + b_e \bigr)
+$$
+
+</Eq>
+
+<Eq caption="eq. 2 — L1 scaled by decoder norm" source="Bricken et al.">
+
+$$
+L = \bigl\| x - \hat{x} \bigr\|_2^2 + \lambda \sum_i f_i(x)\, \| d_i \|_2
+$$
+
+</Eq>
+
+Weighting the L1 by the decoder column norm is not cosmetic: without it the
+penalty is trivially gamed by shrinking $f$ and growing $d$ proportionally. The
+alternative is to constrain the columns to unit norm and project after every step.
+
+### Shrinkage
+
+<Note label="annotation">
+Shrinkage is measurable: regress the true activation on the reconstruction. A
+slope below 1 is the bias, in units you can report.
+</Note>
+
+An L1 penalty biases every active feature toward zero, so reconstructions are
+systematically too small. Top-k and JumpReLU encoders replace the penalty with a
+hard sparsity constraint, which removes the bias at the cost of a
+non-differentiable activation that needs a straight-through estimator.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor, nn
+
+
+class TopKSAE(nn.Module):
+    """Top-k encoder: sparsity is a constraint, not a penalty,
+    so there is no shrinkage to correct for."""
+
+    def __init__(self, d_model: int, d_hidden: int, k: int = 32):
+        super().__init__()
+        self.enc = nn.Linear(d_model, d_hidden)
+        self.dec = nn.Linear(d_hidden, d_model, bias=False)
+        self.pre_bias = nn.Parameter(torch.zeros(d_model))
+        self.k = k
+
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:
+        centred = x - self.pre_bias
+        acts = self.enc(centred)
+        vals, idx = acts.topk(self.k, dim=-1)
+        f = torch.zeros_like(acts).scatter_(-1, idx, vals.relu())
+        return self.dec(f) + self.pre_bias, f
+
+    @torch.no_grad()
+    def normalise_decoder_(self) -> None:
+        self.dec.weight /= self.dec.weight.norm(dim=0, keepdim=True)
+```
+
+</CodeFrame>
+
+Subtracting a learned pre-bias before encoding and adding it back after decoding
+lets the dictionary model deviations from the mean activation rather than the mean
+itself — without it the first few features are spent representing a constant. Call
+`normalise_decoder_` after each optimiser step, and remove the component of the
+gradient parallel to each column beforehand if you want the step to be exact
+rather than approximately tangent.

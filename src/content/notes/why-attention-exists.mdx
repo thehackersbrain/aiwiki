@@ -1,0 +1,120 @@
+---
+title: 'Why attention exists'
+desc: 'The fixed-size bottleneck that broke sequence-to-sequence models, and the obvious fix nobody could take.'
+lede: 'Before attention there was a single vector that had to hold an entire sentence. Understanding why that failed is most of understanding why attention looks the way it does.'
+series: 'attention-from-scratch'
+part: 1
+minutes: 7
+revised: 2026-09-01
+added: 2026-08-14
+tags: ['attention', 'history', 'foundations']
+related: [scaled-dot-product-attention, cross-attention, additive-attention]
+refs:
+  - cite: 'Sutskever et al. — Sequence to Sequence Learning with Neural Networks (2014)'
+    id: 'arXiv:1409.3215'
+    href: https://arxiv.org/abs/1409.3215
+  - cite: 'Bahdanau et al. — Neural Machine Translation by Jointly Learning to Align and Translate (2014)'
+    id: 'arXiv:1409.0473'
+    href: https://arxiv.org/abs/1409.0473
+  - cite: 'Cho et al. — On the Properties of Neural Machine Translation: Encoder–Decoder Approaches (2014)'
+    id: 'arXiv:1409.1259'
+    href: https://arxiv.org/abs/1409.1259
+---
+
+I spent a long time treating attention as a formula to memorise. $\softmax(QK^\top
+/ \sqrt{d_k})V$ — three letters, a scale factor, done. That is a fine way to pass
+an interview and a bad way to understand anything, because none of it explains
+why *those* three letters.
+
+So this series starts where the idea started: with a model that did not have it,
+and the specific way that model failed.
+
+### One vector for the whole sentence
+
+The 2014 sequence-to-sequence architecture is two recurrent networks. The encoder
+reads the source sentence one token at a time, updating a hidden state. When it
+reaches the end, that final hidden state — one fixed-length vector — is handed to
+the decoder, which generates the translation from it.
+
+<Note label="aside">
+Sutskever et al. reversed the source sentence before encoding, which improved
+BLEU noticeably. That trick working at all should have been a loud clue: it only
+helps because the *first* source words are closest to the handover.
+</Note>
+
+Write it out and the problem is visible without any experiment.
+
+<Eq caption="eq. 1 — everything the decoder will ever know about the source" lead>
+
+$$
+c = h_n, \qquad p(y_t \mid y_{<t}, x) = g(y_{t-1}, s_t, c)
+$$
+
+</Eq>
+
+That $c$ is the same vector for every output position. Translating the fortieth
+word of a long paragraph, the decoder consults the identical summary it used for
+the first. And $c$ has a fixed dimension — 1000, say — whether the source is four
+words or eighty.
+
+### The failure had a shape
+
+Cho et al. measured it, and the result is one of those graphs that settles an
+argument: performance is flat up to roughly the length of a typical training
+sentence and then falls off a cliff. Not degrading gracefully, not noisily —
+falling.
+
+This is what a capacity bound looks like. The encoder is being asked to compress
+an unbounded amount of information into a bounded vector, and past some length it
+simply cannot, so it starts discarding. What it discards first is what the
+recurrence has had the longest time to overwrite: the beginning.
+
+<Note label="annotation">
+This is the reason I now distrust any architecture where a variable amount of
+information has to pass through a fixed-size channel. It is not that it performs
+badly — it is that it performs *fine* until it doesn't.
+</Note>
+
+### The fix, stated plainly
+
+Do not compress. Keep every encoder state $h_1, \dots, h_n$, and let the decoder
+look at all of them, choosing what to read at each output step.
+
+Written as a question that is trivially easy to ask and was, for a while, hard to
+answer: **at output step $t$, which input positions matter?**
+
+Everything after this is machinery for answering it differentiably. You cannot
+select a position with an `if` statement and backpropagate through it, so instead
+of choosing one position you take a weighted average of all of them — with the
+weights themselves produced by the network, and therefore learnable.
+
+<Eq caption="eq. 2 — a context vector per output step, not one for the sentence">
+
+$$
+c_t = \sum_{i=1}^{n} \alpha_{ti} \, h_i, \qquad \sum_i \alpha_{ti} = 1
+$$
+
+</Eq>
+
+That is attention. The whole of the rest of it — dot products, scaling, multiple
+heads, the transformer — is a series of answers to "how should $\alpha$ be
+computed, and how fast".
+
+### What I got wrong the first time
+
+I read eq. 2 and thought of it as a soft `argmax`: a way of picking a position
+while keeping gradients alive. That is the intuition everyone gives, and it is
+half right.
+
+The half it misses is that the average is not a compromise between candidates —
+it is often genuinely reading several positions at once and adding what it finds.
+A head resolving a pronoun may attend to the antecedent *and* to the verb that
+constrains it, and the sum is the point rather than a blurring of a decision it
+would rather have made sharply. I only stopped mis-reading attention maps once I
+dropped the "it is trying to pick one" framing.
+
+<Rule label="Next" />
+
+The next part builds $\alpha$ from nothing — starting with the most obvious
+similarity function and getting to dot products by elimination, rather than by
+being told.

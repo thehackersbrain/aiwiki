@@ -1,0 +1,131 @@
+---
+name: 'LayerNorm'
+desc: 'Re-centre and re-scale each activation vector over its own features.'
+category: 'architectures'
+complexity: 'O(n·d)'
+path: 'architectures/normalisation'
+difficulty: 'introductory'
+described: '2016'
+status: 'common'
+statusNote: 'Still in every model trained before about 2022 and in most encoders. New decoder-only models use RMSNorm, which is this with a term removed.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['normalisation', 'core']
+lede: 'Statistics taken across the feature dimension of a single example, so the operation does not care about batch size, sequence length, or what its neighbours are doing.'
+implNote:
+  label: 'caveat'
+  html: 'Compute the mean and variance in fp32 even when the tensor is bf16. Over 4096 features the sum of squares loses enough mantissa in bf16 to shift the norm by a fraction of a percent — which compounds with depth.'
+related: [rmsnorm, pre-norm-and-post-norm, batch-normalisation, scaled-dot-product-attention, gradient-checkpointing]
+refs:
+  - cite: 'Ba, Kiros & Hinton — Layer Normalization (2016)'
+    id: 'arXiv:1607.06450'
+    href: https://arxiv.org/abs/1607.06450
+  - cite: 'Xu et al. — Understanding and Improving Layer Normalization (2019)'
+    id: 'arXiv:1911.07013'
+    href: https://arxiv.org/abs/1911.07013
+  - cite: 'Zhang & Sennrich — Root Mean Square Layer Normalization (2019)'
+    id: 'arXiv:1910.07467'
+    href: https://arxiv.org/abs/1910.07467
+---
+
+[BatchNorm](/entries/batch-normalisation) normalises a feature across the
+examples in a batch. LayerNorm turns the tensor ninety degrees and normalises an
+example across its features. Everything else about the two is the same; that one
+choice is the entire difference, and it is the reason one of them is in every
+transformer and the other is not.
+
+<Eq lead caption="eq. 1 — statistics over d, per token">
+
+$$
+\mathrm{LN}(x) = g \odot \frac{x - \mu}{\sqrt{\sigma^2 + \varepsilon}} + b,
+\qquad
+\mu = \frac{1}{d}\sum_i x_i,
+\quad
+\sigma^2 = \frac{1}{d}\sum_i (x_i - \mu)^2
+$$
+
+</Eq>
+
+Because $\mu$ and $\sigma$ depend only on the vector in front of it, the
+operation is identical at training and inference, identical at batch size 1 and
+1024, and identical for the fifth token of a sequence and the five-thousandth.
+There is no running average to maintain and nothing to synchronise across
+devices.
+
+<Note label="annotation">
+That independence is not a minor convenience. It is what makes autoregressive
+decoding possible at all: a normalisation with cross-token statistics would make
+the representation of token $i$ depend on tokens that have not been generated.
+</Note>
+
+### What the two terms do
+
+The re-scaling is doing the work. The re-centring is mostly not, and this was
+established well before RMSNorm made it official — Xu et al. found that
+LayerNorm's benefit comes from how it shapes gradients rather than from the
+forward statistics, and specifically from the derivative of the $1/\sigma$ term,
+which projects out the component of the gradient along $x$.
+
+<Eq caption="eq. 2 — the gradient is projected, not merely scaled">
+
+$$
+\frac{\partial \mathrm{LN}}{\partial x} \cdot \delta
+= \frac{1}{\sigma}\left(\delta - \bar{\delta}\,\mathbf{1} - \frac{\hat{x}^\top \delta}{d}\,\hat{x}\right)
+$$
+
+</Eq>
+
+Two components are removed: the mean of the gradient, and its projection onto the
+normalised activation. The second is the important one. It means a gradient step
+cannot change the *magnitude* of $x$ — only its direction — which is why
+normalised networks are insensitive to the scale of their weights and why the
+learning rate does not need retuning as activations grow with depth.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor, nn
+
+
+class LayerNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5, bias: bool = True):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim)) if bias else None
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        dtype = x.dtype
+        x = x.float()                                  # statistics in fp32, always
+        mu = x.mean(-1, keepdim=True)
+        var = x.var(-1, keepdim=True, unbiased=False)  # biased: divide by d, not d-1
+        x = (x - mu) * torch.rsqrt(var + self.eps)
+
+        x = x.to(dtype) * self.weight
+        return x if self.bias is None else x + self.bias
+```
+
+</CodeFrame>
+
+`unbiased=False` is not a detail. Bessel's correction divides by $d-1$, every
+reference implementation divides by $d$, and using the corrected estimator
+produces weights that are subtly incompatible with every other stack — a
+discrepancy of $d/(d-1)$ in the norm, small enough to train through and large
+enough to shift outputs.
+
+<Rule label="What gets dropped" />
+
+Two simplifications are now standard, and both are subtractive.
+
+The bias $b$ goes first. It is redundant with the bias of the linear layer that
+follows, and removing it costs nothing measurable while removing a parameter
+tensor per norm — most models since GPT-J ship without it.
+
+Then the mean subtraction goes, which is [RMSNorm](/entries/rmsnorm): one
+reduction pass instead of two, one term fewer in the backward pass, and no
+measured cost. That LayerNorm survived a decade of being progressively hollowed
+out without anyone finding a task where the removed parts mattered is the most
+interesting fact about it.

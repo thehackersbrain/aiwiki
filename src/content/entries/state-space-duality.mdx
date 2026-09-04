@@ -1,0 +1,156 @@
+---
+name: 'State Space Duality'
+desc: 'Selective SSMs and linear attention are the same operator, written two ways.'
+category: 'architectures'
+complexity: 'O(n·d·N)'
+path: 'architectures/recurrence'
+difficulty: 'advanced'
+described: '2024'
+status: 'emerging'
+statusNote: 'A genuine unification with a fast kernel attached. Mamba-2 ships it; the theoretical claim is more settled than the architectural one.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['recurrence', 'sequence', 'attention']
+lede: 'Two literatures spent three years converging without noticing. Write a selective state space model as a matrix and it is masked attention with a structured mask — which means both get the other’s algorithms.'
+metrics:
+  caption: 'Mamba-2 against Mamba-1'
+  rows:
+    - { label: 'State size N', value: '16 → 256' }
+    - { label: 'Training speed', value: '2 … 8×', accent: true }
+    - { label: 'Kernel', value: 'plain matmul' }
+implNote:
+  label: 'annotation'
+  html: 'The practical payoff is that the quadratic form uses ordinary matrix multiplication, which runs on tensor cores. Mamba-1’s scan was a hand-written CUDA kernel that could not — most of the speed-up is that, not the algorithm.'
+related: [state-space-models, linear-attention, parallel-scan, rwkv, scaled-dot-product-attention, flash-attention]
+refs:
+  - cite: 'Dao & Gu — Transformers are SSMs: Generalized Models and Efficient Algorithms Through Structured State Space Duality (2024)'
+    id: 'arXiv:2405.21060'
+    href: https://arxiv.org/abs/2405.21060
+  - cite: 'Katharopoulos et al. — Transformers are RNNs (2020)'
+    id: 'arXiv:2006.16236'
+    href: https://arxiv.org/abs/2006.16236
+  - cite: 'Yang et al. — Gated Linear Attention Transformers with Hardware-Efficient Training (2023)'
+    id: 'arXiv:2312.06635'
+    href: https://arxiv.org/abs/2312.06635
+---
+
+By 2024 three lines of work had independently arrived at a linear recurrence with
+input-dependent decay: [selective SSMs](/entries/state-space-models) from control
+theory, [RWKV](/entries/rwkv) from RNNs, gated
+[linear attention](/entries/linear-attention) from transformers. The resemblance
+was noted informally. Dao and Gu made it an identity.
+
+### Unrolling into a matrix
+
+Take a diagonal selective SSM and substitute the recurrence into itself.
+
+<Eq lead caption="eq. 1 — every output as a weighted sum of all inputs">
+
+$$
+h_t = A_t h_{t-1} + B_t x_t,
+\quad y_t = C_t^\top h_t
+\;\;\Longrightarrow\;\;
+y_t = \sum_{s \le t} C_t^\top \Bigl(\textstyle\prod_{r=s+1}^{t} A_r\Bigr) B_s\, x_s
+$$
+
+</Eq>
+
+That is a linear map from the input sequence to the output sequence, so it is a
+matrix. Read off the entries:
+
+<Eq caption="eq. 2 — attention, with a mask that is a product of decays">
+
+$$
+y = M x,
+\qquad
+M_{ts} = \underbrace{C_t^\top B_s}_{\text{a score}} \cdot \underbrace{\prod_{r=s+1}^{t} A_r}_{\text{the mask}}
+$$
+
+</Eq>
+
+$C_t^\top B_s$ is a query–key inner product with $C$ as the query and $B$ as the
+key. The product of $A$s is lower-triangular by construction — it is empty for
+$s > t$ — so it is a causal mask whose entries decay rather than being ones and
+zeros. The whole model is attention without a softmax, under a *semiseparable*
+mask.
+
+<Note label="annotation">
+Which direction of the duality you find surprising depends on where you started.
+From the SSM side: a recurrence turns out to have a quadratic form. From the
+attention side: masked linear attention turns out to have a constant-memory
+recurrent form. Both were known separately; the contribution is that the
+structured mask is exactly what makes them interchangeable.
+</Note>
+
+### Two algorithms for one operator
+
+| Form | Cost | Good for |
+| --- | --- | --- |
+| recurrent (linear) | $O(nN)$ | decoding, long sequences |
+| quadratic (attention-like) | $O(n^2)$ | short sequences, tensor cores |
+| block-decomposed | both | training, in practice |
+
+The last row is where the speed comes from. Split the sequence into chunks:
+within a chunk use the quadratic form, which is a dense matmul and saturates the
+hardware; between chunks pass a single summarised state, which is the recurrent
+form. Diagonal blocks quadratic, off-diagonal blocks low-rank.
+
+This is why Mamba-2 can afford a state eight times larger than Mamba-1 and still
+train faster. Mamba-1's selective scan was a bespoke CUDA kernel doing elementwise
+work; the chunked form is `torch.matmul` on tensor cores, and the hardware gap
+between those two is roughly an order of magnitude.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch · the chunked form, schematically">
+
+```python
+import torch
+from torch import Tensor
+
+
+def ssd(x: Tensor, a: Tensor, b: Tensor, c: Tensor, chunk: int = 64) -> Tensor:
+    """x: [B, T, D], a: [B, T] decays, b/c: [B, T, N]. Chunked SSD."""
+    bsz, t, d = x.shape
+    n = b.size(-1)
+
+    xs, as_, bs, cs = (z.reshape(bsz, t // chunk, chunk, -1) for z in (x, a[..., None], b, c))
+    cumdecay = as_.cumsum(2)                                  # log-space within chunk
+
+    y, state = [], x.new_zeros(bsz, n, d)
+    for i in range(t // chunk):
+        # Within the chunk: quadratic form, a plain masked matmul.
+        scores = (cs[:, i] @ bs[:, i].transpose(-1, -2))      # [B, C, C]
+        mask = (cumdecay[:, i] - cumdecay[:, i].transpose(-1, -2)).exp().tril()
+        local = (scores * mask) @ xs[:, i]
+
+        # Across chunks: one recurrent step, carrying a summarised state.
+        y.append(local + cs[:, i] @ state)
+        decayed = (cumdecay[:, i, -1:] - cumdecay[:, i]).exp()
+        state = state * cumdecay[:, i, -1:].exp().unsqueeze(-1) + \
+                bs[:, i].transpose(-1, -2) @ (xs[:, i] * decayed)
+
+    return torch.cat(y, dim=1).reshape(bsz, t, d)
+```
+
+</CodeFrame>
+
+Everything in that loop that looks like attention is attention, and everything
+that looks like a recurrence is one. They are separated by the chunk boundary and
+nothing else.
+
+<Rule label="What it buys, and what it does not" />
+
+The theory transfers freely in both directions now. Multi-head and grouped-query
+structure carry over to SSMs. [Tensor and sequence
+parallelism](/entries/expert-parallelism) developed for transformers apply. And
+the attention side gains a constant-memory decoding path for any model whose mask
+is semiseparable.
+
+What the duality does not do is settle whether the softmax matters. Every model
+on this side of it has a mask that decays with distance, and that is a strictly
+weaker object than a content-dependent score over all pairs — a decaying mask
+cannot single out one distant token, however much the model would like to. The
+persistent recall gap between linear and softmax models is that limitation, and
+no reformulation removes it. Which is why the frontier models are still
+[hybrids](/entries/hybrid-recurrent-attention).

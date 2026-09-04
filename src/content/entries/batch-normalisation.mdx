@@ -1,0 +1,142 @@
+---
+name: 'Batch Normalisation'
+desc: 'Normalise each feature across the batch; keep running statistics for inference.'
+category: 'architectures'
+complexity: 'O(n·d)'
+path: 'architectures/normalisation'
+difficulty: 'introductory'
+described: '2015'
+status: 'superseded'
+statusNote: 'Not superseded everywhere — convolutional vision still runs on it. In sequence models it is unusable, and understanding why is the argument for everything else on this shelf.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['normalisation', 'core', 'training']
+lede: 'The technique that made deep networks trainable, and the one that cannot be used in a transformer. Its statistics come from the batch, which makes every example depend on the others it happened to travel with.'
+metrics:
+  caption: 'Why it fails on sequences'
+  rows:
+    - { label: 'Train/infer path', value: 'different' }
+    - { label: 'Batch size 1', value: 'undefined' }
+    - { label: 'Padded positions', value: 'poison μ, σ', accent: true }
+implNote:
+  label: 'annotation'
+  html: 'The running statistics are not learned — they are an exponential moving average updated in the forward pass. They are the reason <code>model.eval()</code> changes the output, and the reason forgetting to call it is a classic silent bug.'
+related: [layer-normalisation, rmsnorm, group-normalisation, pre-norm-and-post-norm]
+refs:
+  - cite: 'Ioffe & Szegedy — Batch Normalization: Accelerating Deep Network Training by Reducing Internal Covariate Shift (2015)'
+    id: 'arXiv:1502.03167'
+    href: https://arxiv.org/abs/1502.03167
+  - cite: 'Santurkar et al. — How Does Batch Normalization Help Optimization? (2018)'
+    id: 'arXiv:1805.11604'
+    href: https://arxiv.org/abs/1805.11604
+  - cite: 'Shen et al. — PowerNorm: Rethinking Batch Normalization in Transformers (2020)'
+    id: 'arXiv:2003.07845'
+    href: https://arxiv.org/abs/2003.07845
+---
+
+BatchNorm is here as the counterexample. Every other entry on this shelf takes
+its statistics from within a single example, and the reason is that BatchNorm
+does not.
+
+<Eq lead caption="eq. 1 — statistics over the batch, per feature">
+
+$$
+\mathrm{BN}(x)_{b,i} = \gamma_i \frac{x_{b,i} - \mu_i}{\sqrt{\sigma_i^2 + \varepsilon}} + \beta_i,
+\qquad
+\mu_i = \frac{1}{B}\sum_b x_{b,i}
+$$
+
+</Eq>
+
+Compare with [LayerNorm](/entries/layer-normalisation): the sum is over $b$, not
+over $i$. One index moves, and the consequences are total.
+
+### Three ways it breaks on sequences
+
+**Inference is a different function.** At training time $\mu$ and $\sigma$ come
+from the batch; at test time they come from a running average accumulated during
+training. The two agree only if the test distribution matches the training
+distribution, and for a language model prompted with something unlike its corpus
+they do not.
+
+**Padding contaminates the statistics.** A batch of sequences is a rectangle with
+padding in the corners. Those positions are masked out of attention and the loss,
+but they are still elements of the tensor BatchNorm reduces over, so $\mu$ and
+$\sigma$ depend on how much padding the batch happened to contain. Masking the
+reduction is possible and is what PowerNorm does; it also means the statistics
+now vary with batch composition in a way that is hard to reason about.
+
+**The statistics are unstable across a sequence.** Shen et al. measured the
+per-batch statistics of transformer activations through training and found the
+variance across batches an order of magnitude larger than in a convolutional
+network — token distributions differ far more between batches than image patches
+do. The running average is then an average over quantities that never settle.
+
+<Note label="caveat">
+Batch size 1 is not merely degenerate, it is undefined: the variance of a single
+sample is zero, the normalised output is zero, and the gradient carries no
+information. Autoregressive serving at batch size 1 is the common case.
+</Note>
+
+### What it was actually doing
+
+The original explanation — that BatchNorm reduces "internal covariate shift" —
+did not survive scrutiny. Santurkar et al. injected noise after the norm to
+deliberately *worsen* the distribution shift and found training just as fast,
+then showed what is really going on: the reparameterisation makes the loss
+landscape smoother, bounding the gradient and the local Lipschitz constant, which
+is what permits the larger learning rates.
+
+That mechanism does not require the batch. It requires *a* normalisation, and
+LayerNorm supplies one from within the example. This is why the transformer could
+drop BatchNorm without losing the benefit that made it famous.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch · the train/eval split">
+
+```python
+import torch
+from torch import Tensor, nn
+
+
+class BatchNorm1d(nn.Module):
+    def __init__(self, dim: int, momentum: float = 0.1, eps: float = 1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+        # Buffers, not parameters: updated in the forward pass, never by the optimiser.
+        self.register_buffer("running_mean", torch.zeros(dim))
+        self.register_buffer("running_var", torch.ones(dim))
+        self.momentum, self.eps = momentum, eps
+
+    def forward(self, x: Tensor) -> Tensor:                   # [B, D]
+        if self.training:
+            mu = x.mean(0)
+            var = x.var(0, unbiased=False)
+            with torch.no_grad():
+                self.running_mean.lerp_(mu, self.momentum)
+                # Note the unbiased estimator here, and the biased one above.
+                self.running_var.lerp_(x.var(0, unbiased=True), self.momentum)
+        else:
+            mu, var = self.running_mean, self.running_var
+
+        return (x - mu) * torch.rsqrt(var + self.eps) * self.weight + self.bias
+```
+
+</CodeFrame>
+
+The mixed estimators in that update are not a mistake in the code — they are what
+PyTorch does. The normalisation uses the biased variance and the running average
+tracks the unbiased one, on the reasoning that the running value is an estimate
+of the population variance while the in-batch value is the exact statistic of the
+thing being normalised.
+
+<Rule label="Where it is still correct" />
+
+Convolutional vision, where the objection largely evaporates: batches are large,
+images are not padded, and per-channel statistics over $B \times H \times W$
+elements are stable. ResNets still train best with it. [Group
+norm](/entries/group-normalisation) exists for the vision cases where they do
+not — small batches, detection, diffusion — and it is a within-example scheme,
+like everything else that works on sequences.

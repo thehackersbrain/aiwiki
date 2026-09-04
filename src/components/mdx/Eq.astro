@@ -1,0 +1,36 @@
+---
+interface Props {
+  /** Left-hand caption, e.g. `eq. 1 — row-wise softmax`. */
+  caption?: string;
+  /** Right-hand attribution, e.g. `Vaswani et al. §3.2.1`. */
+  source?: string;
+  /** Slightly larger, for an entry's defining equation. */
+  lead?: boolean;
+}
+
+const { caption, source, lead = false } = Astro.props;
+---
+
+{/*
+  Display maths runs the full width of the column rather than the prose
+  measure, and scrolls only as a last resort — a long expression should have
+  room, not a scrollbar.
+*/}
+<figure
+  class:list={[
+    'not-prose my-0 [&_.katex-display]:my-0 [&_.katex-display]:overflow-x-auto [&_.katex-display]:overflow-y-hidden [&_.katex-display]:py-1',
+    lead ? '[&_.katex]:text-[1.28em]' : '[&_.katex]:text-[1.12em]',
+  ]}
+>
+  <div class="border-y border-rule-strong px-1 py-6 text-bone">
+    <slot />
+  </div>
+  {
+    (caption || source) && (
+      <figcaption class="flex flex-wrap justify-between gap-x-4 gap-y-1 pt-2 pb-7 font-mono text-[10px] tracking-[0.08em] text-dim-2">
+        <span>{caption}</span>
+        {source && <span>{source}</span>}
+      </figcaption>
+    )
+  }
+</figure>

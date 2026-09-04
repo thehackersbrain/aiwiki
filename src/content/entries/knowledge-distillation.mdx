@@ -1,0 +1,146 @@
+---
+name: 'Knowledge Distillation'
+desc: 'Train the small model on the big one’s distribution, not on the labels.'
+category: 'training'
+complexity: 'O(n·V)'
+path: 'training/objectives'
+difficulty: 'intermediate'
+described: '2015'
+status: 'common'
+statusNote: 'How most small models are actually made. The classroom variant is well understood; the sequence-level variants that matter for language models are still being sorted out.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['objectives', 'training', 'inference']
+lede: 'A one-hot label says the answer is "cat". A teacher’s distribution says it is a cat, that lynx was close, and that lorry was never in contention. The second is a far denser signal, and it is free.'
+metrics:
+  caption: 'Signal per token'
+  rows:
+    - { label: 'Hard label', value: 'log₂ V bits' }
+    - { label: 'Teacher distribution', value: 'the full V', accent: true }
+    - { label: 'Extra cost', value: 'one teacher pass' }
+implNote:
+  label: 'caveat'
+  html: 'Temperature scales the gradient by 1/T², which is why Hinton’s formulation multiplies the soft term by T². Omit it and the soft loss silently shrinks to nothing as the temperature rises.'
+related: [next-token-prediction, speculative-decoding, gptq, supervised-fine-tuning, masked-language-modelling, sampling-strategies]
+refs:
+  - cite: 'Hinton et al. — Distilling the Knowledge in a Neural Network (2015)'
+    id: 'arXiv:1503.02531'
+    href: https://arxiv.org/abs/1503.02531
+  - cite: 'Kim & Rush — Sequence-Level Knowledge Distillation (2016)'
+    id: 'arXiv:1606.07947'
+    href: https://arxiv.org/abs/1606.07947
+  - cite: 'Agarwal et al. — On-Policy Distillation of Language Models: Learning from Self-Generated Mistakes (2023)'
+    id: 'arXiv:2306.13649'
+    href: https://arxiv.org/abs/2306.13649
+---
+
+A hard label carries $\log_2 V$ bits and says nothing about the alternatives. A
+trained model's output distribution says which alternatives were plausible and by
+how much — Hinton's *dark knowledge*, the structure the teacher has discovered
+about how the classes relate.
+
+<Eq lead caption="eq. 1 — match the distribution, not the label">
+
+$$
+\mathcal{L} = (1-\alpha)\,\mathcal{L}_{\text{CE}}(y, p_S)
+\;+\; \alpha\, T^2 \cdot \mathrm{KL}\!\left(p_T^{(T)} \,\big\|\, p_S^{(T)}\right)
+$$
+
+</Eq>
+
+with $p^{(T)} = \mathrm{softmax}(z/T)$. Temperature flattens both distributions so
+the small probabilities — the informative ones — are not lost under the
+argmax. The $T^2$ is compensation: softening divides the logit gradient by $T$
+twice over, and without the factor the soft term vanishes exactly as it becomes
+useful.
+
+<Note label="annotation">
+Distillation is a regulariser as much as a transfer. The teacher's distribution
+is smoother than a one-hot label, so the student is never pushed towards infinite
+confidence — much of the observed benefit is that, rather than any transfer of
+knowledge the labels did not contain.
+</Note>
+
+### Sequence level, which is where language models live
+
+Token-level matching has a problem specific to generation: it is *off-policy*.
+The student is scored on the teacher's outputs, from prefixes drawn from the
+teacher's distribution, and then deployed on its own — the
+[exposure bias](/entries/next-token-prediction) of teacher forcing, with a second
+model's worth of distribution shift stacked on top.
+
+Three responses, in increasing order of cost and quality:
+
+**Hard distillation.** Generate with the teacher, train the student on the text
+as if it were data. Trivial to implement, requires no logits, and is what most
+"distilled" open models actually are. The student learns the teacher's *modes*
+and not its uncertainty.
+
+**Token-level KD.** Match the full distribution at every position of teacher-
+generated text. Denser, and needs the teacher's logits — a $[B, T, V]$ tensor
+that is usually the largest thing in the training step.
+
+**On-policy distillation.** Sample from the *student*, score those sequences with
+the teacher, and match. The distributions are compared exactly where the student
+will operate, which removes the shift. It costs a teacher forward pass per
+student sample and it is the variant that works best.
+
+<Eq caption="eq. 2 — the direction the divergence is taken in">
+
+$$
+\mathrm{KL}(p_T \| p_S) \;\text{ mass-covering}
+\qquad
+\mathrm{KL}(p_S \| p_T) \;\text{ mode-seeking}
+$$
+
+</Eq>
+
+A small student cannot represent everything a large teacher can, so the choice is
+which failure to take. Forward KL spreads the student thin across modes it cannot
+all fit and produces hedged, incoherent output. Reverse KL picks one mode and
+commits, which for generation is what you want. GKD interpolates and finds the
+optimum is usually nearer the reverse end.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor
+from torch.nn import functional as F
+
+
+def distillation_loss(
+    student: Tensor, teacher: Tensor, labels: Tensor, t: float = 2.0, alpha: float = 0.9
+) -> Tensor:
+    """student, teacher: [B, T, V] logits. Hinton et al., eq. 1."""
+    soft = F.kl_div(
+        F.log_softmax(student / t, dim=-1),
+        F.log_softmax(teacher / t, dim=-1),
+        reduction="batchmean",
+        log_target=True,                     # both in log space: no underflow
+    ) * (t * t)                              # restores the gradient scale
+
+    hard = F.cross_entropy(student.flatten(0, 1), labels.flatten())
+    return alpha * soft + (1 - alpha) * hard
+```
+
+</CodeFrame>
+
+`log_target=True` matters at a 128k vocabulary. Passing probabilities means
+exponentiating the teacher's logits first, and the tail entries — the ones
+carrying the dark knowledge — underflow to zero in bf16 before the divergence is
+taken.
+
+<Rule label="Where it sits now" />
+
+Almost every small production model is distilled. The pattern is a large model
+trained once, then a family of small ones distilled from it, because a 7B student
+of a 400B teacher beats a 7B model trained from scratch on the same budget by a
+wide margin.
+
+The economics also run the other way. [Speculative
+decoding](/entries/speculative-decoding) needs a draft model that agrees with the
+target, and distillation is how you get one — there the student is not a
+deployment artefact but a component of the teacher's own inference path.

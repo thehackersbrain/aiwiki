@@ -1,0 +1,117 @@
+---
+name: 'Kaplan Scaling Laws'
+desc: 'The 2020 power laws, and the three choices that made them recommend the wrong model.'
+category: 'training'
+complexity: '—'
+path: 'training/scaling'
+difficulty: 'intermediate'
+described: '2020'
+status: 'superseded'
+statusNote: 'Corrected by Chinchilla two years later. The power-law form survived intact; the allocation advice did not, and it shaped an entire generation of models before anyone rechecked it.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['scaling', 'training']
+lede: 'The paper that established loss falls as a power law in compute, parameters and data — and, on the strength of a fixed learning-rate schedule, told the field to build models far larger than it should have.'
+metrics:
+  caption: 'Optimal allocation of extra compute'
+  rows:
+    - { label: 'Kaplan: N ∝', value: 'C^0.73' }
+    - { label: 'Chinchilla: N ∝', value: 'C^0.50' }
+    - { label: 'GPT-3 tokens/param', value: '1.7', accent: true }
+implNote:
+  label: 'annotation'
+  html: 'Kaplan et al. also gave the field its critical-batch-size estimate and the observation that architecture details matter far less than scale — both of which held up, and both of which are cited less than the allocation result that did not.'
+related: [chinchilla-scaling-laws, training-compute-accounting, learning-rate-schedules, scaling-law-methodology, perplexity]
+refs:
+  - cite: 'Kaplan et al. — Scaling Laws for Neural Language Models (2020)'
+    id: 'arXiv:2001.08361'
+    href: https://arxiv.org/abs/2001.08361
+  - cite: 'Hoffmann et al. — Training Compute-Optimal Large Language Models (2022)'
+    id: 'arXiv:2203.15556'
+    href: https://arxiv.org/abs/2203.15556
+  - cite: 'Porian et al. — Resolving Discrepancies in Compute-Optimal Scaling of Language Models (2024)'
+    id: 'arXiv:2406.19146'
+    href: https://arxiv.org/abs/2406.19146
+---
+
+Before 2020 there was no principled way to decide how large a model to train.
+Kaplan et al. supplied one, and the form of their answer has never been
+seriously challenged.
+
+<Eq lead caption="eq. 1 — smooth power laws over seven orders of magnitude">
+
+$$
+L(N) = \left(\frac{N_c}{N}\right)^{\alpha_N},
+\qquad
+L(D) = \left(\frac{D_c}{D}\right)^{\alpha_D},
+\qquad
+L(C) = \left(\frac{C_c}{C}\right)^{\alpha_C}
+$$
+
+</Eq>
+
+with $\alpha_N \approx 0.076$ and $\alpha_D \approx 0.095$. No thresholds, no
+plateaus, no discontinuities — loss falls predictably and the exponents are
+small, which is the fact that made scaling a strategy rather than a hope.
+
+Their allocation result was that given extra compute, most of it should go to
+parameters: $N \propto C^{0.73}$, $D \propto C^{0.27}$. GPT-3 was built to that
+recommendation — 175B parameters on 300B tokens, fewer than two tokens per
+parameter — and so was almost everything trained in the two years after.
+
+<Note label="caveat">
+Chinchilla later showed the true exponents are both about 0.5, meaning parameters
+and data should grow together. A 70B model on 1.4T tokens beat GPT-3 at a quarter
+of its size. The gap between the two answers is one of the most expensive errors
+in the field's history, and it came from methodology rather than from the theory.
+</Note>
+
+### The three causes
+
+Porian et al. reproduced both papers and isolated what differed. Three choices,
+and each moves the exponent.
+
+**The learning-rate schedule.** Kaplan et al. trained every model with a single
+schedule set for their longest run. A [cosine schedule](/entries/learning-rate-schedules)
+truncated early leaves the model mid-decay and undertrained, so every small-$D$
+point was worse than it should have been — which makes data look less valuable
+than it is. Chinchilla tuned the schedule to each run's length. This is the
+largest of the three.
+
+**Embedding parameters.** Kaplan et al. excluded them from $N$; Chinchilla
+included them. At the small end of the sweep, embeddings are a large fraction of
+the model, so the two conventions disagree most exactly where the fit is most
+sensitive.
+
+**Warmup.** Small models in the Kaplan sweep spent a significant fraction of
+their brief training in warmup, again penalising short runs.
+
+Correct all three and the Kaplan setup reproduces Chinchilla's exponent. The
+disagreement was never about the science.
+
+<Rule label="What survived" />
+
+Quite a lot, and it is worth separating from what did not.
+
+The power-law form itself, over seven orders of magnitude in compute — this is
+the finding, and everything since is a refinement of the constants.
+
+The irrelevance of architectural detail: within a wide band, depth, width and
+aspect ratio move the loss far less than scale does. The result that made it
+reasonable to stop redesigning transformers and start enlarging them.
+
+The critical batch size, $B_{\text{crit}} \propto L^{-4.8}$ — a prediction of how
+large a batch can be before extra examples stop buying anything, still the
+starting point for that calculation.
+
+<Rule label="The lesson that generalises" />
+
+The failure was not in the model of scaling. It was that a hyperparameter held
+fixed across the sweep became a confound, and the confound was correlated with
+the variable being studied.
+
+That is a hazard for any scaling study, and it is why
+[methodology](/entries/scaling-law-methodology) is a topic in its own right.
+Something has to be held fixed across a sweep, and the question of whether the
+thing you fixed is neutral with respect to what you are measuring has no general
+answer — only, as here, an expensive empirical one.

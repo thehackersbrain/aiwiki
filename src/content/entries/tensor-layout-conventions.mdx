@@ -1,0 +1,156 @@
+---
+name: 'Tensor Layout Conventions'
+desc: 'Axis order, pairing schemes and epsilon placement: arbitrary until weights exist.'
+category: 'miscellany'
+complexity: '—'
+path: 'miscellany/conventions'
+difficulty: 'introductory'
+described: '—'
+status: 'common'
+statusNote: 'No convention has won and none will. The entry exists because the mismatches are silent, and a port that is quietly wrong is worse than one that crashes.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['conventions', 'inference', 'core']
+lede: 'None of these choices changes the mathematics. All of them change the checkpoint, and every one has produced a port that runs, emits plausible text, and is wrong.'
+implNote:
+  label: 'in practice'
+  html: 'The diagnostic for all of them is the same: a model that produces fluent, locally coherent output which drifts off-topic within a paragraph. A crash means the shapes disagreed; fluent nonsense means they agreed and the semantics did not.'
+related: [rotary-position-embedding, multi-head-attention, rmsnorm, layer-normalisation, flash-attention, floating-point-formats]
+refs:
+  - cite: 'Su et al. — RoFormer: Rotary Position Embedding (2021)'
+    id: 'arXiv:2104.09864'
+    href: https://arxiv.org/abs/2104.09864
+  - cite: 'Vaswani et al. — Attention Is All You Need (2017)'
+    id: 'arXiv:1706.03762'
+    href: https://arxiv.org/abs/1706.03762
+  - cite: 'Dao et al. — FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness (2022)'
+    id: 'arXiv:2205.14135'
+    href: https://arxiv.org/abs/2205.14135
+---
+
+Everything in this entry is a coin flip that someone made once and that a few
+hundred million parameters were then fitted around. There is no argument to be
+had about which is correct; there is only the question of which one the
+checkpoint in front of you assumed.
+
+### Axis order
+
+Two orderings for the attention tensors are in wide use.
+
+| Layout | Shape | Where |
+| --- | --- | --- |
+| head-second | `[B, H, T, D]` | PyTorch SDPA, most reference code |
+| head-third | `[B, T, H, D]` | FlashAttention, most fused kernels |
+
+Both describe the same numbers. The second keeps the head and feature dimensions
+adjacent in memory, so a token's full activation is contiguous — which is what a
+fused kernel wants, and why the transpose between the two shows up in every
+profile of a naïve implementation.
+
+<Note label="annotation">
+The transpose is not free and it is not fused. Moving between layouts once per
+layer on a long sequence is a full read and write of the activation tensor,
+routinely 3–5% of step time. Pick one layout and keep the model in it.
+</Note>
+
+### RoPE pairing
+
+[Rotary embeddings](/entries/rotary-position-embedding) rotate the feature
+dimension in pairs, and there are two ways to decide which components are paired.
+
+<Eq lead caption="eq. 1 — interleaved: consecutive components">
+
+$$
+(x_0, x_1),\; (x_2, x_3),\; \ldots,\; (x_{d-2}, x_{d-1})
+$$
+
+</Eq>
+
+<Eq caption="eq. 2 — halved: a component and its opposite number">
+
+$$
+(x_0, x_{d/2}),\; (x_1, x_{d/2+1}),\; \ldots,\; (x_{d/2-1}, x_{d-1})
+$$
+
+</Eq>
+
+The original paper specifies the first. Meta's LLaMA reference implementation and
+therefore most of the ecosystem use the second, and Hugging Face's conversion
+scripts permute the query and key weight matrices at load time so that the halved
+implementation reproduces the interleaved model.
+
+That permutation is the part that bites. Load a checkpoint through a path that
+skips it and the model still runs, still produces English, and has an attention
+mechanism whose positional signal is scrambled — coherent for a clause, adrift by
+the end of the paragraph.
+
+### Epsilon placement
+
+<Eq caption="eq. 3 — inside, as published">
+
+$$
+\frac{x}{\sqrt{\sigma^2 + \varepsilon}}
+\qquad\text{versus}\qquad
+\frac{x}{\sqrt{\sigma^2} + \varepsilon}
+$$
+
+</Eq>
+
+Both prevent the division by zero. They differ in the gradient near small
+$\sigma$, and they differ in the forward value by an amount that is negligible
+unless the activation is small — which, in a well-normalised network, some of
+them are. Every reference implementation puts it inside. A surprising number of
+reimplementations do not.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · the conversion that is usually the bug">
+
+```python
+import torch
+from torch import Tensor
+
+
+def interleaved_to_halved(w: Tensor, heads: int, dim: int) -> Tensor:
+    """Permute a q or k projection so a halved-RoPE kernel reproduces
+    an interleaved-RoPE checkpoint. Applied to weights, once, at load."""
+    return (
+        w.view(heads, dim // 2, 2, -1)   # split each head's rows into pairs
+        .transpose(1, 2)                 # pairs → (first halves, second halves)
+        .reshape(w.shape)
+    )
+
+
+def rotate_halved(x: Tensor) -> Tensor:
+    """The rotation this pairing implies: [-x2, x1] over the two halves."""
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def rotate_interleaved(x: Tensor) -> Tensor:
+    """The other one. Same operation, different notion of 'pair'."""
+    x = x.view(*x.shape[:-1], -1, 2)
+    x1, x2 = x.unbind(-1)
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
+```
+
+</CodeFrame>
+
+<Rule label="A checklist for a port" />
+
+When a converted model is fluent and wrong, work through these before anything
+else, because each is a single line and each produces exactly that symptom:
+
+- **RoPE pairing** — is the weight permutation applied, and applied to $q$ and
+  $k$ only?
+- **Axis order** — does the kernel expect `[B, H, T, D]` or `[B, T, H, D]`?
+- **Gate order in SwiGLU** — [the fused up-projection](/entries/swiglu) is a
+  single matrix whose halves are gate and value; swapping them is silent.
+- **Norm variance** — biased ($/d$) or Bessel-corrected ($/(d{-}1)$)?
+- **Attention scale** — $1/\sqrt{d_{\text{head}}}$, not $1/\sqrt{d_{\text{model}}}$.
+- **Causal mask offset** — does position $i$ see position $i$, or only $i-1$?
+
+The fastest way to localise it is to compare hidden states layer by layer against
+a known-good implementation on one short prompt. The first layer where the
+cosine similarity drops below about 0.99 is the layer with the bug, and the list
+above will name it.

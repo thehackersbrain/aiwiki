@@ -1,0 +1,157 @@
+---
+name: 'Nondeterminism'
+desc: 'Why the same prompt, the same weights and the same seed give different logits.'
+category: 'miscellany'
+complexity: '—'
+path: 'miscellany/numerics'
+difficulty: 'intermediate'
+described: '2020'
+status: 'standard'
+statusNote: 'Not a technique but a property of the stack. Any evaluation, regression test or reproducibility claim that ignores it is measuring something other than what it thinks.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['numerics', 'inference', 'evaluation']
+lede: 'Floating-point addition is not associative, GPU reductions do not fix their order, and a served model does not control its own batch. Three facts, and between them they account for almost every irreproducible result.'
+metrics:
+  caption: 'Typical divergence, greedy decoding'
+  rows:
+    - { label: 'Same batch, same run', value: 'bitwise equal' }
+    - { label: 'Different batch size', value: '≈ 1e−3 in logits' }
+    - { label: 'Tokens to visible drift', value: '10 … 100', accent: true }
+implNote:
+  label: 'in practice'
+  html: 'Temperature zero is not determinism. It removes the sampler as a source of variation and leaves every other source untouched — which is why greedy decoding still produces different completions across runs.'
+related: [floating-point-formats, tensor-layout-conventions, continuous-batching, sampling-strategies, perplexity, paged-attention]
+refs:
+  - cite: 'Jouppi et al. — In-Datacenter Performance Analysis of a Tensor Processing Unit (2017)'
+    id: 'arXiv:1704.04760'
+    href: https://arxiv.org/abs/1704.04760
+  - cite: 'Riquelme et al. — Scaling Vision with Sparse Mixture of Experts (2021)'
+    id: 'arXiv:2106.05974'
+    href: https://arxiv.org/abs/2106.05974
+  - cite: 'Zhuang et al. — Randomness In Neural Network Training (2021)'
+    id: 'arXiv:2106.11872'
+    href: https://arxiv.org/abs/2106.11872
+---
+
+Set the seed, set temperature to zero, run the same prompt twice, and get two
+different completions. This surprises people, and the surprise is the problem —
+it leads to bug reports filed against sampling code that is working correctly.
+
+The seed controls the sampler. Nothing else in the stack consulted it.
+
+### Addition is not associative
+
+<Eq lead caption="eq. 1 — the whole root cause, in one line">
+
+$$
+(a + b) + c \;\neq\; a + (b + c)
+$$
+
+</Eq>
+
+In exact arithmetic these are equal. In floating point each addition rounds, and
+rounding depends on the magnitudes of the operands, so a different grouping gives
+a different answer. The difference is one unit in the last place per operation —
+utterly negligible, and it does not stay negligible.
+
+A GPU reduction is a tree, and the shape of the tree is chosen by the kernel from
+the problem size, the launch configuration and sometimes an autotuner. Change any
+of them and the grouping changes.
+
+<Note label="annotation">
+Some kernels are worse than merely order-dependent: they use atomic adds, where
+the order is whatever the hardware scheduler happened to do. Those are not
+reproducible even between two identical launches. <code>torch.use_deterministic_algorithms(True)</code>
+exists to refuse them, and it will raise rather than silently substitute.
+</Note>
+
+### Batch size changes the answer
+
+This is the one that catches people in production. cuBLAS and its successors pick
+a matmul kernel from the shapes involved, and a batch of 1 gets a different
+kernel — different tiling, different split-K, different reduction order — than a
+batch of 32. Same weights, same input row, different logits in the last few
+decimal places.
+
+With [continuous batching](/entries/continuous-batching), your request is grouped
+with whatever else arrived in the same window. The batch composition is a
+function of other people's traffic, so the numerics of your own request are too.
+This is why a served model gives different output than the same model run locally,
+and why it gives different output at 3 a.m. than at noon.
+
+### Where 1e−3 becomes a different sentence
+
+Greedy decoding takes an argmax. Almost always the top two logits are far enough
+apart that a $10^{-3}$ perturbation cannot reorder them — and then a token arrives
+where they are not.
+
+<Eq caption="eq. 2 — the point at which noise decides">
+
+$$
+|z_{(1)} - z_{(2)}| < \epsilon_{\text{numeric}}
+$$
+
+</Eq>
+
+Past that token the two runs have different context, and they diverge completely
+rather than gradually. Ten to a hundred tokens is the usual distance to a visible
+split for a 7B model; a chain-of-thought trace with hundreds of near-ties reaches
+it faster.
+
+### Mixture of experts
+
+[MoE routing](/entries/mixture-of-experts-routing) makes it structural rather
+than numerical. Experts have finite capacity per batch; when more tokens route to
+an expert than it can take, the surplus is dropped. Which tokens are dropped
+depends on what else is in the batch — so a token's *computation*, not merely its
+rounding, depends on its neighbours.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch · as close as it gets">
+
+```python
+import os
+
+import torch
+
+# Must be set before the CUDA context exists. cuBLAS otherwise picks
+# split-K kernels whose reduction order varies with workspace availability.
+os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+
+def make_deterministic(seed: int = 0) -> None:
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # Raises on any op with no deterministic implementation, rather than
+    # quietly using the nondeterministic one.
+    torch.use_deterministic_algorithms(True)
+
+    # cuDNN autotuning benchmarks kernels at runtime and picks the fastest,
+    # which is not stable across machines or even across runs.
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+```
+
+</CodeFrame>
+
+What this buys is run-to-run reproducibility on one machine, at one batch size,
+with one library version, typically at a 10–20% throughput cost. What it does not
+buy is reproducibility across GPU architectures, across batch sizes, or against a
+served endpoint — none of which are under your control from inside the process.
+
+<Rule label="What to do about it" />
+
+Mostly, stop requiring bitwise equality. It is the wrong test for a system built
+on floating point, and pinning it forces an expensive configuration on production
+in order to satisfy CI.
+
+Better tests: assert on distributions rather than samples — mean and variance of
+a metric over $n$ runs, with an interval; compare logits with a tolerance rather
+than an equality; and pin the batch size in any evaluation whose numbers will be
+compared against numbers from another day. For anything comparative, the
+[statistical power](/entries/statistical-power) question comes first anyway, and
+seed variance is usually smaller than the effect being argued about — which makes
+it a reason to run more seeds, not a reason to eliminate them.

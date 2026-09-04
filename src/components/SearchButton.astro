@@ -1,0 +1,32 @@
+---
+/**
+ * The nav trigger. It is a separate component from the panel because the panel
+ * must not render inside the header: the header carries a backdrop-filter,
+ * which makes it the containing block for any `position: fixed` descendant, so
+ * an overlay nested inside it sizes to the header instead of the viewport.
+ * The panel binds to this button by attribute, wherever either one sits.
+ */
+---
+
+<button
+  type="button"
+  data-search-open
+  aria-label="Search the grimoire"
+  class="flex items-baseline gap-1.5 text-dim transition-colors hover:text-chalk"
+>
+  <svg
+    viewBox="0 0 14 14"
+    width="12"
+    height="12"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.4"
+    aria-hidden="true"
+    class="translate-y-[1px]"
+  >
+    <circle cx="6" cy="6" r="4.25"></circle>
+    <path d="M9.2 9.2 12.6 12.6" stroke-linecap="round"></path>
+  </svg>
+  <span class="sr-only">Search</span>
+  <span aria-hidden="true" class="hidden text-dim-3 sm:inline">⌘K</span>
+</button>

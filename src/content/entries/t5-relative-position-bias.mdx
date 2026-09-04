@@ -1,0 +1,142 @@
+---
+name: 'T5 Relative Position Bias'
+desc: 'One learned scalar per head per log-spaced distance bucket, added to the logits.'
+category: 'architectures'
+complexity: 'O(n²)'
+memory: 'O(H·B) parameters'
+path: 'architectures/position'
+difficulty: 'intermediate'
+described: '2019'
+status: 'common'
+statusNote: 'Still the default in the T5 lineage and in most encoder-decoder work. New decoder-only models use RoPE instead, but this remains the cheapest scheme that works.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['position', 'attention']
+lede: 'Strip the relative scheme down to a scalar. No vectors, no content interaction — just a learned number per head for "roughly this far away", added to the attention logit.'
+metrics:
+  caption: 'T5-base configuration'
+  rows:
+    - { label: 'Buckets', value: '32' }
+    - { label: 'Max distance', value: '128' }
+    - { label: 'Parameters', value: '32 × 12 = 384', accent: true }
+implNote:
+  label: 'in practice'
+  html: 'T5 computes the bias in the first layer only and shares it with every layer above. Removing that sharing costs parameters and buys nothing measurable.'
+related: [relative-position-embeddings, alibi, rotary-position-embedding, scaled-dot-product-attention, sinusoidal-position-encoding]
+refs:
+  - cite: 'Raffel et al. — Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer (2019)'
+    id: 'arXiv:1910.10683'
+    href: https://arxiv.org/abs/1910.10683
+  - cite: 'Press et al. — Train Short, Test Long: ALiBi (2021)'
+    id: 'arXiv:2108.12409'
+    href: https://arxiv.org/abs/2108.12409
+  - cite: 'Chi et al. — KERPLE: Kernelized Relative Positional Embedding (2022)'
+    id: 'arXiv:2205.09921'
+    href: https://arxiv.org/abs/2205.09921
+---
+
+[Shaw's scheme](/entries/relative-position-embeddings) gives every offset a
+learned $d$-dimensional vector, and pays $O(n^2 d)$ for the privilege. T5 asks
+what happens if the vector is a scalar and the offsets are bucketed.
+
+<Eq lead caption="eq. 1 — a number, not a vector">
+
+$$
+e_{ij} = \frac{q_i^\top k_j}{\sqrt{d_k}} + b_{h,\,\beta(i-j)}
+$$
+
+</Eq>
+
+$b$ is a table of $H \times B$ learned scalars and $\beta$ maps an offset to one
+of $B$ buckets. For T5-base that is 384 parameters — for the entire model, at
+every layer, across all context lengths. It is difficult to overstate how little
+this costs.
+
+<Note label="annotation">
+Note what is given up: the bias does not depend on content. A head cannot say
+"look three back if this is a verb"; it can only say "prefer three back". Shaw's
+term (b) is gone. Empirically the loss is small, which is itself an interesting
+result about how much of positional behaviour is content-conditional.
+</Note>
+
+### Log-spaced buckets
+
+The bucketing is the part worth studying. Near offsets get one bucket each;
+distant ones are grouped logarithmically, so resolution decays with distance.
+
+<Eq caption="eq. 2 — exact when near, logarithmic when far">
+
+$$
+\beta(\delta) =
+\begin{cases}
+|\delta| & |\delta| < B/4 \\[4pt]
+\left\lfloor \dfrac{B}{4} + \dfrac{\log(|\delta| \cdot 4/B)}{\log(D \cdot 4/B)} \cdot \dfrac{B}{4} \right\rfloor
+& \text{otherwise}
+\end{cases}
+$$
+
+</Eq>
+
+with the sign of $\delta$ selecting the half of the table for a bidirectional
+model, and everything past $D$ clamped into the final bucket. The design encodes
+a belief that turns out to be right: the difference between offsets 3 and 4
+matters, and the difference between 300 and 400 does not.
+
+### Extrapolation, and its limit
+
+Because far offsets share buckets, a longer sequence introduces no unseen
+inputs — every distance past $D = 128$ lands in the bucket the model already
+trained on. T5 therefore runs at lengths it never saw without crashing, and
+degrades gently rather than sharply.
+
+But it does not *extend* context, and it is worth being clear about why. Beyond
+128 tokens the bias is a constant: the model is told only that something is far,
+not how far, and cannot rank two distant candidates by proximity. That is enough
+to keep perplexity respectable and not enough to retrieve from long context,
+which is why the long-context work went to [rotary scaling](/entries/rope-scaling)
+instead.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import math
+
+import torch
+from torch import Tensor, nn
+
+
+def bucket(offset: Tensor, buckets: int = 32, max_distance: int = 128) -> Tensor:
+    """Signed offset → bucket index, exact when near and log-spaced when far."""
+    half = buckets // 2
+    idx = (offset > 0).long() * half                          # sign selects the half
+    d = offset.abs()
+
+    exact = half // 2
+    is_far = d >= exact
+    far = exact + (
+        torch.log(d.float().clamp(min=1) / exact)
+        / math.log(max_distance / exact)
+        * (half - exact)
+    ).long()
+    return idx + torch.where(is_far, far.clamp(max=half - 1), d)
+
+
+class RelativeBias(nn.Module):
+    def __init__(self, heads: int, buckets: int = 32, max_distance: int = 128):
+        super().__init__()
+        self.table = nn.Embedding(buckets, heads)
+        self.buckets, self.max_distance = buckets, max_distance
+
+    def forward(self, n: int, device: torch.device) -> Tensor:          # [1, H, n, n]
+        pos = torch.arange(n, device=device)
+        b = bucket(pos[None, :] - pos[:, None], self.buckets, self.max_distance)
+        return self.table(b).permute(2, 0, 1).unsqueeze(0)
+```
+
+</CodeFrame>
+
+The bias is a function of sequence length alone, so it is built once and reused —
+never recomputed per layer or per batch element. For a causal model, only the
+lower triangle is ever read and the sign branch collapses, halving the table.

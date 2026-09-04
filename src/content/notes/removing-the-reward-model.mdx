@@ -1,0 +1,150 @@
+---
+title: 'Removing the reward model'
+desc: 'DPO inverts the closed form from part 4, and what it gives up is not obvious until you look for it.'
+lede: 'One rearrangement deletes the reward model, the value model, the sampling loop and most of the difficulty. It also quietly removes the ability to learn from anything the model says now.'
+series: 'alignment-from-scratch'
+part: 5
+minutes: 10
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['alignment', 'objectives', 'training']
+related: [direct-preference-optimisation, kl-regularisation, reward-modelling, grpo, proximal-policy-optimisation, test-time-compute-scaling]
+refs:
+  - cite: 'Rafailov et al. — Direct Preference Optimization: Your Language Model is Secretly a Reward Model (2023)'
+    id: 'arXiv:2305.18290'
+    href: https://arxiv.org/abs/2305.18290
+  - cite: 'Xu et al. — Is DPO Superior to PPO for LLM Alignment? A Comprehensive Study (2024)'
+    id: 'arXiv:2404.10719'
+    href: https://arxiv.org/abs/2404.10719
+  - cite: 'Tajwar et al. — Preference Fine-Tuning of LLMs Should Leverage Suboptimal, On-Policy Data (2024)'
+    id: 'arXiv:2404.14367'
+    href: https://arxiv.org/abs/2404.14367
+  - cite: 'DeepSeek-AI — DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning (2025)'
+    id: 'arXiv:2501.12948'
+    href: https://arxiv.org/abs/2501.12948
+---
+
+Part 4 produced a closed form for the optimal policy and then discarded it as
+uncomputable. DPO's contribution is noticing that it does not need to be
+computed — only rearranged.
+
+### The inversion
+
+Start from eq. 2 of part 4 and solve for the reward instead of the policy.
+
+<Eq lead caption="eq. 1 — the reward, in terms of the policy">
+
+$$
+r(x, y) = \beta \log \frac{\pi^{*}(y \mid x)}{\pi_{\text{ref}}(y \mid x)} + \beta \log Z(x)
+$$
+
+</Eq>
+
+The intractable $Z(x)$ is still there. But now substitute this into the
+Bradley–Terry likelihood from part 3, which depends only on the *difference* of
+two rewards for the same prompt — and $\beta \log Z(x)$ is the same in both terms.
+
+It cancels.
+
+<Eq caption="eq. 2 — DPO, with no reward model anywhere in it">
+
+$$
+\mathcal{L}_{\text{DPO}} = -\mathbb{E}\left[\log \sigma\!\left(
+\beta \log \frac{\pi_\theta(y_w \mid x)}{\pi_{\text{ref}}(y_w \mid x)}
+- \beta \log \frac{\pi_\theta(y_l \mid x)}{\pi_{\text{ref}}(y_l \mid x)}
+\right)\right]
+$$
+
+</Eq>
+
+That is a supervised loss on preference pairs. Two forward passes through the
+policy, two through the frozen reference, one logistic loss. No reward model, no
+value model, no sampling during training, no PPO.
+
+<Note label="annotation">
+The first time through I assumed this was an approximation of the RLHF objective.
+It is not — the derivation is exact. Under the Bradley–Terry assumption, the
+policy minimising eq. 2 is <em>the same policy</em> that maximises the constrained
+objective. The partition function was never the obstacle it appeared to be; it
+was an obstacle to <em>sampling</em>, and this route never samples.
+</Note>
+
+The $\beta$ is the same $\beta$ as the KL coefficient, which is the tell that this
+is the same objective. DPO has a KL constraint; it just never computes a KL.
+
+### What it costs in practice
+
+Four models became one, or one and a bit. And with LoRA the reference is free —
+disable the adapters and the base weights *are* $\pi_{\text{ref}}$ — so a 70B DPO
+run fits where a 7B PPO run struggled. This is most of why DPO displaced PPO
+across the open ecosystem within about a year.
+
+### What it gives up
+
+One thing, and it took the field a while to name it: **the data are fixed**.
+
+A reward model can score whatever the policy produces right now. A preference
+dataset was written down before training started, by a model that is not this one,
+and it cannot say anything about the responses the current policy has drifted
+towards.
+
+<Eq caption="eq. 3 — the two regimes">
+
+$$
+\text{PPO: } y \sim \pi_\theta \text{ (now)}
+\qquad\qquad
+\text{DPO: } (y_w, y_l) \sim \mathcal{D} \text{ (fixed)}
+$$
+
+</Eq>
+
+Tajwar et al. show this matters and characterise when. Preference tuning benefits
+substantially from **on-policy** data — responses sampled from the current
+policy — and the gap widens the further the policy moves from whatever generated
+the dataset. Xu et al. reach a compatible conclusion from the other direction:
+with sufficient budget and a good reward model, well-tuned PPO still beats DPO on
+hard tasks, and their explanation is precisely that DPO cannot correct behaviours
+absent from its data.
+
+<Note label="caveat">
+There is a specific pathology worth knowing. Eq. 2 only constrains the
+<em>difference</em> in log-ratios, so it can be reduced by pushing the rejected
+response's probability down rather than the chosen one's up — and both can fall.
+A DPO run where the chosen-response log-probability decreases throughout is
+common, and it is not obviously a failure, but it is not what anyone intends.
+</Note>
+
+The response is iterative DPO: run it, sample from the improved policy, get those
+new samples labelled, run it again. Which recovers on-policy data at the cost of
+reintroducing the labelling loop DPO was meant to avoid — and at that point the
+distance to PPO is smaller than it looked.
+
+### Where the argument went next
+
+The interesting turn is that both branches of this series assume the reward is a
+*proxy*. Part 3's overoptimisation, part 4's leash, this part's careful
+$\beta$ — all of it exists because the reward model can be wrong.
+
+When the reward is **verifiable** — a maths answer that checks out, a test suite
+that passes — none of that applies. There is nothing to overoptimise into, so the
+KL leash can be dropped, and [R1-style](/entries/test-time-compute-scaling)
+recipes do exactly that with [GRPO](/entries/grpo). What emerges is long chains of
+reasoning that a leash to the SFT policy would have prevented.
+
+I find this the most interesting thing in post-training right now, and also the
+most over-generalised. It works because the reward is ground truth. For anything
+scored by a learned model or an [LLM judge](/entries/llm-as-judge), the proxy is
+back, and so is everything in parts 3 and 4.
+
+<Rule label="End of series" />
+
+Five parts. A base model is doing document continuation; demonstrations redirect
+it and cannot express a negative; comparisons carry a negative and need to be
+turned into a scalar; the scalar is only valid near where it was fitted, which is
+what the KL term is for; and the constrained objective has a closed form that can
+be inverted, which removes most of the apparatus and one real capability.
+
+What I take from having written it down: almost every design decision in RLHF
+follows from *the reward is learned and therefore wrong somewhere*. Read any new
+method against that sentence and it usually resolves into either a better proxy,
+a tighter leash, or a way to avoid needing one.

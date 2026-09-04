@@ -1,0 +1,131 @@
+---
+name: 'Sinusoidal Position Encoding'
+desc: 'Fixed sinusoids of geometrically spaced frequencies, added to the token embeddings.'
+category: 'architectures'
+complexity: 'O(n·d)'
+memory: 'O(n·d)'
+path: 'architectures/position'
+difficulty: 'introductory'
+described: '2017'
+status: 'superseded'
+statusNote: 'The original scheme, and the one every later design is a reaction to. Nothing trained since about 2021 uses it, but the argument it makes still shapes the field.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['position', 'attention', 'core']
+lede: 'The first answer to the question. Build a table of sines and cosines at geometrically spaced frequencies, add it to the token embeddings, and let the model work out what to do with it.'
+implNote:
+  label: 'caveat'
+  html: 'The encoding is <em>added</em> to the embedding, not concatenated. That is a deliberate economy — it costs no width — but it means position and content share a vector space and the dot product cannot separate them.'
+related: [scaled-dot-product-attention, rotary-position-embedding, alibi, multi-head-attention]
+refs:
+  - cite: 'Vaswani et al. — Attention Is All You Need (2017)'
+    id: 'arXiv:1706.03762'
+    href: https://arxiv.org/abs/1706.03762
+  - cite: 'Gehring et al. — Convolutional Sequence to Sequence Learning (2017)'
+    id: 'arXiv:1705.03122'
+    href: https://arxiv.org/abs/1705.03122
+  - cite: 'Wang & Chen — What Do Position Embeddings Learn? (2020)'
+    id: 'arXiv:2010.04903'
+    href: https://arxiv.org/abs/2010.04903
+---
+
+Self-attention is a sum over a set. Permute the tokens and every score, every
+weight and every output permutes with them — the operation genuinely cannot tell
+`the cat sat` from `sat cat the`. Position is not something attention loses; it
+is something attention never had, and it has to be supplied from outside.
+
+The original transformer supplies it by adding a fixed vector to each token
+embedding before the first layer.
+
+<Eq lead caption="eq. 1 — one vector per position, no parameters">
+
+$$
+\mathrm{PE}_{(p,\,2i)} = \sin\!\left(\frac{p}{10000^{2i/d}}\right)
+\qquad
+\mathrm{PE}_{(p,\,2i+1)} = \cos\!\left(\frac{p}{10000^{2i/d}}\right)
+$$
+
+</Eq>
+
+Read it as a clock face with $d/2$ hands. The hand at $i = 0$ turns once per
+token; the hand at $i = d/2 - 1$ turns once per $2\pi \cdot 10^4$ tokens. Any
+position is the unique reading of all the hands at once, and nearby positions
+give nearby readings on the fast hands while agreeing on the slow ones.
+
+<Note label="annotation">
+Ten thousand is not derived from anything. It sets the longest wavelength, and
+therefore the range over which the slowest dimensions still vary. Every rotary
+scheme since has inherited the constant, and every context-extension method is in
+some sense an argument about what it should have been.
+</Note>
+
+### The relative-position argument
+
+The paper's justification is that offsets are linear: for a fixed $k$ there is a
+matrix $M_k$, independent of $p$, with $\mathrm{PE}_{p+k} = M_k \,\mathrm{PE}_p$.
+It is a rotation by $k\omega_i$ in each two-dimensional subspace, so the claim is
+exactly true.
+
+What does not follow is that the model gets relative position for free. The
+encoding is added to the content vector, so a query at position $p$ is
+$W_Q(x_p + \mathrm{PE}_p)$ and the score expands into four terms — content with
+content, content with position, position with content, position with position.
+Only the last depends on the offset alone, and it is entangled with the other
+three in a single scalar. The linear structure is available to be learned; it is
+not imposed.
+
+<Eq caption="eq. 2 — what the score actually contains">
+
+$$
+q_p^\top k_j = \underbrace{x_p^\top W^\top W x_j}_{\text{content}}
++ x_p^\top W^\top W\,\mathrm{PE}_j
++ \mathrm{PE}_p^\top W^\top W x_j
++ \underbrace{\mathrm{PE}_p^\top W^\top W\,\mathrm{PE}_j}_{\text{position}}
+$$
+
+</Eq>
+
+[Relative position embeddings](/entries/relative-position-embeddings) exist
+because of that expansion, and [rotary embeddings](/entries/rotary-position-embedding)
+exist because rotating $q$ and $k$ rather than adding to $x$ makes the offset
+dependence structural instead of learned.
+
+### Why it does not extrapolate
+
+Nothing about the table is undefined past the training length — the sinusoids
+carry on. The problem is that the *scores* do not. Positions beyond anything seen
+in training produce combinations of phases the attention weights were never fit
+against, and perplexity degrades sharply within a few hundred tokens of the
+training window. The encoding is defined everywhere; the model is not.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import math
+
+import torch
+from torch import Tensor
+
+
+def sinusoidal(n: int, d: int, base: float = 10_000.0) -> Tensor:
+    """[n, d] table. Even dims sine, odd dims cosine, shared frequency."""
+    p = torch.arange(n).unsqueeze(1)                          # [n, 1]
+    i = torch.arange(0, d, 2)                                 # [d/2]
+    # exp/log rather than a direct power: base**(i/d) overflows fp32 for large d.
+    freq = torch.exp(-math.log(base) * i / d)                 # [d/2]
+
+    pe = torch.zeros(n, d)
+    pe[:, 0::2] = torch.sin(p * freq)
+    pe[:, 1::2] = torch.cos(p * freq)
+    return pe
+```
+
+</CodeFrame>
+
+Two conventions are in circulation and they disagree. The paper interleaves sine
+and cosine on adjacent dimensions, as above; several widely copied
+implementations concatenate the sine block and the cosine block instead. Both
+train equally well, and neither is compatible with the other's checkpoints — the
+same silent-mismatch hazard that later reappears in RoPE's two pairing schemes.

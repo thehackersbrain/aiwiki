@@ -1,0 +1,135 @@
+---
+title: 'How I read a paper in this field'
+desc: 'A working procedure, and the four questions that decide whether the result transfers.'
+lede: 'Most of what I read does not replicate at my scale, on my data, with my budget. This is the filter I use to work out which parts might.'
+minutes: 8
+unfinished: true
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['evaluation', 'notes', 'method']
+related: [scaling-law-methodology, statistical-power, emergent-abilities, contamination-detection, llm-as-judge]
+refs:
+  - cite: 'Choshen et al. — A Hitchhiker’s Guide to Scaling Law Estimation (2024)'
+    id: 'arXiv:2410.11840'
+    href: https://arxiv.org/abs/2410.11840
+  - cite: 'Besiroglu et al. — Chinchilla Scaling: A Replication Attempt (2024)'
+    id: 'arXiv:2404.10102'
+    href: https://arxiv.org/abs/2404.10102
+  - cite: 'Bouthillier et al. — Accounting for Variance in Machine Learning Benchmarks (2021)'
+    id: 'arXiv:2103.03098'
+    href: https://arxiv.org/abs/2103.03098
+---
+
+This is the least finished thing here and I am publishing it anyway, because
+writing it down has been more useful to me than getting it right would be.
+
+The problem: far more is published than anyone can read, most results are
+reported at a scale I do not have, and the abstract is written to make the method
+sound general. I needed a filter.
+
+### The four questions
+
+I ask these before reading past the method section, and they decide how much
+attention the rest gets.
+
+**1. What was held fixed, and is it neutral?**
+
+The [Kaplan](/entries/kaplan-scaling-laws) failure is the canonical example: a
+learning-rate schedule held constant across a sweep, penalising exactly the runs
+that varied the quantity being measured. The conclusion was wrong and nothing in
+the paper was sloppy.
+
+So: what is constant across the comparison, and could it plausibly interact with
+the axis being varied? If the answer is "a hyperparameter tuned for one arm", the
+result is about that tuning.
+
+**2. Is the baseline tuned as hard as the method?**
+
+Almost never. The authors spent months on their method and ran the baseline from
+a config file. A new optimiser beating AdamW at the authors' AdamW settings is a
+much weaker claim than it appears, and papers rarely state how much search each
+arm received.
+
+The tell is an ablation table where every row of the proposed method is tuned and
+the baseline is one row.
+
+**3. Does the improvement exceed the seed variance?**
+
+Bouthillier et al.'s number has stayed with me: on standard benchmarks, seed and
+data-order variation alone produces spreads comparable to the differences papers
+routinely report as improvements. A single-run comparison with a 0.4-point gap is
+not evidence of anything.
+
+Three seeds with an interval is the minimum I now believe. Most papers report
+one, and the omission is usually not mentioned.
+
+**4. At what scale, and does the mechanism predict transfer?**
+
+This is the question I get most wrong. A result at 100M may or may not hold at
+70B, and the way to guess is not the size of the gap but whether the *mechanism*
+depends on scale.
+
+[ScaleNorm](/entries/scale-norm) is the cautionary case: a single scalar gain in
+place of a per-channel one, correct at the width it was tested at, wrong at the
+widths that came after — because the per-channel gain absorbs differences that
+grow with width. The mechanism had a scale dependence and the paper had no reason
+to notice.
+
+<Note label="annotation">
+The inverse also happens. Chinchilla's exponent was derived from models far
+smaller than the ones it now governs, and it transferred, because the power-law
+form is a claim about the shape rather than about any particular size. Small-scale
+results transfer when the mechanism is scale-free and fail when it is not, and
+telling which is the actual skill.
+</Note>
+
+### What I do with the answers
+
+Roughly three buckets.
+
+**Might be true for me.** Mechanism is scale-free, baseline looks fairly treated,
+variance addressed. I will consider trying it, and I will run the baseline myself
+first.
+
+**True at their scale, unknown at mine.** Most things. I note it and wait for
+someone else to report a replication at a size closer to mine.
+
+**Probably an artefact.** Untuned baseline, single seed, a metric chosen after
+the fact. I read the related-work section for the citations and stop.
+
+### The parts I skip and the parts I read twice
+
+Skipped: the introduction, the related work on first pass, and most of the
+results section.
+
+Read twice: the experimental setup, in full, including the appendix — this is
+where question 1 is answered, usually inadvertently. And the limitations section
+where there is an honest one, which is rarer than it should be and a strong
+positive signal when present.
+
+The best papers state their own confound. Porian et al. reconciling Kaplan and
+Chinchilla, Besiroglu et al. failing to reproduce a fit from the paper's own
+figures, Schaeffer et al. manufacturing emergence to show it can be manufactured —
+these are the papers I trust most, and they share the property of trying to break
+their own result.
+
+<Rule label="Still open" />
+
+Things I have not worked out, which is why this note is marked unfinished:
+
+**How to weigh a result I cannot replicate at all.** Frontier-scale findings —
+training dynamics at 400B, cluster-level behaviour — are unavailable to almost
+everyone and are also the ones that matter most for understanding what is
+happening. I have no procedure here beyond noting who reported it.
+
+**When to trust a benchmark number.** Between
+[contamination](/entries/contamination-detection),
+[judge](/entries/llm-as-judge) bias and metric choice, I have gradually stopped
+believing most reported evaluations, and I do not have a replacement — only a
+vaguer sense of which sources have been careful before.
+
+**How much to discount for incentive.** A paper from a lab shipping a product
+with the technique in it is not thereby wrong. But it is not independent
+evidence either, and I do not know what the correct adjustment is.
+
+If I work any of these out I will revise this rather than write a second one.

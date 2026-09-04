@@ -1,0 +1,103 @@
+---
+name: 'Unsloth'
+desc: 'Hand-written kernels and manual backward passes for fine-tuning on one GPU.'
+category: 'tooling'
+complexity: '—'
+path: 'tooling/tuning'
+difficulty: 'intermediate'
+described: '2023'
+status: 'common'
+statusNote: 'The fastest single-GPU fine-tuning path, and single-GPU only in the free version. Widely used for exactly that case.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['tooling', 'training', 'fine-tuning', 'memory']
+lede: 'The same LoRA fine-tune as PEFT, roughly twice as fast in half the memory, with no approximation. The gains come from rewriting the kernels rather than from changing the method.'
+metrics:
+  caption: 'Reported, single GPU'
+  rows:
+    - { label: 'Speed vs HF + PEFT', value: '≈ 2×' }
+    - { label: 'Memory', value: '≈ 50% less', accent: true }
+    - { label: 'Accuracy cost', value: 'none claimed' }
+implNote:
+  label: 'annotation'
+  html: 'The claim of no accuracy loss is credible because nothing about the mathematics changes — these are fused Triton kernels and hand-derived backward passes for the same operations, not approximations of them.'
+related: [peft-and-trl, lora, qlora, transformers-library, config-driven-finetuning, gradient-checkpointing, gradient-accumulation]
+refs:
+  - cite: 'Unsloth'
+    id: 'github'
+    href: https://github.com/unslothai/unsloth
+  - cite: 'Unsloth — Gradient accumulation bug fix (2024)'
+    id: 'unsloth.ai'
+    href: https://unsloth.ai/blog/gradient
+  - cite: 'Dettmers et al. — QLoRA: Efficient Finetuning of Quantized LLMs (2023)'
+    id: 'arXiv:2305.14314'
+    href: https://arxiv.org/abs/2305.14314
+---
+
+[PEFT and TRL](/entries/peft-and-trl) are reference implementations: correct,
+general, and not tuned. Unsloth is the same algorithms with the hot paths
+rewritten.
+
+- **Fused Triton kernels** for RMSNorm, RoPE, the SwiGLU block and cross-entropy,
+  so intermediates stay in registers instead of round-tripping to HBM.
+- **Manually derived backward passes** for the LoRA path, avoiding the generic
+  autograd graph and the tensors it keeps alive.
+- **Chunked cross-entropy**, which never materialises the `[B, T, V]` logits —
+  usually the single largest allocation in a fine-tuning step.
+
+None of that changes what is computed, which is why "twice as fast, no accuracy
+cost" is a reasonable claim rather than a suspicious one.
+
+<CodeFrame meta="python">
+
+```python
+from unsloth import FastLanguageModel
+
+model, tok = FastLanguageModel.from_pretrained(
+    "unsloth/llama-3.1-8b-bnb-4bit",
+    max_seq_length=4096,
+    load_in_4bit=True,                # QLoRA, with their quantised checkpoints
+)
+
+model = FastLanguageModel.get_peft_model(
+    model,
+    r=16,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                    "gate_proj", "up_proj", "down_proj"],
+    use_gradient_checkpointing="unsloth",   # their variant, not torch's
+)
+
+# From here it is TRL. SFTTrainer, DPOTrainer, GRPOTrainer all work unchanged.
+```
+
+</CodeFrame>
+
+### What it is for
+
+- **Fine-tuning on one consumer GPU.** An 8B QLoRA run fits comfortably in 16 GB
+  and is usable in 12.
+- **Dropping into an existing TRL script.** Two changed lines at the top; the
+  trainer code is untouched.
+- **Long-context fine-tuning**, where the memory savings compound with sequence
+  length.
+
+### What it is not for
+
+**Multi-GPU.** Distributed training is not in the open version. A run that needs
+more than one card wants [config-driven
+tooling](/entries/config-driven-finetuning) over Accelerate or DeepSpeed.
+
+**Full fine-tuning at scale.** The optimisations are aimed at the adapter path.
+
+**Architectures it has not covered.** The kernels are per-architecture, so a new
+or unusual model may not be supported — where
+[Transformers](/entries/transformers-library) has everything.
+
+<Note label="annotation">
+Unsloth's team found and published the <a href="/entries/gradient-accumulation">
+gradient accumulation normalisation bug</a> that affected several major
+libraries in 2024 — dividing by the number of micro-batches rather than by total
+tokens. That is a useful signal about the project: the speed comes from people
+reading the arithmetic closely, and it is the same attention that turned up a
+correctness bug nobody else had noticed.
+</Note>

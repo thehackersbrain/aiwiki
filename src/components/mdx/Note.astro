@@ -1,0 +1,29 @@
+---
+interface Props {
+  /** Mono label above the note: 'aside', 'annotation', 'caveat', 'in practice'… */
+  label?: string;
+}
+
+const { label = 'aside' } = Astro.props;
+---
+
+{/*
+  A note beside the sentence that provoked it, not deferred to the foot of
+  the page. The outer div sits in the flow at the right vertical position but
+  contributes no height, so the prose reads straight through; the aside is
+  lifted out into the margin beside it. Below md the two collapse and the note
+  reads as a callout above the paragraph — proximity without the geometry.
+*/}
+<div data-margin-note class="not-prose md:relative md:h-0">
+  <aside
+    class="mt-1 mb-5 border border-accent-edge bg-accent-wash px-3 py-2.5 md:absolute md:top-0 md:right-[calc(100%+3rem)] md:mt-0 md:mb-0 md:w-[210px]"
+  >
+    <div class="eyebrow mb-1.5 tracking-[0.14em] text-accent/70">{label}</div>
+    <div
+      lang="en"
+      class="text-[13px] leading-[1.55] text-mute-2 italic hyphens-auto [&_a]:not-italic [&_code]:font-mono [&_code]:text-[11.5px] [&_code]:not-italic [&_p]:m-0"
+    >
+      <slot />
+    </div>
+  </aside>
+</div>

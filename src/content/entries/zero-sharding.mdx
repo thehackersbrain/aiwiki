@@ -1,0 +1,83 @@
+---
+name: 'ZeRO Sharding'
+desc: 'Partition optimiser state, gradients and parameters across ranks.'
+category: 'training'
+complexity: 'O(d/N)'
+memory: 'O(d/N)'
+path: 'training/distributed'
+difficulty: 'advanced'
+described: '2019'
+status: 'standard'
+statusNote: 'Stage 3 or an equivalent full shard is how large models are trained. The alternatives differ in packaging, not in principle.'
+revised: 2026-08-04
+added: 2025-09-22
+tags: ['distributed', 'memory']
+lede: 'Data parallelism replicates the optimiser state N times for no reason. ZeRO shards it, then the gradients, then the parameters themselves.'
+implNote:
+  label: 'caveat'
+  html: 'Stage 3 makes memory look flat as you add ranks, which tempts people into it too early. If stages 1–2 already fit, stage 3 buys nothing but latency.'
+related: [data-parallelism, collective-communication, tensor-parallelism, pipeline-parallelism, parallelism-composition, memory-efficient-optimisers]
+refs:
+  - cite: 'Rajbhandari et al. — ZeRO: Memory Optimizations Toward Training Trillion Parameter Models (2019)'
+    id: 'arXiv:1910.02054'
+    href: https://arxiv.org/abs/1910.02054
+  - cite: 'Zhao et al. — PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel (2023)'
+    id: 'arXiv:2304.11277'
+    href: https://arxiv.org/abs/2304.11277
+---
+
+<Note label="in numbers">
+Sixteen bytes per parameter. A 7B model wants 112 GB of optimiser state before a
+single activation is stored.
+</Note>
+
+Mixed-precision Adam holds, per parameter: an fp16 weight and gradient (2 + 2
+bytes) plus fp32 weight, momentum and variance (12 bytes) — sixteen bytes where
+the model itself needs two. Replicating that across $N$ ranks wastes
+$14(N-1)\Psi$ bytes.
+
+<Eq caption="eq. 1 — Ψ parameters, N ranks" source="Rajbhandari et al. §5">
+
+$$
+\begin{aligned}
+\text{stage 1:} \quad M_1 &= 4\Psi + \tfrac{12\Psi}{N} \\[2pt]
+\text{stage 2:} \quad M_2 &= 2\Psi + \tfrac{14\Psi}{N} \\[2pt]
+\text{stage 3:} \quad M_3 &= \tfrac{16\Psi}{N}
+\end{aligned}
+$$
+
+</Eq>
+
+Stages 1 and 2 keep the communication volume of plain data parallelism: a
+reduce-scatter of gradients plus an all-gather of updated weights is exactly one
+all-reduce in disguise. Stage 3 additionally all-gathers each layer's parameters
+immediately before use and frees them after, adding one further $\Psi$ of traffic
+per step.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.4 · FSDP2">
+
+```python
+import torch
+from torch.distributed.fsdp import fully_shard, MixedPrecisionPolicy
+
+policy = MixedPrecisionPolicy(
+    param_dtype=torch.bfloat16,
+    reduce_dtype=torch.float32,   # reduce grads in fp32
+)
+
+# Shard each block separately so parameters are gathered
+# per-block and freed again, not held for the whole model.
+for block in model.blocks:
+    fully_shard(block, mp_policy=policy)
+fully_shard(model, mp_policy=policy)
+```
+
+</CodeFrame>
+
+Reducing gradients in bf16 to save bandwidth is a false economy at scale: the
+reduction is a sum over $N$ ranks, and bf16 has eight mantissa bits. Keep
+`reduce_dtype` at fp32. Wrapping only the top-level model rather than each block
+is the other common mistake — it collapses stage 3 back into a single enormous
+all-gather.

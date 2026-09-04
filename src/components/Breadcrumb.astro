@@ -1,0 +1,32 @@
+---
+interface Crumb {
+  label: string;
+  href?: string;
+}
+
+interface Props {
+  trail: Crumb[];
+}
+
+const { trail } = Astro.props;
+---
+
+<nav
+  class="flex flex-wrap items-center gap-2 border-b border-rule py-4.5 font-mono text-[11px] text-dim"
+  aria-label="Breadcrumb"
+>
+  {
+    trail.map((crumb, i) => (
+      <>
+        {i > 0 && <span class="text-edge-hi">›</span>}
+        {crumb.href ? (
+          <a href={crumb.href} class="text-mute hover:text-chalk">
+            {crumb.label}
+          </a>
+        ) : (
+          <span class="text-chalk">{crumb.label}</span>
+        )}
+      </>
+    ))
+  }
+</nav>

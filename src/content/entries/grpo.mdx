@@ -1,0 +1,133 @@
+---
+name: 'GRPO'
+desc: 'Group-relative advantages from sampled completions; no value network.'
+category: 'training'
+complexity: 'O(G·T·d)'
+path: 'training/objectives'
+difficulty: 'advanced'
+described: '2024'
+status: 'common'
+statusNote: 'Widely adopted for reasoning training on the strength of one very visible result. Ablations against simpler baselines are still thin.'
+revised: 2026-08-25
+added: 2025-06-08
+tags: ['RL', 'alignment']
+lede: 'Sample a group of completions for the same prompt, and let their rewards standardise each other. The baseline the critic used to estimate is now just the group mean.'
+implNote:
+  label: 'in numbers'
+  html: 'G = 8–64. Below about 8 the standard deviation is too noisy to divide by; above 64 the extra samples buy very little.'
+related: [proximal-policy-optimisation, kl-regularisation, reward-modelling, direct-preference-optimisation, elo-bradley-terry-scoring]
+refs:
+  - cite: 'Shao et al. — DeepSeekMath: Pushing the Limits of Mathematical Reasoning (2024)'
+    id: 'arXiv:2402.03300'
+    href: https://arxiv.org/abs/2402.03300
+  - cite: 'DeepSeek-AI — DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via RL (2025)'
+    id: 'arXiv:2501.12948'
+    href: https://arxiv.org/abs/2501.12948
+  - cite: 'Schulman et al. — Proximal Policy Optimization Algorithms (2017)'
+    id: 'arXiv:1707.06347'
+    href: https://arxiv.org/abs/1707.06347
+---
+
+PPO needs an advantage, and an advantage needs a baseline. The usual baseline is
+a learned value function — a second network of comparable size, trained on a
+regression target that is itself noisy. GRPO removes it.
+
+<Note label="annotation">
+The value model is not just expensive to train. On a sequence-level reward it
+is being asked to predict the final reward from a half-written completion, which
+is a genuinely hard problem it usually solves badly.
+</Note>
+
+For each prompt, sample $G$ completions and score them. The advantage of a
+completion is its reward standardised within its own group — every token in a
+completion carries the same advantage.
+
+<Eq caption="eq. 1 — the whole idea" source="Shao et al. §4.1" lead>
+
+$$
+\hat{A}_i = \frac{r_i - \operatorname{mean}(r_1, \dots, r_G)}
+                 {\operatorname{std}(r_1, \dots, r_G)}
+$$
+
+</Eq>
+
+The objective is then PPO's clipped surrogate over those advantages, with the KL
+penalty moved out of the reward and into the loss directly.
+
+<Eq caption="eq. 2 — clipped surrogate, group-averaged">
+
+$$
+\mathcal{J} = \frac{1}{G}\sum_{i=1}^{G} \frac{1}{|o_i|} \sum_{t}
+\min\Bigl( r_{i,t}\hat{A}_i,\; \clip(r_{i,t}, 1-\epsilon, 1+\epsilon)\hat{A}_i \Bigr)
+- \beta\, \mathbb{D}_{\mathrm{KL}}\bigl[\pi \,\|\, \pi_{\text{ref}}\bigr]
+$$
+
+</Eq>
+
+The KL estimator is the unbiased low-variance one, which is always positive —
+unlike the naive log-ratio, whose sample estimate goes negative and destabilises
+the run.
+
+<Eq caption="eq. 3 — k3 estimator, ρ the reference/policy ratio">
+
+$$
+\mathbb{D}_{\mathrm{KL}} \approx \rho - \log \rho - 1,
+\qquad
+\rho = \frac{\pi_{\text{ref}}(o_t \mid q)}{\pi(o_t \mid q)}
+$$
+
+</Eq>
+
+### Where it works
+
+<Note label="caveat">
+Standardising within a group means a prompt where every sample gets the same
+reward contributes exactly nothing. Whole batches can vanish this way.
+</Note>
+
+The method suits verifiable rewards — a maths answer that checks out, a test
+suite that passes — where sampling $G$ completions is cheap and the reward is
+exact. Against a learned reward model the group standardisation amplifies that
+model's noise as readily as its signal.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor
+
+
+def group_advantages(rewards: Tensor, eps: float = 1e-4) -> Tensor:
+    """rewards: [B, G] one row per prompt. Returns [B, G]."""
+    mean = rewards.mean(dim=-1, keepdim=True)
+    std = rewards.std(dim=-1, keepdim=True)
+    return (rewards - mean) / (std + eps)
+
+
+def grpo_loss(
+    logp: Tensor, logp_old: Tensor, logp_ref: Tensor,   # [B, G, T]
+    advantages: Tensor,                                  # [B, G]
+    mask: Tensor,                                        # [B, G, T] completion
+    eps: float = 0.2, beta: float = 0.04,
+) -> Tensor:
+    ratio = (logp - logp_old).exp()
+    adv = advantages.unsqueeze(-1)
+    surrogate = torch.min(ratio * adv, ratio.clamp(1 - eps, 1 + eps) * adv)
+
+    # k3: always non-negative, unlike the raw log-ratio
+    log_rho = logp_ref - logp
+    kl = log_rho.exp() - log_rho - 1
+
+    per_token = -(surrogate - beta * kl) * mask
+    return (per_token.sum(-1) / mask.sum(-1).clamp(min=1)).mean()
+```
+
+</CodeFrame>
+
+Averaging per token *within* a completion and then across completions is what
+eq. 2 specifies; flattening everything and taking one mean instead weights long
+completions more heavily and biases the policy toward length. Groups whose
+rewards are all identical produce zero advantage and can be dropped before the
+backward pass rather than contributing a zero gradient.

@@ -1,0 +1,136 @@
+---
+title: 'Reading an attention matrix'
+desc: 'What the n×n matrix contains, what the pretty heatmaps show, and how much of it is an artefact.'
+lede: 'Attention maps are the most-shown and least-reliable diagnostic in the field. This is what I now check before I believe one — including the sinks that dominate almost every row.'
+series: 'attention-from-scratch'
+part: 3
+minutes: 8
+revised: 2026-08-31
+added: 2026-08-19
+tags: ['attention', 'interpretability', 'foundations']
+related: [scaled-dot-product-attention, attention-sinks, multi-head-attention, induction-heads]
+refs:
+  - cite: 'Jain & Wallace — Attention is not Explanation (2019)'
+    id: 'arXiv:1902.10186'
+    href: https://arxiv.org/abs/1902.10186
+  - cite: 'Wiegreffe & Pinter — Attention is not not Explanation (2019)'
+    id: 'arXiv:1908.04626'
+    href: https://arxiv.org/abs/1908.04626
+  - cite: 'Xiao et al. — Efficient Streaming Language Models with Attention Sinks (2023)'
+    id: 'arXiv:2309.17453'
+    href: https://arxiv.org/abs/2309.17453
+  - cite: 'Elhage et al. — A Mathematical Framework for Transformer Circuits (2021)'
+    id: 'transformer-circuits'
+    href: https://transformer-circuits.pub/2021/framework/index.html
+---
+
+After the softmax you have $A \in \R^{n \times n}$, row-stochastic: row $i$ says
+how position $i$ divided its reading across the sequence. Every row sums to one.
+It is the most inviting object in the architecture, because it is a picture, and
+pictures feel like explanations.
+
+I have misread these more times than I would like, in a fairly consistent set of
+ways.
+
+### Mistake one: forgetting the row must sum to one
+
+The constraint is not a normalisation detail; it dictates what you can conclude
+from a large weight. If a head has nothing to retrieve at position $i$, it still
+has to spend its full unit of mass somewhere. A large $A_{ij}$ can mean "$j$ is
+what $i$ needed" — or it can mean "$i$ needed nothing and $j$ is where this head
+dumps mass".
+
+<Note label="in numbers">
+In a trained decoder the first token routinely takes over half the mass in most
+heads of most layers. Whatever that is, it is not the model finding token 0
+relevant 4000 times in a row.
+</Note>
+
+These are [attention sinks](/entries/attention-sinks), and once you have seen
+them you cannot unsee them: a huge fraction of every attention map is a head
+saying nothing at all, loudly. The practical consequence is that you should
+almost always drop the sink columns before normalising a heatmap, or the colour
+scale is set by an artefact and everything real renders as black.
+
+### Mistake two: treating $A$ as the whole story
+
+$A$ says where a head read. It says nothing about what it wrote, and the two are
+independent. In the circuits framing, a head is two operators: $W_{QK}$ decides
+the pattern, $W_{OV}$ decides what gets copied into the residual stream. You can
+have a head attending sharply and precisely to exactly the right token while
+$W_{OV}$ maps that token to something the rest of the model ignores.
+
+<Eq caption="eq. 1 — attention decides the mixing; OV decides the content" lead>
+
+$$
+\text{head}(X) = \underbrace{A}_{\text{where}} \; X \; \underbrace{W^V W^O}_{\text{what}}
+$$
+
+</Eq>
+
+A high attention weight is therefore necessary but not sufficient for influence.
+This is the substance behind the "attention is not explanation" argument: Jain
+and Wallace showed you can often find a very different attention distribution
+that produces the same output, which is exactly what you would expect if $A$ is
+only half the map.
+
+The counter-argument (Wiegreffe and Pinter) is worth holding at the same time:
+those adversarial distributions are found by optimising for them, and a
+*naturally trained* head's pattern is not arbitrary. My working position is that
+attention maps are hypotheses. They tell you where to point a
+[patching experiment](/entries/activation-patching), and the patch is what
+settles it.
+
+### Mistake three: averaging over heads
+
+Almost every attention visualisation I see averages across heads, and averaging
+destroys the thing worth looking at. Heads in a layer do not cooperate — they
+write into the residual stream independently — so a mean over 32 heads is a mean
+over 32 different functions. A sharp induction head and a diffuse
+attend-to-everything head average to something mildly diffuse that describes
+neither.
+
+Look at heads individually, or do not look.
+
+### What I actually plot now
+
+<CodeFrame meta="python · a heatmap that does not lie to you">
+
+```python
+import torch
+
+
+def readable_pattern(attn: Tensor, n_sink: int = 4) -> Tensor:
+    """attn: [H, N, N] for one layer of one sequence. Returns per-head maps."""
+    # Drop the sink columns and renormalise, so the colour scale is set by the
+    # part of the row that carries information rather than by the dump site.
+    body = attn[..., n_sink:]
+    body = body / body.sum(dim=-1, keepdim=True).clamp_min(1e-9)
+    return body
+
+
+def head_summary(attn: Tensor) -> dict[str, Tensor]:
+    """Three numbers per head, which sort 32 heads faster than 32 pictures."""
+    h, n, _ = attn.shape
+    idx = torch.arange(n, device=attn.device)
+    return {
+        # How concentrated: log(n) is uniform, 0 is one-hot.
+        "entropy": -(attn * attn.clamp_min(1e-12).log()).sum(-1).mean(-1),
+        # How far back it looks, in tokens.
+        "distance": ((idx[None, :, None] - idx[None, None, :]).abs() * attn).sum(-1).mean(-1),
+        # How much never leaves the sink.
+        "sink_mass": attn[..., :4].sum(-1).mean(-1),
+    }
+```
+
+</CodeFrame>
+
+Three scalars per head sorts thirty-two heads in a second and tells you which two
+are worth drawing. Entropy separates the sharp heads from the diffuse ones,
+distance separates local from long-range, and sink mass tells you which heads are
+mostly idle — which, on any given input, is most of them.
+
+<Rule label="Next" />
+
+Part 4 is about the cost: where the $n^2$ actually comes from, which is not quite
+where I assumed it was.

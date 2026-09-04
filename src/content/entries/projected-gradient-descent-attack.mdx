@@ -1,0 +1,101 @@
+---
+name: 'Projected Gradient Descent Attack'
+desc: 'Iterative L_p-bounded perturbation maximising task loss.'
+category: 'adversarial-ml'
+complexity: 'O(k·d)'
+path: 'adversarial-ml/evasion'
+difficulty: 'intermediate'
+described: '2017'
+status: 'standard'
+statusNote: 'The reference continuous-domain attack, and the benchmark robustness claims are made against.'
+revised: 2026-08-04
+added: 2026-03-07
+tags: ['attack', 'robustness']
+lede: 'Ascend the loss with respect to the input, project back into the ε-ball after every step, and restart from random points inside it.'
+implNote:
+  label: 'caveat'
+  html: 'A defence evaluated only against PGD with a fixed step count and no restarts is not evaluated. Check that a black-box attack does no better before believing a robustness number.'
+related: [membership-inference, model-extraction]
+refs:
+  - cite: 'Madry et al. — Towards Deep Learning Models Resistant to Adversarial Attacks (2017)'
+    id: 'arXiv:1706.06083'
+    href: https://arxiv.org/abs/1706.06083
+  - cite: 'Goodfellow et al. — Explaining and Harnessing Adversarial Examples (2014)'
+    id: 'arXiv:1412.6572'
+    href: https://arxiv.org/abs/1412.6572
+  - cite: 'Croce & Hein — Reliable Evaluation with an Ensemble of Diverse Parameter-free Attacks (2020)'
+    id: 'arXiv:2003.01690'
+    href: https://arxiv.org/abs/2003.01690
+---
+
+PGD is the standard first-order attack and, empirically, close to the strongest one
+within its threat model. Each step takes a signed gradient step of size $\alpha$
+and projects back onto the feasible set.
+
+<Eq caption="eq. 1 — L∞ variant" source="Madry et al. §2" lead>
+
+$$
+x^{t+1} = \Pi_{\|\cdot - x\|_\infty \le \varepsilon}
+\Bigl( x^{t} + \alpha \cdot \mathrm{sign}\bigl( \nabla_x L(\theta, x^{t}, y) \bigr) \Bigr)
+$$
+
+</Eq>
+
+<Note label="in practice">
+Five restarts of twenty steps beats one run of a hundred, for the same budget,
+every time.
+</Note>
+
+Random restarts matter: the inner maximisation is non-concave, and a single run
+from the clean input systematically underestimates the attainable loss.
+Adversarial training frames the whole thing as a saddle-point problem with PGD as
+the inner solver.
+
+<Eq caption="eq. 2 — the robust objective">
+
+$$
+\min_{\theta} \; \E \Bigl[ \max_{\|\delta\| \le \varepsilon} L(\theta, x + \delta, y) \Bigr]
+$$
+
+</Eq>
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor
+
+
+def pgd(model, x: Tensor, y: Tensor, loss_fn,
+        eps: float = 8 / 255, alpha: float = 2 / 255,
+        steps: int = 20, restarts: int = 5) -> Tensor:
+    best_adv, best_loss = x.clone(), torch.full((x.size(0),), -1e30)
+
+    for _ in range(restarts):
+        delta = torch.empty_like(x).uniform_(-eps, eps)
+        delta = (x + delta).clamp(0, 1) - x
+
+        for _ in range(steps):
+            delta.requires_grad_(True)
+            loss = loss_fn(model(x + delta), y)
+            grad, = torch.autograd.grad(loss.sum(), delta)
+            delta = (delta.detach() + alpha * grad.sign()).clamp(-eps, eps)
+            delta = (x + delta).clamp(0, 1) - x     # stay a valid image
+
+        with torch.no_grad():
+            l = loss_fn(model(x + delta), y)
+        improved = l > best_loss
+        best_loss = torch.where(improved, l, best_loss)
+        best_adv[improved] = (x + delta)[improved]
+
+    return best_adv
+```
+
+</CodeFrame>
+
+Two clamps per step, in this order: the ε-ball first, then the valid input range.
+Reversing them lets the perturbation drift outside the threat model. Keep the
+per-example best rather than the last iterate — the loss is not monotone under a
+fixed step size, and reporting the final step understates the attack.

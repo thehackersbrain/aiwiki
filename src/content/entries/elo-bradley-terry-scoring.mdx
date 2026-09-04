@@ -1,0 +1,85 @@
+---
+name: 'Elo / Bradley-Terry Scoring'
+desc: 'Latent-strength model fitted to pairwise preference outcomes.'
+category: 'evaluation'
+complexity: 'O(P)'
+path: 'evaluation/metrics'
+difficulty: 'intermediate'
+described: '1952'
+status: 'common'
+revised: 2026-07-28
+added: 2026-01-23
+tags: ['metric', 'preference']
+lede: 'Assign each model a scalar strength such that the logistic of the difference predicts who wins. The same model that underwrites DPO, fitted to human votes instead.'
+implNote:
+  label: 'caveat'
+  html: 'Confidence intervals on a leaderboard are usually wider than the gaps between adjacent entries. Two models separated by fewer points than their interval width are tied, however the table orders them.'
+related: [perplexity, direct-preference-optimisation, contamination-detection]
+refs:
+  - cite: 'Bradley & Terry — Rank Analysis of Incomplete Block Designs (1952)'
+    id: 'Biometrika 39'
+  - cite: 'Chiang et al. — Chatbot Arena: An Open Platform for Evaluating LLMs by Human Preference (2024)'
+    id: 'arXiv:2403.04132'
+    href: https://arxiv.org/abs/2403.04132
+---
+
+Bradley–Terry posits a latent strength per competitor with the probability of a win
+given by a logistic in the difference. Fitting is a convex logistic regression on
+the pairwise outcomes.
+
+<Eq caption="eq. 1 — Elo scaling, 400 points per decade of odds" lead>
+
+$$
+P(i \text{ beats } j) = \sigma\!\left( \frac{s_i - s_j}{400} \ln 10 \right)
+$$
+
+</Eq>
+
+<Note label="annotation">
+Elo was designed for players whose strength drifts between games. A checkpoint does
+not drift, so the online update solves a problem you do not have.
+</Note>
+
+Online Elo updates are order-dependent. Fit the whole matrix by maximum likelihood
+instead and bootstrap for intervals. The scale has no zero — only differences are
+identified, which is why every leaderboard fixes an anchor.
+
+<Eq caption="eq. 2 — MLE with the gauge fixed">
+
+$$
+\hat{s} = \arg\max_{s} \sum_{(i,j)} w_{ij} \log \sigma(s_i - s_j)
+\quad \text{subject to} \quad \textstyle\sum_i s_i = 0
+$$
+
+</Eq>
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · numpy + scipy">
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+from scipy.special import log_expit
+
+
+def bradley_terry(wins: np.ndarray, scale: float = 400.0) -> np.ndarray:
+    """wins[i, j] = number of times i beat j. Returns Elo-scaled strengths."""
+    n = wins.shape[0]
+
+    def nll(s):
+        diff = s[:, None] - s[None, :]
+        return -(wins * log_expit(diff)).sum()
+
+    res = minimize(nll, np.zeros(n), method="L-BFGS-B")
+    s = res.x - res.x.mean()               # fix the gauge
+    return 1000 + s * (scale / np.log(10))
+```
+
+</CodeFrame>
+
+Use `log_expit` rather than `log(sigmoid(·))`; the composed form underflows to
+$-\infty$ for strength gaps a fit will routinely visit, and L-BFGS then walks off.
+Centring the solution is not cosmetic — the likelihood is invariant to a constant
+shift, so without it the optimiser wanders along a flat direction and the reported
+numbers are not reproducible.

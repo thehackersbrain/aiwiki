@@ -1,0 +1,152 @@
+---
+name: 'Collective Communication'
+desc: 'All-reduce, all-gather, reduce-scatter, all-to-all — the six primitives everything is built from.'
+category: 'training'
+complexity: 'O(N)'
+path: 'training/distributed'
+difficulty: 'intermediate'
+described: '1994'
+status: 'standard'
+statusNote: 'The vocabulary every parallelism strategy is written in. Older than deep learning by two decades and unchanged in substance.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['distributed', 'training', 'core']
+lede: 'Every distributed training strategy is a choice of which tensor to split and which collective to pay for. There are only about six collectives, and the cost model for each is one line.'
+metrics:
+  caption: 'Ring all-reduce, N ranks, S bytes'
+  rows:
+    - { label: 'Bytes per rank', value: '2S(N−1)/N' }
+    - { label: 'Steps', value: '2(N−1)' }
+    - { label: 'Scaling in N', value: 'flat', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Every collective is a barrier. All ranks must call it, in the same order, with the same shapes — a rank that takes a different branch and skips one deadlocks the job, and the symptom is a hang with no error rather than a crash.'
+related: [zero-sharding, data-parallelism, tensor-parallelism, expert-parallelism, pipeline-parallelism, gradient-accumulation]
+refs:
+  - cite: 'Thakur et al. — Optimization of Collective Communication Operations in MPICH (2005)'
+    id: 'IJHPCA 19(1)'
+    href: https://journals.sagepub.com/doi/10.1177/1094342005051521
+  - cite: 'Patarasuk & Yuan — Bandwidth Optimal All-reduce Algorithms for Clusters of Workstations (2009)'
+    id: 'JPDC 69(2)'
+    href: https://www.sciencedirect.com/science/article/pii/S0743731508001767
+  - cite: 'NVIDIA — NCCL documentation'
+    id: 'docs.nvidia.com'
+    href: https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/index.html
+---
+
+Distributed training is a small number of tensor-splitting decisions, and each
+one buys memory by paying for a collective. Knowing the six operations and what
+each costs is enough to reason about any of the strategies on this branch.
+
+| Operation | Each rank has | Each rank ends with |
+| --- | --- | --- |
+| broadcast | rank 0 has $x$ | $x$ |
+| reduce | $x_i$ | rank 0 has $\sum x_i$ |
+| all-reduce | $x_i$ | $\sum x_i$ |
+| all-gather | $x_i$ | $[x_0, \ldots, x_{N-1}]$ |
+| reduce-scatter | $x_i$ (full size) | shard $i$ of $\sum x_i$ |
+| all-to-all | $[y_{i0}, \ldots]$ | $[y_{0i}, \ldots]$ |
+
+The identity worth memorising:
+
+<Eq lead caption="eq. 1 — why the two-phase implementations exist">
+
+$$
+\text{all-reduce} = \text{reduce-scatter} + \text{all-gather}
+$$
+
+</Eq>
+
+That decomposition is not a curiosity. It is exactly how
+[ZeRO](/entries/zero-sharding) turns data-parallel all-reduce into something
+cheaper: if each rank only needs *its shard* of the summed gradient, the
+all-gather half can be skipped.
+
+### Ring all-reduce
+
+The naïve implementation sends everything to one rank and back, which makes that
+rank's link the bottleneck and scales badly. The ring algorithm does not.
+
+Arrange the ranks in a circle and split the tensor into $N$ chunks. In the
+reduce-scatter phase, each rank sends one chunk to its neighbour and adds what it
+receives — after $N-1$ steps each rank holds the complete sum for one chunk. The
+all-gather phase circulates those around, another $N-1$ steps.
+
+<Eq caption="eq. 2 — bandwidth cost, independent of N">
+
+$$
+T = 2\,\frac{N-1}{N}\cdot\frac{S}{B} + 2(N-1)\,\alpha
+$$
+
+</Eq>
+
+The bandwidth term approaches $2S/B$ and stops growing — twice the tensor size
+per rank however many ranks there are, which is why data parallelism scales at
+all. The latency term $\alpha$ does grow with $N$, which is why small tensors
+are the problem and gradient bucketing exists.
+
+<Note label="annotation">
+NCCL does not always use a ring. For small messages a tree has $O(\log N)$
+latency and wins; for large ones the ring's bandwidth optimality wins.
+NCCL picks per call from the message size and topology, which is one reason
+measured collective times are not a smooth function of size.
+</Note>
+
+### Topology
+
+Bandwidth differs by an order of magnitude depending on which link a message
+crosses.
+
+| Link | Bandwidth |
+| --- | --- |
+| NVLink, intra-node | 400–900 GB/s |
+| PCIe 5 ×16 | 64 GB/s |
+| InfiniBand NDR | 50 GB/s per port |
+| Ethernet | 12 GB/s |
+
+Every serious strategy places the chattiest parallelism inside a node.
+[Tensor parallelism](/entries/tensor-parallelism) all-reduces twice per layer and
+belongs on NVLink; data parallelism reduces once per step and tolerates the
+network. Getting that assignment backwards is the most common way to lose half
+the throughput of a cluster, and it is a launch-configuration decision rather
+than a code change.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch.distributed">
+
+```python
+import torch
+import torch.distributed as dist
+
+
+def gradient_all_reduce(grads: list[torch.Tensor], bucket_mb: int = 25) -> None:
+    """Bucket small tensors: the latency term dominates below ~1 MB, so
+    one call for a hundred tensors beats a hundred calls."""
+    bucket, size = [], 0
+    for g in grads:
+        bucket.append(g)
+        size += g.numel() * g.element_size()
+        if size >= bucket_mb * 2**20:
+            _flush(bucket)
+            bucket, size = [], 0
+    if bucket:
+        _flush(bucket)
+
+
+def _flush(bucket: list[torch.Tensor]) -> None:
+    flat = torch._utils._flatten_dense_tensors(bucket)
+    dist.all_reduce(flat, op=dist.ReduceOp.AVG)
+    for g, r in zip(bucket, torch._utils._unflatten_dense_tensors(flat, bucket)):
+        g.copy_(r)
+```
+
+</CodeFrame>
+
+`ReduceOp.AVG` rather than `SUM` followed by a division: it is one kernel instead
+of two, and it avoids a subtle overflow when many ranks contribute large
+gradients in low precision.
+
+Bucketing is what DDP does automatically, and it is why a hand-rolled
+data-parallel loop is usually much slower — a transformer has hundreds of
+parameter tensors, most of them small, and the per-call latency dominates.

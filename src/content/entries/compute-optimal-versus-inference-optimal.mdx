@@ -1,0 +1,139 @@
+---
+name: 'Compute-Optimal versus Inference-Optimal'
+desc: 'Chinchilla minimises training cost. Nobody trains a model they only train once.'
+category: 'training'
+complexity: '—'
+path: 'training/scaling'
+difficulty: 'intermediate'
+described: '2023'
+status: 'standard'
+statusNote: 'Every deployed open model is deliberately overtrained relative to Chinchilla, by factors of ten to a hundred. The reasoning is settled; the right multiple depends on how much you will serve.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['scaling', 'training', 'inference']
+lede: 'Chinchilla answers a question with a hidden assumption: that training cost is the only cost. Add serving to the objective and the optimum moves sharply towards smaller models trained far longer.'
+metrics:
+  caption: 'Tokens per parameter'
+  rows:
+    - { label: 'Chinchilla optimum', value: '≈ 20' }
+    - { label: 'Llama 3 8B', value: '≈ 1 875' }
+    - { label: 'Loss penalty', value: 'small', accent: true }
+implNote:
+  label: 'annotation'
+  html: 'The loss curve near the Chinchilla optimum is remarkably flat. Moving a long way along the parameter–token trade at fixed compute costs very little quality, which is exactly why so much overtraining is affordable.'
+related: [chinchilla-scaling-laws, training-compute-accounting, kaplan-scaling-laws, data-constrained-scaling, gptq, speculative-decoding]
+refs:
+  - cite: 'Hoffmann et al. — Training Compute-Optimal Large Language Models (2022)'
+    id: 'arXiv:2203.15556'
+    href: https://arxiv.org/abs/2203.15556
+  - cite: 'Sardana et al. — Beyond Chinchilla-Optimal: Accounting for Inference in Language Model Scaling Laws (2023)'
+    id: 'arXiv:2401.00448'
+    href: https://arxiv.org/abs/2401.00448
+  - cite: 'Dubey et al. — The Llama 3 Herd of Models (2024)'
+    id: 'arXiv:2407.21783'
+    href: https://arxiv.org/abs/2407.21783
+---
+
+[Chinchilla](/entries/chinchilla-scaling-laws) minimises loss subject to a
+training budget. Read the objective carefully and the assumption is visible: the
+model is trained and then, apparently, never used.
+
+<Eq lead caption="eq. 1 — the objective, with serving included">
+
+$$
+\min_{N,\,D} \; \underbrace{6ND}_{\text{train once}}
+\;+\; \underbrace{2N D_{\text{inf}}}_{\text{serve forever}}
+\quad \text{subject to} \quad L(N, D) \le \ell
+$$
+
+</Eq>
+
+The second term has no $D$ in it. Training tokens are paid once; parameters are
+paid on every token ever generated. So if $D_{\text{inf}}$ is large the optimum
+shifts to fewer parameters, and the way to hold quality is more training data.
+
+### How far the shift goes
+
+Sardana et al. solve eq. 1 and the answer depends on the ratio of inference to
+training demand. At a billion inference tokens against a Chinchilla-optimal
+training budget, the optimal model is roughly half the parameters and several
+times the tokens; at a trillion, the multiplier on tokens per parameter runs into
+the hundreds.
+
+Llama 3's 8B model saw 15T tokens — about 1875 per parameter, nearly a hundred
+times Chinchilla. That is not an oversight. It is the correct answer for a model
+that will be downloaded and run several billion times.
+
+<Note label="annotation">
+This is why "Chinchilla-optimal" stopped being a compliment. It describes a model
+optimised for a cost nobody actually faces alone — and a model trained to that
+recipe is, for any real deployment, the wrong size.
+</Note>
+
+### Why it is cheap to do
+
+The isoFLOP curves are flat near their minimum. At fixed compute, halving the
+parameters and doubling the tokens costs a small amount of loss — well under a
+percent in most of the published sweeps.
+
+<Eq caption="eq. 2 — the shape that makes the trade affordable">
+
+$$
+\frac{\partial^2 L}{\partial (\log N)^2}\Big|_{C} \;\text{ small near the optimum}
+$$
+
+</Eq>
+
+So the choice is between a small quality loss and a large, permanent serving
+saving, and for anything served at scale it is not close.
+
+### Where it stops
+
+Two limits, and both are real.
+
+**Data.** Overtraining needs tokens, and the high-quality supply is finite. Past
+a few epochs, repeated data stops helping — which is
+[data-constrained scaling](/entries/data-constrained-scaling), and it is the
+binding constraint for the largest overtraining multiples.
+
+**Diminishing returns.** Loss falls as a power law in $D$, so each doubling of
+tokens buys less than the last while costing the same. The curve does not stop,
+but it flattens enough that the marginal token stops being worth the compute
+before the data runs out.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python">
+
+```python
+import math
+
+
+def optimal_size(target_loss: float, inference_tokens: float,
+                 a=406.4, b=410.7, e=1.69, alpha=0.34, beta=0.28) -> dict:
+    """Minimise 6ND + 2N·D_inf subject to Chinchilla's L(N, D) ≤ target.
+    Constants from Hoffmann et al., table 3 (their 'approach 3' fit)."""
+    def loss(n: float, d: float) -> float:
+        return e + a / n**alpha + b / d**beta
+
+    best = None
+    for log_n in [x / 20 for x in range(120, 260)]:           # 10^6 … 10^13
+        n = 10**log_n
+        residual = target_loss - e - a / n**alpha
+        if residual <= 0:
+            continue                                          # too small at any D
+        d = (b / residual) ** (1 / beta)
+        cost = 6 * n * d + 2 * n * inference_tokens
+        if best is None or cost < best["cost"]:
+            best = {"n": n, "d": d, "cost": cost, "tokens_per_param": d / n}
+    return best
+```
+
+</CodeFrame>
+
+Two cautions on those constants. They are Hoffmann's approach-3 fit, which
+[Besiroglu et al. showed](/entries/scaling-law-methodology) does not reproduce
+from the paper's own data — treat the shape as reliable and the exact numbers as
+approximate. And the function assumes inference is served at full precision;
+[quantisation](/entries/gptq) reduces the effective cost of a parameter and moves
+the optimum back towards larger models.

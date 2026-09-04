@@ -1,0 +1,170 @@
+---
+name: 'RoPE Scaling'
+desc: 'Extending a rotary model past its training length by rewriting the frequencies.'
+category: 'architectures'
+complexity: 'O(n·d)'
+path: 'architectures/position'
+difficulty: 'intermediate'
+described: '2023'
+status: 'standard'
+statusNote: 'How every long-context model on the shelf got long. Llama 3.1, Qwen 2.5 and Mistral all ship a scaling configuration rather than a natively long pre-training run.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['position', 'long-context', 'attention']
+lede: 'A rotary model fails past its training length because it meets phases it has never seen. Every extension method is a different answer to the same question: which frequencies may be stretched, and by how much.'
+metrics:
+  caption: 'Llama 3.1 — 8k pre-training to 128k'
+  rows:
+    - { label: 'Scale factor', value: '8' }
+    - { label: 'Base θ', value: '500 000' }
+    - { label: 'Extension tokens', value: '≈ 800 B', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Scaling changes the meaning of every cached key. A KV cache written under one configuration is unusable under another — which is why RoPE is applied at attention time in cache-heavy serving stacks, and the unrotated keys are what get stored.'
+related: [rotary-position-embedding, alibi, xpos, flash-attention, paged-attention, sliding-window-attention]
+refs:
+  - cite: 'Chen et al. — Extending Context Window of Large Language Models via Position Interpolation (2023)'
+    id: 'arXiv:2306.15595'
+    href: https://arxiv.org/abs/2306.15595
+  - cite: 'Peng et al. — YaRN: Efficient Context Window Extension of Large Language Models (2023)'
+    id: 'arXiv:2309.00071'
+    href: https://arxiv.org/abs/2309.00071
+  - cite: 'Xiong et al. — Effective Long-Context Scaling of Foundation Models (2023)'
+    id: 'arXiv:2309.16039'
+    href: https://arxiv.org/abs/2309.16039
+  - cite: 'Liu et al. — Scaling Laws of RoPE-based Extrapolation (2023)'
+    id: 'arXiv:2310.05209'
+    href: https://arxiv.org/abs/2310.05209
+---
+
+[RoPE](/entries/rotary-position-embedding) rotates dimension pair $i$ by
+$m\theta_i$ at position $m$, with $\theta_i = b^{-2i/d}$. Nothing in that formula
+breaks at $m = 5000$ for a model trained to 4096. What breaks is that the fast
+pairs have wrapped around into phase relationships the attention weights were
+never fit against, and the scores they produce are not merely inaccurate but
+unrelated to distance.
+
+Every extension method rewrites the rotation so that a longer sequence lands
+inside the phase range the model already understands.
+
+### Position interpolation
+
+The blunt version. Divide every position by the scale factor $s$, so the longer
+sequence occupies the same angular span as the original.
+
+<Eq lead caption="eq. 1 — squeeze the positions">
+
+$$
+m' = \frac{m}{s}, \qquad s = \frac{L_{\text{new}}}{L_{\text{train}}}
+$$
+
+</Eq>
+
+No phase is out of range, because none exceeds what training covered. The price
+is resolution: adjacent tokens are now $\theta_i / s$ apart instead of
+$\theta_i$, and at $s = 8$ the fastest pair can no longer cleanly separate
+neighbours. Chen et al. recover this with about 1000 steps of fine-tuning —
+cheap, but not free, and the model gets slightly worse at short contexts.
+
+<Note label="annotation">
+Interpolation degrades exactly the dimensions that were doing local work, in
+order to rescue dimensions that were doing global work. Whether that trade is
+worth making depends on frequency, and noticing that is the whole of NTK-aware
+scaling.
+</Note>
+
+### NTK-aware scaling
+
+Instead of scaling positions, scale the base.
+
+<Eq caption="eq. 2 — stretch the slow pairs, leave the fast ones">
+
+$$
+b' = b \cdot s^{\frac{d}{d-2}}
+$$
+
+</Eq>
+
+Because $\theta_i = b^{-2i/d}$, raising $b$ barely moves the high-frequency pairs
+($i$ small) and moves the low-frequency pairs a great deal. Local resolution
+survives; the slow dimensions that encode long-range position absorb the
+stretch. This works with no fine-tuning at modest $s$, which is why it spread
+through the open-weights community before either paper was published.
+
+### YaRN
+
+YaRN makes the frequency dependence explicit rather than implicit. Compare each
+pair's wavelength $\lambda_i = 2\pi/\theta_i$ to the original context $L$:
+
+- $\lambda_i \ll L$ — the pair completes many rotations inside the training
+  window, so the model has seen its full phase range. Leave it alone.
+- $\lambda_i > L$ — the pair never completes a rotation, so its phase is an
+  absolute coordinate. Interpolate it fully by $1/s$.
+- In between — ramp linearly between the two.
+
+<Eq caption="eq. 3 — per-dimension, with a ramp">
+
+$$
+\theta'_i = \bigl(1 - \gamma_i\bigr)\frac{\theta_i}{s} + \gamma_i\,\theta_i,
+\qquad
+\gamma_i = \mathrm{clip}\!\left(\frac{\lambda_i^{-1} L - \alpha}{\beta - \alpha},\, 0,\, 1\right)
+$$
+
+</Eq>
+
+YaRN adds one more piece that is easy to miss and does real work: attention
+temperature. Longer contexts mean more terms in the softmax and therefore flatter
+distributions, so the logits are scaled by $t$ with
+$\sqrt{1/t} = 0.1\ln s + 1$ — a fixed multiplier folded into the rotation at no
+runtime cost. With both, YaRN reaches the same perplexity as position
+interpolation on roughly a tenth of the fine-tuning tokens.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch · YaRN-style per-dimension scaling">
+
+```python
+import math
+
+import torch
+from torch import Tensor
+
+
+def yarn_frequencies(
+    dim: int,
+    base: float = 10_000.0,
+    scale: float = 8.0,
+    original_context: int = 8192,
+    alpha: float = 1.0,     # below this many rotations: interpolate fully
+    beta: float = 32.0,     # above this many rotations: leave untouched
+) -> Tensor:
+    """Per-pair inverse frequencies, ramped between interpolated and original."""
+    i = torch.arange(0, dim, 2).float()
+    inv_freq = 1.0 / (base ** (i / dim))                      # θ_i
+
+    # Rotations completed inside the original context window.
+    rotations = original_context * inv_freq / (2 * math.pi)
+    gamma = ((rotations - alpha) / (beta - alpha)).clamp(0, 1)
+
+    return (1 - gamma) * (inv_freq / scale) + gamma * inv_freq
+
+
+def attention_temperature(scale: float) -> float:
+    """Softmax sharpening that compensates for the longer sum. YaRN §3.4."""
+    return 0.1 * math.log(scale) + 1.0
+```
+
+</CodeFrame>
+
+Llama 3.1's configuration is this shape with different names —
+`low_freq_factor: 1`, `high_freq_factor: 4`, `factor: 8` over a base already
+raised to 500 000 during pre-training. The large base is the tell: the model was
+built to be extended, with the slow dimensions given room in advance.
+
+<Rule label="What none of it fixes" />
+
+Scaling makes long positions representable. It does not make the model *use*
+them. A model extended to 128k typically retains strong retrieval at the
+beginning and end of its window and much weaker retrieval in the middle, and no
+amount of frequency arithmetic addresses that — it is a property of what the
+attention heads learned to do, not of how position is encoded.

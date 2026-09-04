@@ -1,0 +1,157 @@
+---
+name: 'KL Regularisation'
+desc: 'A leash to the reference policy, and the three ways it is estimated.'
+category: 'training'
+complexity: 'O(n·V)'
+path: 'training/objectives'
+difficulty: 'intermediate'
+described: '2019'
+status: 'standard'
+statusNote: 'Present in every preference-optimisation method, explicitly in PPO and GRPO and implicitly in DPO. The recent reasoning-model work is the first to argue seriously for dropping it.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['objectives', 'training', 'alignment']
+lede: 'Optimising a learned reward without a constraint gives a model that maximises the reward and nothing else. The KL term is what keeps the policy inside the region where the reward still means something.'
+metrics:
+  caption: 'Typical operating points'
+  rows:
+    - { label: 'PPO coefficient β', value: '0.01 … 0.1' }
+    - { label: 'DPO β', value: '0.1 … 0.5' }
+    - { label: 'Useful KL budget', value: '≈ 10 nats', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'The naïve single-sample estimator <code>log(π/π_ref)</code> is unbiased and has enormous variance, and can be negative for a quantity that is provably non-negative. Use the k3 estimator below; it is unbiased too and it cannot go negative.'
+related: [proximal-policy-optimisation, direct-preference-optimisation, grpo, reward-modelling, supervised-fine-tuning]
+refs:
+  - cite: 'Ziegler et al. — Fine-Tuning Language Models from Human Preferences (2019)'
+    id: 'arXiv:1909.08593'
+    href: https://arxiv.org/abs/1909.08593
+  - cite: 'Schulman — Approximating KL Divergence (2020)'
+    id: 'joschu.net'
+    href: http://joschu.net/blog/kl-approx.html
+  - cite: 'Rafailov et al. — Direct Preference Optimization (2023)'
+    id: 'arXiv:2305.18290'
+    href: https://arxiv.org/abs/2305.18290
+---
+
+A [reward model](/entries/reward-modelling) is correct near the responses it was
+trained on and unconstrained elsewhere. Maximise it freely and the policy leaves
+that region immediately, because the highest-scoring text under a proxy is
+usually text the proxy has never seen.
+
+<Eq lead caption="eq. 1 — the objective every RLHF method optimises">
+
+$$
+\max_{\pi} \; \mathbb{E}_{y \sim \pi}\bigl[r(x, y)\bigr]
+\;-\; \beta\, \mathrm{KL}\bigl(\pi \,\|\, \pi_{\text{ref}}\bigr)
+$$
+
+</Eq>
+
+$\pi_{\text{ref}}$ is the [supervised fine-tuned](/entries/supervised-fine-tuning)
+model — frozen, and the definition of "still a reasonable language model". $\beta$
+sets how far the policy may travel from it.
+
+### The closed form
+
+Eq. 1 has an exact solution, which is worth knowing because two other entries
+depend on it.
+
+<Eq caption="eq. 2 — the optimal policy, for any reward">
+
+$$
+\pi^*(y \mid x) = \frac{1}{Z(x)}\, \pi_{\text{ref}}(y \mid x)\, \exp\!\left(\frac{r(x,y)}{\beta}\right)
+$$
+
+</Eq>
+
+The reference distribution reweighted by exponentiated reward. It cannot be
+sampled from — $Z(x)$ sums over all sequences — which is why PPO exists. But it
+can be *rearranged*: solve for $r$ in terms of $\pi^*$, substitute into the
+Bradley–Terry likelihood, and the partition function cancels. That is
+[DPO](/entries/direct-preference-optimisation), and it is why DPO has a $\beta$
+even though it never computes a KL.
+
+<Note label="annotation">
+Reverse KL, not forward. $\mathrm{KL}(\pi\|\pi_{\text{ref}})$ is mode-seeking: it
+punishes the policy for putting mass where the reference puts none, and is
+relaxed about dropping modes the reference had. That is why aligned models are
+less diverse than their base models — the objective explicitly permits it.
+</Note>
+
+### Estimating it
+
+The KL cannot be computed exactly over sequences, so it is estimated from samples,
+and the choice of estimator matters more than it looks.
+
+<Eq caption="eq. 3 — three estimators of the same quantity">
+
+$$
+k_1 = \log\frac{\pi}{\pi_{\text{ref}}}
+\qquad
+k_2 = \tfrac{1}{2}\left(\log\frac{\pi}{\pi_{\text{ref}}}\right)^2
+\qquad
+k_3 = \frac{\pi_{\text{ref}}}{\pi} - 1 - \log\frac{\pi_{\text{ref}}}{\pi}
+$$
+
+</Eq>
+
+$k_1$ is unbiased and high-variance, and is negative about half the time — an
+estimate of a non-negative quantity that is routinely negative is a poor
+diagnostic even when its mean is right. $k_2$ is low-variance and biased. $k_3$
+is unbiased *and* non-negative, being a Bregman divergence, and costs one extra
+exponential. It is what current implementations use, and it is Schulman's blog
+post rather than any paper that established it.
+
+### Two places to apply it
+
+**In the reward.** Subtract $\beta \log(\pi/\pi_{\text{ref}})$ per token from the
+reward before computing advantages. The KL then flows through the value function
+and the advantage estimator like any other reward.
+
+**In the loss.** Add the estimated KL as a separate term. GRPO does this, which
+is cleaner to reason about since the penalty does not interact with the critic.
+
+They are not equivalent — the first shapes credit assignment, the second does
+not — and papers are frequently unclear about which they mean.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor
+
+
+def kl_k3(logp: Tensor, logp_ref: Tensor) -> Tensor:
+    """Schulman's k3: unbiased and never negative. logp: [B, T] per-token."""
+    ratio = logp_ref - logp                       # log(π_ref / π)
+    return ratio.exp() - ratio - 1.0
+
+
+def adaptive_beta(beta: float, kl: float, target: float = 6.0, horizon: int = 10_000) -> float:
+    """Ziegler et al. §2.2: steer the coefficient towards a KL budget."""
+    error = torch.clamp(torch.tensor(kl / target - 1.0), -0.2, 0.2).item()
+    return beta * (1.0 + error / horizon)
+```
+
+</CodeFrame>
+
+The adaptive controller is the underused half. A fixed $\beta$ means the realised
+KL wanders as the policy improves — early in training the same coefficient buys a
+much smaller step than late. Targeting a KL budget instead makes runs comparable
+across reward models and across seeds, which a fixed coefficient does not.
+
+<Rule label="Dropping it" />
+
+The reasoning-model work is the first credible argument against. When the reward
+is *verifiable* — a maths answer that is right or wrong, a test suite that passes
+— it is not a proxy, so there is nothing to overoptimise into. Several
+R1-style recipes set $\beta = 0$ and report that the long chains of thought the
+model develops are precisely what a KL leash to the SFT policy would have
+prevented.
+
+The scope of that argument is narrow and worth keeping straight. It applies
+exactly where the reward is ground truth. For anything scored by a learned model
+or an [LLM judge](/entries/llm-as-judge), the proxy is back and so is the leash.

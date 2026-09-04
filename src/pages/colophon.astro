@@ -1,0 +1,121 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Rail from '../components/Rail.astro';
+import { counts } from '../lib/grimoire';
+import { breadcrumbs, siteNodes } from '../lib/schema';
+import { AUTHOR, AUTHOR_HANDLE, AUTHOR_URL, CONTACT_EMAIL } from '../consts';
+
+const conventions = [
+  {
+    k: 'Notation',
+    v: 'Row-vector convention throughout; batch and head dimensions elided unless they matter to the argument.',
+  },
+  {
+    k: 'Complexity',
+    v: 'Stated for a single forward pass at sequence length n and model width d, ignoring constant factors.',
+  },
+  {
+    k: 'Code',
+    v: 'PyTorch, minimal and unfused, written to be read rather than shipped. Fused variants are linked, not inlined.',
+  },
+  {
+    k: 'Stubs',
+    v: 'Marked inline. A stub means the maths is not yet rederived or the implementation has not been run.',
+  },
+  {
+    k: 'Citations',
+    v: 'Primary sources only. Blog posts are cited when they are the primary source.',
+  },
+];
+
+const { stubs } = await counts();
+
+const stack = [
+  'Literata for prose and equations · Space Mono for labels and code',
+  'Astro content collections in MDX · KaTeX for the maths · Shiki for the code',
+  'Tailwind for the tokens, TypeScript throughout, statically built',
+  'Notation follows Elhage et al. where the two overlap',
+  'Source and revision history kept in a private repository',
+];
+---
+
+<BaseLayout
+  title="Colophon"
+  tabTitle="Colophon — AI Grimoire"
+  description="How the grimoire is written: what earns an entry, what stays a stub, the notation and complexity conventions, and where to send corrections."
+  nav="colophon"
+  schema={[
+    ...siteNodes(),
+    breadcrumbs([{ name: 'AI Grimoire', path: '/' }, { name: 'Colophon' }]),
+  ]}
+>
+  <main class="mx-auto max-w-[1180px] animate-rise px-6 pb-20 sm:px-12">
+    <Rail label="Colophon" class="pt-16 pb-9">
+      <h1
+        class="mt-0 mb-5 max-w-[26ch] text-[30px] leading-[1.14] font-normal tracking-[-0.024em] text-bone sm:text-[40px]"
+      >
+        How this thing is written
+      </h1>
+      <p class="mt-0 mb-4 max-w-[62ch] text-[18px] text-lede text-pretty">
+        Every entry starts as a note taken while reading a paper or debugging something
+        that didn't work. It gets promoted to an entry once the maths has been rederived
+        by hand and the implementation runs on real tensors.
+      </p>
+      <p class="m-0 max-w-[62ch] text-[16px] text-dim italic">
+        Entries that fail that bar stay stubs. There are {stubs} of them.
+      </p>
+    </Rail>
+
+    <Rail labelAs="h2" label="Maintained by">
+      <div class="max-w-[62ch]">
+        <p class="mt-0 mb-4 text-[18px] text-lede text-pretty">
+          <a href={AUTHOR_URL} rel="me noreferrer" target="_blank">{AUTHOR}</a> — written
+          and revised by one person, which is the only reason the conventions below hold
+          consistently across every entry.
+        </p>
+        <div class="font-mono text-[12px] leading-[2] text-mute">
+          <div>@{AUTHOR_HANDLE}</div>
+          <div>
+            <a href={`mailto:${CONTACT_EMAIL}`}>{CONTACT_EMAIL}</a>
+          </div>
+        </div>
+      </div>
+    </Rail>
+
+    <Rail labelAs="h2" label="Conventions">
+      <div class="max-w-[68ch]">
+        {
+          conventions.map((c) => (
+            <div class="grid grid-cols-1 gap-x-6 gap-y-1 border-b border-rule-faint py-4 sm:grid-cols-[150px_minmax(0,1fr)]">
+              <span class="font-mono text-[11px] tracking-[0.1em] text-mute uppercase">
+                {c.k}
+              </span>
+              <span class="text-[16px] text-prose text-pretty">{c.v}</span>
+            </div>
+          ))
+        }
+      </div>
+    </Rail>
+
+    <Rail labelAs="h2" label="Stack">
+      <div class="max-w-[68ch] font-mono text-[12px] leading-[2] text-mute">
+        {stack.map((line) => <div>{line}</div>)}
+      </div>
+    </Rail>
+
+    <Rail labelAs="h2" label="Corrections" divider={false} class="pt-11">
+      <div class="max-w-[62ch]">
+        <p class="mt-0 mb-5 text-[17px] text-lede text-pretty">
+          If an entry is wrong, it is wrong in a specific place. Send the entry path, the
+          line, and what it should say.
+        </p>
+        <a
+          href={`mailto:${CONTACT_EMAIL}?subject=${encodeURIComponent('Grimoire correction')}`}
+          class="inline-block border-b border-accent pb-[3px] font-mono text-[12px] text-accent"
+        >
+          {CONTACT_EMAIL} →
+        </a>
+      </div>
+    </Rail>
+  </main>
+</BaseLayout>

@@ -1,0 +1,152 @@
+---
+import BaseLayout from '../../../layouts/BaseLayout.astro';
+import Rail from '../../../components/Rail.astro';
+import Breadcrumb from '../../../components/Breadcrumb.astro';
+import StatusBadge from '../../../components/StatusBadge.astro';
+import Pager from '../../../components/Pager.astro';
+import { getEntry, render } from 'astro:content';
+import {
+  allSubcategories,
+  entriesInSub,
+  subcategoriesIn,
+  type Subcategory,
+} from '../../../lib/grimoire';
+import { breadcrumbs, collectionNode, siteNodes } from '../../../lib/schema';
+
+export async function getStaticPaths() {
+  const subs = await allSubcategories();
+  return subs.map((sub) => {
+    const [category, leaf] = sub.id.split('/');
+    return { params: { category, sub: leaf }, props: { sub } };
+  });
+}
+
+interface Props {
+  sub: Subcategory;
+}
+
+const { sub } = Astro.props;
+const leaf = sub.id.split('/').pop()!;
+const category = (await getEntry(sub.data.category))!;
+const entries = await entriesInSub(sub.id);
+const stubs = entries.filter((e) => e.data.stub).length;
+const { Content: About } = await render(sub);
+
+// The other branches of the same shelf, offered in the margin so a reader who
+// has come in from a search result can see what sits either side of this one.
+const siblings = (await subcategoriesIn(category.id)).map((s) => ({
+  leaf: s.id.split('/').pop()!,
+  name: s.data.name,
+  current: s.id === sub.id,
+}));
+
+const description = `${sub.data.name} — ${sub.data.blurb}. ${entries.length} ${entries.length === 1 ? 'entry' : 'entries'} filed under ${category.data.name} in the AI Grimoire.`;
+
+const trail = [
+  { label: 'AI Grimoire', href: '/' },
+  { label: 'Categories', href: '/categories' },
+  { label: category.data.name, href: `/categories/${category.id}` },
+  { label: sub.data.name },
+];
+---
+
+<BaseLayout
+  title={sub.data.name}
+  tabTitle={`${sub.data.name} — ${category.data.name} — AI Grimoire`}
+  description={description}
+  nav="categories"
+  schema={[
+    ...siteNodes(),
+    collectionNode({
+      path: `/categories/${category.id}/${leaf}`,
+      name: `${sub.data.name} — ${category.data.name}`,
+      description,
+      entries,
+    }),
+    breadcrumbs([
+      { name: 'AI Grimoire', path: '/' },
+      { name: 'Categories', path: '/categories' },
+      { name: category.data.name, path: `/categories/${category.id}` },
+      { name: sub.data.name },
+    ]),
+  ]}
+>
+  <main class="mx-auto max-w-[1180px] animate-rise px-6 pb-20 sm:px-12">
+    <Breadcrumb trail={trail} />
+
+    <Rail class="pt-12 pb-9">
+      <div slot="rail" class="font-mono text-[11px] leading-[2] text-dim">
+        <div class="label mb-3 text-accent">{category.data.num} — siblings</div>
+        {
+          siblings.map((s) =>
+            s.current ? (
+              <div class="py-0.5 text-chalk">{s.leaf}/</div>
+            ) : (
+              <a
+                href={`/categories/${category.id}/${s.leaf}`}
+                class="block py-0.5 text-mute-2 hover:text-chalk"
+              >
+                {s.leaf}/
+              </a>
+            )
+          )
+        }
+      </div>
+
+      <p class="mt-0 mb-2 font-mono text-[11px] text-dim-2">
+        <a href={`/categories/${category.id}`} class="hover:text-chalk"
+          >{category.data.name}</a
+        > <span class="text-edge-hi">/</span> {leaf}
+      </p>
+      <h1
+        class="mt-0 mb-4 text-[34px] leading-[1.1] font-normal tracking-[-0.026em] text-bone sm:text-[44px]"
+      >
+        {sub.data.name}
+      </h1>
+      <div
+        class="mb-4 max-w-[62ch] text-[18px] text-lede [&>p]:mt-0 [&>p]:mb-4 [&>p]:text-pretty"
+      >
+        <About />
+      </div>
+      <p class="m-0 max-w-[62ch] text-[16px] text-dim italic">
+        {entries.length} {entries.length === 1 ? 'entry' : 'entries'}{
+          stubs > 0 && `, ${stubs} of them ${stubs === 1 ? 'a stub' : 'stubs'}`
+        }.
+      </p>
+    </Rail>
+
+    <Rail labelAs="h2" label="Entries" divider={false} class="pt-11">
+      <div data-paged>
+        {
+          entries.length === 0 ? (
+            <p class="mt-0 mb-0 text-[15px] text-dim italic">Nothing filed here yet.</p>
+          ) : (
+            entries.map((e, i) => (
+              <a
+                href={`/entries/${e.id}`}
+                data-row
+                class="grid grid-cols-[30px_minmax(0,1fr)] items-baseline gap-x-5 gap-y-1 border-b border-rule-faint py-4.5 transition-colors hover:bg-raise sm:grid-cols-[30px_minmax(0,1fr)_110px]"
+              >
+                <span class="font-mono text-[11px] text-dim-3">
+                  {category.data.num}.{sub.data.num}.{i + 1}
+                </span>
+                <div>
+                  <div class="text-[20px] tracking-[-0.014em] text-bone">
+                    {e.data.name}
+                    {e.data.stub && <span class="eyebrow ml-2.5 text-accent">stub</span>}
+                    {e.data.status && <StatusBadge status={e.data.status} class="ml-2.5" />}
+                  </div>
+                  <div class="mt-1 text-[15px] text-mute-3 text-pretty">{e.data.desc}</div>
+                </div>
+                <span class="col-start-2 font-mono text-[12px] text-accent sm:col-start-3 sm:text-right">
+                  {e.data.complexity}
+                </span>
+              </a>
+            ))
+          )
+        }
+        <Pager label={`${sub.data.name} pages`} />
+      </div>
+    </Rail>
+  </main>
+</BaseLayout>

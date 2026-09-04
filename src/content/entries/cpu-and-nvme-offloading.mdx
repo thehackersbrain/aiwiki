@@ -1,0 +1,149 @@
+---
+name: 'CPU and NVMe Offloading'
+desc: 'Park what is not in use on host memory or disk, bounded by PCIe rather than compute.'
+category: 'training'
+complexity: '—'
+memory: 'O(P/D)'
+path: 'training/memory'
+difficulty: 'intermediate'
+described: '2021'
+status: 'common'
+statusNote: 'The technique of last resort, and genuinely load-bearing for anyone training large models on few GPUs. Frontier runs do not use it because they do not have to.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['memory', 'training', 'inference']
+lede: 'A GPU has 80 GB and a host has a terabyte. Offloading makes the difference usable — turning a model that does not fit into one that runs slowly, which is a better outcome than it sounds.'
+metrics:
+  caption: 'Bandwidth, per direction'
+  rows:
+    - { label: 'HBM3', value: '≈ 3 000 GB/s' }
+    - { label: 'PCIe 5 ×16', value: '≈ 64 GB/s' }
+    - { label: 'NVMe', value: '≈ 7 GB/s', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Host memory must be pinned for the transfer to overlap with compute. Pageable memory forces a staging copy and serialises the transfer, which removes the entire benefit of prefetching — and pinning too much starves the operating system.'
+related: [zero-sharding, activation-memory-accounting, gradient-checkpointing, memory-efficient-optimisers, selective-recomputation, qlora]
+refs:
+  - cite: 'Ren et al. — ZeRO-Offload: Democratizing Billion-Scale Model Training (2021)'
+    id: 'arXiv:2101.06840'
+    href: https://arxiv.org/abs/2101.06840
+  - cite: 'Rajbhandari et al. — ZeRO-Infinity: Breaking the GPU Memory Wall for Extreme Scale Deep Learning (2021)'
+    id: 'arXiv:2104.07857'
+    href: https://arxiv.org/abs/2104.07857
+  - cite: 'Alizadeh et al. — LLM in a Flash: Efficient Large Language Model Inference with Limited Memory (2023)'
+    id: 'arXiv:2312.11514'
+    href: https://arxiv.org/abs/2312.11514
+---
+
+Every other technique on this branch reduces what must be resident. Offloading
+accepts the memory requirement and moves part of it somewhere larger and slower.
+
+The hierarchy is steep — three orders of magnitude from HBM to NVMe — so the
+question is not whether it costs performance but whether the transfer can be
+hidden behind compute.
+
+### What to offload
+
+The right candidates are tensors that are large, and used *rarely*.
+
+[Optimiser state](/entries/memory-efficient-optimisers) is the ideal case: two
+thirds of the memory of a mixed-precision model, and touched exactly once per
+step. ZeRO-Offload puts it on the host along with the fp32 master weights, and
+runs the optimiser update on the CPU — the update is elementwise and
+bandwidth-bound, so a CPU is not badly matched to it, and the gradients have to
+cross the bus anyway.
+
+Parameters are harder: used every layer, every step. ZeRO-Infinity offloads them
+and prefetches layer $\ell+1$ while layer $\ell$ computes, which works precisely
+when a layer's compute time exceeds the next layer's transfer time.
+
+<Eq lead caption="eq. 1 — the condition for a free transfer">
+
+$$
+\frac{\text{FLOPs}_\ell}{\text{throughput}} \;\ge\; \frac{\text{bytes}_{\ell+1}}{\text{bandwidth}}
+$$
+
+</Eq>
+
+Rearranged, this is a statement about arithmetic intensity, and it is why
+offloading works far better during *training* than during decoding. Training a
+layer at batch 8 and sequence 4096 does thousands of FLOPs per parameter byte;
+decoding one token does two. Same weights, same bus, and the ratio decides
+everything.
+
+<Note label="annotation">
+This is also why offloading interacts badly with small batches. Raising the batch
+size increases compute per layer without increasing the bytes to transfer, so the
+inequality becomes easier to satisfy — the counter-intuitive advice is that a
+memory-constrained offloaded run often wants a <em>larger</em> micro-batch.
+</Note>
+
+### The tiers
+
+| Tier | Capacity | Holds | Cost |
+| --- | --- | --- | --- |
+| HBM | 80 GB | active layer, activations | — |
+| host RAM | 1–2 TB | optimiser state, parameters | PCIe |
+| NVMe | 10+ TB | parameters, for very large models | PCIe + SSD |
+
+ZeRO-Infinity spans all three and reports trillion-parameter training on a single
+node, at a throughput that is a fraction of what the same model would achieve
+resident. The honest framing is the one its authors use: this is about
+*accessibility*, not speed. A model that trains slowly on hardware you have beats
+one that does not train at all on hardware you do not.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import nn
+
+
+class OffloadedLayers:
+    """Keep one layer resident; prefetch the next on a side stream."""
+
+    def __init__(self, layers: list[nn.Module], device="cuda"):
+        # pin_memory: required for async H2D. Pageable memory silently
+        # serialises through a staging buffer and the overlap is lost.
+        self.cpu = [{k: v.pin_memory() for k, v in l.state_dict().items()} for l in layers]
+        self.layers, self.device = layers, device
+        self.stream = torch.cuda.Stream()
+
+    def _prefetch(self, i: int) -> None:
+        if i >= len(self.layers):
+            return
+        with torch.cuda.stream(self.stream):
+            for k, v in self.cpu[i].items():
+                self.layers[i].state_dict()[k].copy_(v, non_blocking=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        self._prefetch(0)
+        for i, layer in enumerate(self.layers):
+            # Wait for this layer's weights, then start the next transfer
+            # before computing — so the copy overlaps the matmul.
+            torch.cuda.current_stream().wait_stream(self.stream)
+            self._prefetch(i + 1)
+            x = layer(x)
+        return x
+```
+
+</CodeFrame>
+
+The ordering in that loop is the whole technique. Prefetching *after* the compute
+call rather than before serialises the two, and the code still runs and still
+produces correct results — just at half the speed, with no error to explain why.
+
+<Rule label="On the inference side" />
+
+The same arithmetic, with the inequality now failing badly: decoding has
+arithmetic intensity of about 2, so streaming weights over PCIe is
+straightforwardly bandwidth-bound and slow.
+
+LLM in a Flash is the interesting response. It combines offloading with
+[activation sparsity](/entries/activation-sparsity) — if only 10% of the FFN
+neurons fire, only their rows need to be read from SSD, which reduces the
+transfer by the sparsity factor rather than trying to hide it. Against a baseline
+of the model not running at all, a 4–5× speed-up over naïve streaming is the
+difference between usable and not.

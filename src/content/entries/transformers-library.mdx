@@ -1,0 +1,98 @@
+---
+name: 'Transformers'
+desc: 'The reference implementation of nearly every architecture, and the format everything reads.'
+category: 'tooling'
+complexity: '—'
+path: 'tooling/tuning'
+difficulty: 'introductory'
+described: '2019'
+status: 'standard'
+statusNote: 'The lingua franca. A model that is not in this library is, for most practical purposes, a model nobody can use.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['tooling', 'training', 'core']
+lede: 'Not the fastest way to run a model or the most efficient way to train one. It is the one that has every architecture, and the one whose checkpoint format every other tool consumes.'
+implNote:
+  label: 'in practice'
+  html: 'Load with <code>dtype="bfloat16"</code> explicitly. The default is fp32, which doubles memory and is almost never what is wanted — and on a 70B model it is the difference between loading and not.'
+related: [peft-and-trl, unsloth, config-driven-finetuning, vllm, llama-cpp, supervised-fine-tuning]
+refs:
+  - cite: 'Wolf et al. — Transformers: State-of-the-Art Natural Language Processing (2019)'
+    id: 'arXiv:1910.03771'
+    href: https://arxiv.org/abs/1910.03771
+  - cite: 'Hugging Face — Transformers documentation'
+    id: 'huggingface.co'
+    href: https://huggingface.co/docs/transformers
+  - cite: 'safetensors format'
+    id: 'github'
+    href: https://github.com/huggingface/safetensors
+---
+
+Every other tool on this shelf either wraps this library, consumes checkpoints
+saved by it, or is measured against it. That position — not speed, not elegance —
+is what makes it worth an entry.
+
+<CodeFrame meta="python">
+
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.1-8B-Instruct",
+    dtype="bfloat16",          # the default is fp32; say what you mean
+    device_map="auto",         # shard across whatever GPUs exist
+    attn_implementation="flash_attention_2",
+)
+tok = AutoTokenizer.from_pretrained("meta-llama/Llama-3.1-8B-Instruct")
+
+chat = [{"role": "user", "content": "What is a capacity factor?"}]
+ids = tok.apply_chat_template(chat, add_generation_prompt=True, return_tensors="pt")
+print(tok.decode(model.generate(ids.cuda(), max_new_tokens=200)[0]))
+```
+
+</CodeFrame>
+
+### What it is for
+
+- **Loading any architecture.** Several hundred of them, each a readable Python
+  file. When the paper and the code disagree, this is usually the code people
+  mean.
+- **The `from_pretrained` contract.** A name resolves to weights, tokeniser and
+  config, cached locally. Nearly every tool in this book accepts one of these
+  identifiers.
+- **Reading how something works.** `modeling_llama.py` is a better description of
+  the architecture than most papers, and it is the one that runs.
+
+### What it is not for
+
+**Production serving.** `generate` has no continuous batching and no paged cache.
+[vLLM](/entries/vllm) exists for this and is an order of magnitude faster under
+load.
+
+**Memory-optimal training.** The `Trainer` works and is not tuned;
+[Unsloth](/entries/unsloth) and the config-driven wrappers beat it substantially
+on a single GPU.
+
+**Edge deployment.** Python, PyTorch and CUDA. [llama.cpp](/entries/llama-cpp) is
+the answer there.
+
+### Two things worth knowing
+
+**`apply_chat_template`.** Every instruction-tuned model has its own turn
+formatting, and getting it wrong degrades output in a way that looks like the
+model being bad. The template ships in the tokeniser config, so the model tells
+you its own format — hand-writing `[INST]` markers is a mistake with a silent
+failure mode.
+
+**safetensors.** The successor to pickled `.bin` checkpoints, which could execute
+arbitrary code on load. safetensors is a flat, memory-mappable format that cannot
+carry code, so loading an untrusted checkpoint is safe. A repository still
+offering only `.bin` is a reason for suspicion, not merely for inconvenience.
+
+<Note label="annotation">
+<code>device_map="auto"</code> uses accelerate to place layers across available
+GPUs and, if it must, CPU and disk. It makes an oversized model load and run
+slowly rather than fail — <a href="/entries/cpu-and-nvme-offloading">offloading</a>
+with the decisions made for you, and worth recognising when a model is
+inexplicably slow.
+</Note>

@@ -1,0 +1,131 @@
+---
+name: 'Additive Attention'
+desc: 'The original mechanism: a learned MLP scores each query–key pair.'
+category: 'architectures'
+complexity: 'O(n·m·d)'
+memory: 'O(n·m)'
+path: 'architectures/attention'
+difficulty: 'introductory'
+described: '2014'
+revised: 2026-08-30
+added: 2026-08-16
+tags: ['attention', 'history', 'foundations']
+status: 'superseded'
+statusNote: 'Displaced entirely by dot-product scoring, and not because it was less expressive — it is more. It lost because a tanh in the middle of the score cannot be folded into a single matrix multiplication, and by 2017 that was the only property that mattered.'
+lede: 'Bahdanau’s original formulation, in which a small feed-forward network learns the similarity function instead of assuming an inner product.'
+implNote:
+  label: 'annotation'
+  html: 'The two projections are applied separately and broadcast against each other, so <code>s</code> and <code>h</code> need not share a dimension — the one genuine advantage this has over the dot product.'
+related: [scaled-dot-product-attention, cross-attention, multi-head-attention]
+refs:
+  - cite: 'Bahdanau et al. — Neural Machine Translation by Jointly Learning to Align and Translate (2014)'
+    id: 'arXiv:1409.0473'
+    href: https://arxiv.org/abs/1409.0473
+  - cite: 'Luong et al. — Effective Approaches to Attention-based Neural Machine Translation (2015)'
+    id: 'arXiv:1508.04025'
+    href: https://arxiv.org/abs/1508.04025
+  - cite: 'Vaswani et al. — Attention Is All You Need (2017)'
+    id: 'arXiv:1706.03762'
+    href: https://arxiv.org/abs/1706.03762
+---
+
+Attention was introduced without a dot product. Bahdanau et al. needed a score
+for each decoder-state/encoder-state pair and, rather than assuming the two
+should be compared by inner product, they learned the comparison.
+
+<Eq caption="eq. 1 — a one-hidden-layer MLP, scoring one pair" source="Bahdanau et al. §A.1.2" lead>
+
+$$
+e_{ti} = v^{\top} \tanh\!\left( W_s s_{t-1} + W_h h_i \right),
+\qquad
+\alpha_{ti} = \frac{\exp(e_{ti})}{\sum_j \exp(e_{tj})}
+$$
+
+</Eq>
+
+<Note label="aside">
+"Additive" names the $+$ inside the tanh, not the aggregation. Luong later called
+the same thing "concat", which is arguably the clearer name.
+</Note>
+
+$W_s$ and $W_h$ map the two sides into a shared $d_a$-dimensional space
+independently, so the decoder state and the encoder states may have different
+dimensions — something the dot product cannot do without an extra projection.
+The tanh and $v$ then reduce the pair to a scalar.
+
+### Why it lost
+
+The nonlinearity sits between the two operands. That single fact is the whole
+story: it means the $n \times m$ score matrix cannot be written as a product of a
+$Q$ matrix and a $K$ matrix, so it cannot be one GEMM.
+
+<Eq caption="eq. 2 — the structural difference">
+
+$$
+\underbrace{E = v^{\top}\tanh(S W_s^{\top} \oplus H W_h^{\top})}_{n \cdot m \text{ small ops}}
+\qquad\text{versus}\qquad
+\underbrace{E = \frac{Q K^{\top}}{\sqrt{d_k}}}_{\text{one matmul}}
+$$
+
+</Eq>
+
+Luong et al. compared the two directly and found the accuracy difference small
+and inconsistent — dot-product scoring was competitive on their tasks and
+sometimes better. Given comparable quality and an order-of-magnitude difference
+in how well the computation maps onto matrix hardware, the outcome was not close.
+
+<Note label="caveat">
+It is worth being precise about *why* it lost, because "additive attention is
+worse" is the wrong lesson. It is more expressive per parameter. It was beaten by
+hardware, not by mathematics — the same reason several other things in this book
+are where they are.
+</Note>
+
+### What it is still good for
+
+Reading the original formulation makes the modern one look like a choice rather
+than a definition. The three requirements on a scoring function — depends on both
+sides, normalises to a distribution, differentiable — are satisfied by both, and
+seeing a second solution is what stops $\softmax(QK^\top/\sqrt{d_k})$ feeling
+like an incantation.
+
+It also still appears in small models where $n \cdot m$ is tiny and the extra
+expressivity is worth more than the GEMM: pointer networks, some
+retrieval rerankers, and a good deal of pre-2017 code that still works.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor, nn
+
+
+class AdditiveAttention(nn.Module):
+    """Bahdanau scoring. d_s and d_h may differ — that is the point."""
+
+    def __init__(self, d_s: int, d_h: int, d_attn: int) -> None:
+        super().__init__()
+        self.w_s = nn.Linear(d_s, d_attn, bias=False)
+        self.w_h = nn.Linear(d_h, d_attn, bias=False)
+        self.v = nn.Linear(d_attn, 1, bias=False)
+
+    def forward(self, s: Tensor, h: Tensor, mask: Tensor | None = None) -> Tensor:
+        # [B, N, 1, A] + [B, 1, M, A] -> [B, N, M, A]. This tensor is the cost:
+        # d_attn times larger than the score matrix it collapses to.
+        joint = self.w_s(s).unsqueeze(2) + self.w_h(h).unsqueeze(1)
+        scores = self.v(joint.tanh()).squeeze(-1)
+
+        if mask is not None:
+            scores = scores.masked_fill(mask, torch.finfo(scores.dtype).min / 2)
+
+        return scores.softmax(dim=-1) @ h
+```
+
+</CodeFrame>
+
+The `unsqueeze`-and-add broadcast materialises a $[B, N, M, A]$ tensor — $d_a$
+times the memory of the score matrix itself. At $n = m = 4096$ and $d_a = 64$
+that is 4 GB in fp32 for a single head of a single layer, which is the practical
+reason nobody runs this at transformer scale.

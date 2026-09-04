@@ -1,0 +1,140 @@
+---
+title: 'Throwing work away'
+desc: 'Recomputation is a trade with a bad exchange rate applied uniformly, and a good one applied selectively.'
+lede: 'Storing an activation costs bytes. Regenerating it costs FLOPs. The whole question is which tensors have a favourable ratio — and it is not the same answer for all of them.'
+series: 'making-it-fit'
+part: 2
+minutes: 8
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['memory', 'training']
+related: [gradient-checkpointing, selective-recomputation, activation-memory-accounting, flash-attention, activation-compression]
+refs:
+  - cite: 'Chen et al. — Training Deep Nets with Sublinear Memory Cost (2016)'
+    id: 'arXiv:1604.06174'
+    href: https://arxiv.org/abs/1604.06174
+  - cite: 'Korthikanti et al. — Reducing Activation Recomputation in Large Transformer Models (2022)'
+    id: 'arXiv:2205.05198'
+    href: https://arxiv.org/abs/2205.05198
+  - cite: 'Griewank & Walther — Revolve: an implementation of checkpointing for the reverse or adjoint mode of computational differentiation (2000)'
+    id: 'ACM TOMS 26(1)'
+    href: https://dl.acm.org/doi/10.1145/347837.347846
+---
+
+Backpropagation needs the forward pass's intermediates. That is a requirement of
+the chain rule and not negotiable. What is negotiable is whether those
+intermediates were *stored* or are *recreated on demand*.
+
+### The √L result
+
+Chen et al.'s version is elegant enough to derive in a paragraph. Divide $L$
+layers into $k$ segments. Keep only the activation at each segment boundary — $k$
+tensors. During the backward pass, when a segment is reached, rerun its forward
+from the stored boundary to regenerate its interior.
+
+<Eq lead caption="eq. 1 — memory and recompute, traded against k">
+
+$$
+M \sim k + \frac{L}{k}, \qquad \text{extra compute} \sim \frac{L}{k} \cdot \frac{L}{L} = 1 \text{ forward pass}
+$$
+
+</Eq>
+
+Minimising the first over $k$ gives $k = \sqrt{L}$ and $M \sim \sqrt{L}$ — memory
+sublinear in depth, for one extra forward pass. For an 80-layer model that is
+memory proportional to 9 rather than 80.
+
+<Note label="aside">
+The idea is older than deep learning by two decades. Griewank's Revolve solves
+exactly this problem — optimal checkpoint placement for reverse-mode
+differentiation — for adjoint solvers in computational fluid dynamics, and the
+optimal schedule for a known memory budget is a binomial recursion rather than
+the even split everyone actually uses.
+</Note>
+
+### The number in practice
+
+One extra forward pass sounds cheap. Put it in the [6ND
+accounting](/entries/training-compute-accounting) and it is not.
+
+<Eq caption="eq. 2 — the constant, with and without">
+
+$$
+\underbrace{2}_{\text{fwd}} + \underbrace{4}_{\text{bwd}} = 6
+\qquad\longrightarrow\qquad
+\underbrace{2 + 2}_{\text{fwd, twice}} + \underbrace{4}_{\text{bwd}} = 8
+$$
+
+</Eq>
+
+Thirty-three percent more compute for the entire run. On a month-long job that is
+ten days. It is a real price and it is routinely paid without being stated —
+scaling-law plots are drawn in FLOPs and the checkpointing multiplier does not
+appear anywhere in them.
+
+### Why uniform recomputation is the wrong shape
+
+Here is the observation that reframed this for me. The memory in a transformer
+block is not evenly distributed, and neither is the cost of regenerating it.
+
+Sort the tensors by *arithmetic intensity* — FLOPs to recompute, divided by bytes
+stored.
+
+| Tensor | Bytes | Recompute cost |
+| --- | --- | --- |
+| attention scores | $5as^2b$ | one matmul |
+| softmax output | $2as^2b$ | elementwise |
+| dropout mask | $as^2b$ | free |
+| QKV projections | $6sbh$ | a large matmul |
+| FFN hidden | $8sbh$ | a large matmul |
+
+The quadratic tensors — the large ones — are almost free to regenerate. The
+linear tensors are matmul outputs, where recomputing means repeating the
+expensive part.
+
+So the right move is not "recompute the block". It is: recompute the attention
+interior, keep the projections. Korthikanti et al. measured about 70% of full
+checkpointing's saving at roughly 4% overhead instead of 36%.
+
+<Note label="annotation">
+A ninth of the cost for most of the benefit, purely from not applying the
+technique uniformly. This is the general lesson I took from the memory branch:
+almost every "trade X for Y" technique has a version that asks <em>which</em> X,
+and the selective version is usually dramatically better than the blanket one.
+</Note>
+
+### And it composes badly with the free thing
+
+The table above assumes the score matrices are stored. If you took part 1's
+advice, they are not — [FlashAttention](/entries/flash-attention) already made
+that trade, better, and for free.
+
+Which means selective recomputation has much less left to work on than the
+numbers suggest. Its three big targets are gone, and what remains is the linear
+term where the exchange rate is poor.
+
+This is the honest state of the technique in 2026: important historically,
+important in stacks that cannot use fused attention, and considerably less
+central than the papers make it sound if you are running a modern kernel.
+
+### The third option
+
+There is a route neither of these takes: keep the activations and store them in
+fewer bits. The backward pass reads them once to compute a gradient that is
+already a noisy minibatch estimate, so a little extra noise is tolerable —
+[ActNN](/entries/activation-compression) makes this rigorous with stochastic
+rounding, which keeps the gradient unbiased and preserves convergence guarantees.
+
+It gets about twelve-fold compression for roughly 20% throughput. Sound, and
+mostly unused — because recomputation is exact, is one function call, and after
+FlashAttention there is not enough left on the table to justify custom kernels.
+
+I like it as an entry anyway. It is a good example of a technique that is
+correct, well-motivated, and was overtaken by something that solved the same
+problem from a different direction.
+
+<Rule label="Next" />
+
+Part 3 stops trying to fit on one device and splits the batch — where the
+interesting content is not the splitting but what has to stay identical across
+the copies.

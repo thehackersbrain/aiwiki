@@ -1,0 +1,144 @@
+---
+name: 'Masked Language Modelling'
+desc: 'Corrupt the input, predict what was removed; the objective that lost to next-token.'
+category: 'training'
+complexity: 'O(n·V·m)'
+path: 'training/objectives'
+difficulty: 'introductory'
+described: '2018'
+status: 'common'
+statusNote: 'Still correct for encoders, which are still what embedding and reranking models are. Gone from anything that generates, and the reason is sample efficiency rather than quality.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['objectives', 'training']
+lede: 'Hide fifteen percent of the tokens and predict them from both sides. Better representations per token than next-token prediction, and a fraction of the training signal per sequence.'
+metrics:
+  caption: 'Predictions per 512-token sequence'
+  rows:
+    - { label: 'Next-token', value: '512' }
+    - { label: 'MLM at 15%', value: '77', accent: true }
+    - { label: 'Context per prediction', value: 'both sides' }
+implNote:
+  label: 'caveat'
+  html: 'The 80/10/10 split — mask, random token, unchanged — exists because <code>[MASK]</code> never appears at fine-tuning time. Without it the model learns a feature that is absent from every downstream input.'
+related: [next-token-prediction, supervised-fine-tuning, perplexity, causal-masking, knowledge-distillation]
+refs:
+  - cite: 'Devlin et al. — BERT: Pre-training of Deep Bidirectional Transformers (2018)'
+    id: 'arXiv:1810.04805'
+    href: https://arxiv.org/abs/1810.04805
+  - cite: 'Raffel et al. — Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer (2019)'
+    id: 'arXiv:1910.10683'
+    href: https://arxiv.org/abs/1910.10683
+  - cite: 'Clark et al. — ELECTRA: Pre-training Text Encoders as Discriminators Rather Than Generators (2020)'
+    id: 'arXiv:2003.10555'
+    href: https://arxiv.org/abs/2003.10555
+---
+
+[Next-token prediction](/entries/next-token-prediction) forces a decision every
+model designer would rather not make: each token may only see its predecessors.
+That is required for generation and it is a real cost for understanding — the
+representation of a word cannot depend on the sentence it ends up in.
+
+MLM removes the constraint by removing generation. Corrupt some tokens, let every
+position attend everywhere, and predict what was taken out.
+
+<Eq lead caption="eq. 1 — over the masked positions only">
+
+$$
+\mathcal{L} = -\sum_{t \in \mathcal{M}} \log p_\theta\bigl(x_t \mid \tilde{x}\bigr),
+\qquad |\mathcal{M}| \approx 0.15\,T
+$$
+
+</Eq>
+
+Note the sum's range. Only masked positions contribute; the other 85% are context
+and produce no gradient of their own. That single fact decided the outcome.
+
+### Sample efficiency
+
+A 512-token sequence yields 512 training signals under next-token prediction and
+about 77 under MLM. Same forward pass, same cost, a sixth of the supervision.
+
+<Note label="annotation">
+The trade is real in both directions. Each MLM prediction is <em>better
+supervised</em> — the model sees both sides — so per prediction the objective is
+richer. It is simply not richer by a factor of six, and when the binding
+constraint became compute rather than data, the objective that extracts more
+signal per FLOP won.
+</Note>
+
+### The 80/10/10 rule
+
+BERT does not simply replace the chosen tokens with `[MASK]`. Of the 15% selected:
+80% become `[MASK]`, 10% become a random token, and 10% are left alone with the
+loss still applied.
+
+The reason is a train/test mismatch. `[MASK]` exists only during pre-training; no
+fine-tuning input contains it. A model that keyed on the token would have learnt
+a feature that is never again present. The random-token share forces the model to
+maintain a representation of every position — it cannot assume an unmasked token
+is correct — and the unchanged share keeps the identity prediction in
+distribution.
+
+It is a patch, and the ratios are not derived from anything.
+
+### The variants that fixed the efficiency
+
+**Span corruption** (T5) masks contiguous runs and predicts them as a sequence,
+so a single training example can be several tokens long. This unifies the
+encoder-decoder setup with generation and is why T5 could do both.
+
+**ELECTRA** is the sharper answer. A small generator fills the masks; the main
+model, a discriminator, predicts for *every* position whether it was replaced.
+The loss now covers 100% of positions rather than 15%, and ELECTRA matches
+RoBERTa's quality at roughly a quarter of the compute — the same objective
+reformulated so that no token is wasted.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor
+
+
+def mask_tokens(
+    tokens: Tensor, mask_id: int, vocab: int, rate: float = 0.15, special: Tensor | None = None
+) -> tuple[Tensor, Tensor]:
+    """Returns the corrupted input and the labels (-100 where no loss applies)."""
+    probs = torch.full(tokens.shape, rate)
+    if special is not None:
+        probs.masked_fill_(special, 0.0)                      # never mask [CLS]/[SEP]
+    chosen = torch.bernoulli(probs).bool()
+
+    labels = tokens.masked_fill(~chosen, -100)                # loss on chosen only
+    x = tokens.clone()
+
+    # 80% [MASK]
+    swap = torch.bernoulli(torch.full(tokens.shape, 0.8)).bool() & chosen
+    x[swap] = mask_id
+
+    # 10% random; the remaining 10% keep their original token.
+    rand = torch.bernoulli(torch.full(tokens.shape, 0.5)).bool() & chosen & ~swap
+    x[rand] = torch.randint(vocab, (int(rand.sum()),), device=tokens.device)
+
+    return x, labels
+```
+
+</CodeFrame>
+
+The `-100` is not arbitrary: it is `cross_entropy`'s default `ignore_index`, so
+unmasked positions drop out of the loss without a separate mask tensor.
+
+<Rule label="Where it still applies" />
+
+Every serious embedding and reranking model is an encoder trained this way —
+retrieval wants a bidirectional representation of a whole passage, and there is
+nothing to generate. ModernBERT and its contemporaries are MLM models with the
+last decade of architecture work folded in, and they beat decoder-based
+embeddings at a fraction of the size.
+
+The correct summary is not that MLM lost. It is that generation and
+representation turned out to be different jobs, and the field spent five years
+discovering that one objective is better at each.

@@ -1,0 +1,133 @@
+---
+name: 'Statistical Power for Evals'
+desc: 'Error bars, paired tests and how many items an eval actually needs.'
+category: 'evaluation'
+complexity: 'O(N)'
+path: 'evaluation/data'
+difficulty: 'intermediate'
+described: '2024'
+status: 'standard'
+statusNote: 'Not a technique in fashion but a precondition. A benchmark comparison without it is not a result.'
+revised: 2026-08-18
+added: 2025-07-03
+tags: ['metric', 'data']
+lede: 'A benchmark score is an estimate from a sample. Most reported differences between models are smaller than the interval around either of them.'
+metrics:
+  caption: 'binomial standard error at p ≈ 0.8'
+  rows:
+    - { label: 'n = 100', value: '±4.0 pts' }
+    - { label: 'n = 1000', value: '±1.3 pts' }
+    - { label: 'n = 10000', value: '±0.4 pts', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Run both models on the same items and pair the comparison. An unpaired test on a shared benchmark throws away most of your power for no reason.'
+related: [llm-as-judge, contamination-detection, perplexity, elo-bradley-terry-scoring]
+refs:
+  - cite: 'Miller — Adding Error Bars to Evals (2024)'
+    id: 'arXiv:2411.00640'
+    href: https://arxiv.org/abs/2411.00640
+  - cite: 'Bowyer et al. — Position: Don’t Use the CLT in LLM Evals With Fewer Than a Few Hundred Datapoints (2025)'
+    id: 'arXiv:2503.01747'
+    href: https://arxiv.org/abs/2503.01747
+  - cite: 'Efron & Tibshirani — An Introduction to the Bootstrap (1993)'
+    id: 'Chapman & Hall'
+---
+
+Accuracy on $n$ items is a mean of $n$ Bernoulli draws. Its standard error is
+the familiar one, and it is larger than most leaderboard gaps.
+
+<Eq caption="eq. 1 — standard error of a proportion" lead>
+
+$$
+\mathrm{SE}(\hat{p}) = \sqrt{\frac{\hat{p}(1 - \hat{p})}{n}}
+$$
+
+</Eq>
+
+<Note label="in numbers">
+At $n = 400$ and $\hat p = 0.8$, the 95% interval is roughly ±4 points. Two
+models 2 points apart on that benchmark are not distinguishable.
+</Note>
+
+### Pair the comparison
+
+Comparing two models on the *same* items means the question is not "are these
+two proportions different" but "is the mean of the per-item difference nonzero".
+Items that both models get right or both get wrong contribute nothing to the
+variance, and on a shared benchmark most items are like that.
+
+<Eq caption="eq. 2 — paired difference, d_i ∈ {−1, 0, 1}">
+
+$$
+\bar{d} = \frac{1}{n}\sum_i \bigl( c_i^{A} - c_i^{B} \bigr),
+\qquad
+\mathrm{SE}(\bar{d}) = \frac{s_d}{\sqrt{n}}
+$$
+
+</Eq>
+
+The paired standard error is typically two to three times smaller than the
+unpaired one. McNemar's test is the same idea in exact form: condition on the
+discordant pairs and test whether they split evenly.
+
+<Eq caption="eq. 3 — McNemar, b and c the discordant counts">
+
+$$
+b \sim \mathrm{Binomial}(b + c,\; \tfrac{1}{2}) \quad \text{under } H_0
+$$
+
+</Eq>
+
+### Two things that inflate confidence
+
+**Clustering.** Benchmarks with several questions per passage or per template
+violate independence. The effective sample size is closer to the number of
+clusters than the number of items, and ignoring it understates the interval —
+often by a factor of two.
+
+**Sampling variance.** At non-zero temperature the model is a random variable
+too. Report over $k$ samples per item and the variance decomposes into
+between-item and within-item parts; only the second falls as you sample more.
+
+> With fewer than a few hundred items the normal approximation is unreliable at
+> the tails. Use a Wilson or Clopper–Pearson interval, or bootstrap — the
+> $\hat p \pm 1.96\,\mathrm{SE}$ reflex is the thing to unlearn first.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · numpy + scipy">
+
+```python
+import numpy as np
+from scipy import stats
+
+
+def wilson(correct: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Better than normal approximation at small n and extreme p."""
+    p = correct / n
+    denom = 1 + z**2 / n
+    centre = (p + z**2 / (2 * n)) / denom
+    half = z * np.sqrt(p * (1 - p) / n + z**2 / (4 * n**2)) / denom
+    return centre - half, centre + half
+
+
+def paired_test(a: np.ndarray, b: np.ndarray) -> dict[str, float]:
+    """a, b: 0/1 correctness on the SAME items, aligned."""
+    only_a = int(np.sum((a == 1) & (b == 0)))
+    only_b = int(np.sum((a == 0) & (b == 1)))
+
+    # exact McNemar: how surprising is this split of the discordant pairs?
+    p_value = stats.binomtest(only_a, only_a + only_b, 0.5).pvalue
+    diff = float(np.mean(a - b))
+    se = float(np.std(a - b, ddof=1) / np.sqrt(len(a)))
+
+    return {"diff": diff, "se": se, "ci95": 1.96 * se, "p": p_value}
+```
+
+</CodeFrame>
+
+`ddof=1` is not a detail — the population formula understates the standard error
+at the sample sizes evals actually use. If the benchmark has clusters, bootstrap
+by resampling whole clusters rather than items; resampling items treats
+correlated questions as independent evidence and returns an interval that is
+confidently wrong.

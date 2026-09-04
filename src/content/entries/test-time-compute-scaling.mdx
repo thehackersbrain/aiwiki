@@ -1,0 +1,158 @@
+---
+name: 'Test-Time Compute Scaling'
+desc: 'Spend more compute per question instead of more compute per model.'
+category: 'training'
+complexity: '—'
+path: 'training/scaling'
+difficulty: 'intermediate'
+described: '2024'
+status: 'standard'
+statusNote: 'A second scaling axis, established in about eighteen months. Every frontier reasoning model is built on it, and where it applies is much narrower than the headlines suggest.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['scaling', 'inference', 'objectives']
+lede: 'Training compute is spent once and serves every query. Inference compute is spent per query and can be varied per query — which turns out to buy accuracy on exactly the problems where verification is cheap.'
+metrics:
+  caption: 'Where the compute goes'
+  rows:
+    - { label: 'Training', value: 'once, all queries' }
+    - { label: 'Test-time', value: 'per query' }
+    - { label: 'Payoff', value: 'verifiable tasks', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Sequential revision and parallel sampling are not interchangeable. Easy questions favour revision — the model is nearly right and needs a nudge; hard ones favour breadth, because the model is on the wrong track and revising it stays there.'
+related: [sampling-strategies, grpo, speculative-decoding, emergent-abilities, chinchilla-scaling-laws, llm-as-judge, kl-regularisation]
+refs:
+  - cite: 'Snell et al. — Scaling LLM Test-Time Compute Optimally can be More Effective than Scaling Model Parameters (2024)'
+    id: 'arXiv:2408.03314'
+    href: https://arxiv.org/abs/2408.03314
+  - cite: 'Wu et al. — Inference Scaling Laws: An Empirical Analysis of Compute-Optimal Inference (2024)'
+    id: 'arXiv:2408.00724'
+    href: https://arxiv.org/abs/2408.00724
+  - cite: 'DeepSeek-AI — DeepSeek-R1: Incentivizing Reasoning Capability in LLMs via Reinforcement Learning (2025)'
+    id: 'arXiv:2501.12948'
+    href: https://arxiv.org/abs/2501.12948
+---
+
+Every entry above this one treats compute as something spent before the model
+ships. There is a second budget, and until recently nobody was optimising it.
+
+<Eq lead caption="eq. 1 — two budgets, and only one is fixed at deploy time">
+
+$$
+C_{\text{total}} = \underbrace{6ND}_{\text{once}} \;+\; \underbrace{2N \cdot T_{\text{gen}} \cdot Q}_{\text{per query, and } T_{\text{gen}} \text{ is a choice}}
+$$
+
+</Eq>
+
+$T_{\text{gen}}$ is under your control at request time. Let the model produce ten
+thousand tokens of working instead of two hundred, or sample sixty-four answers
+and pick one, and accuracy rises — often by more than a several-fold larger model
+would have bought.
+
+### The three shapes
+
+**Parallel sampling.** Draw $k$ independent answers and select. With a
+ground-truth checker this is *pass@k* and rises steeply; without one, selection
+is by majority vote or by a
+[reward model](/entries/reward-modelling), and the ceiling is the selector's
+accuracy rather than the generator's.
+
+**Sequential revision.** Let the model critique and rewrite its own answer. Uses
+the budget on depth rather than breadth.
+
+**Search.** Tree search over reasoning steps with a process reward model scoring
+partial paths — beam search or lookahead. Most expensive, and the one that scales
+furthest on hard problems.
+
+Snell et al.'s finding is that the right choice depends on difficulty, and that
+adapting it per question — a *compute-optimal* policy — beats any fixed strategy
+by a factor of four in efficiency. On easy questions revision wins; on hard ones
+breadth does, because a model that has taken a wrong turn revises within the
+wrong turn.
+
+<Note label="annotation">
+Their headline comparison is that this can outperform a 14× larger model at
+matched FLOPs — with a stated condition that is usually dropped in the retelling:
+it holds when the base model is not too far from solving the problem. Where the
+model essentially never succeeds, no amount of sampling finds an answer that is
+not in the distribution.
+</Note>
+
+### Why the reasoning models work
+
+R1 and its contemporaries make the long chain of thought a *learned* behaviour
+rather than a prompting trick, and the training signal is
+[GRPO](/entries/grpo) against a verifiable reward — a maths answer that checks
+out, a test suite that passes.
+
+Two consequences follow from verifiability, and both are covered in
+[KL regularisation](/entries/kl-regularisation). The reward is not a proxy, so
+there is nothing to overoptimise into and the KL leash can be dropped. And once
+it is dropped, the policy is free to develop response lengths the SFT model would
+never have produced — which is the observable signature of these models, chains
+running to tens of thousands of tokens, and it emerges from the optimisation
+rather than being prompted for.
+
+### Where it does not apply
+
+The requirement is a verifier, and it is a strong one.
+
+Mathematics, competitive programming and formal proof have cheap ground truth,
+and this is where every reported gain lives. Summarisation, style, advice and
+open-ended writing have none — sampling sixty-four essays and picking one
+requires a judge, and an [LLM judge](/entries/llm-as-judge) has its own error
+rate that caps the whole procedure.
+
+<Eq caption="eq. 2 — the selector is the ceiling">
+
+$$
+\text{accuracy} \le \Pr[\text{a correct answer is sampled}] \cdot \Pr[\text{the selector picks it}]
+$$
+
+</Eq>
+
+Which is why "reasoning models are better at everything" is not what the results
+say. They are better where answers can be checked, and the checking is the part
+that does not generalise.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python">
+
+```python
+from collections import Counter
+
+
+def best_of_n(model, prompt: str, n: int, verifier=None, judge=None) -> str:
+    """Parallel sampling with the three selection regimes, in order of quality."""
+    samples = [model.generate(prompt, temperature=0.8) for _ in range(n)]
+
+    if verifier is not None:
+        # Ground truth: the only regime where pass@k is the real curve.
+        for s in samples:
+            if verifier(s):
+                return s
+        return samples[0]
+
+    if judge is not None:
+        return max(samples, key=judge)         # capped by the judge's accuracy
+
+    # Majority vote over extracted answers: free, and needs a canonical form.
+    answers = Counter(extract_answer(s) for s in samples)
+    top = answers.most_common(1)[0][0]
+    return next(s for s in samples if extract_answer(s) == top)
+
+
+def budget(difficulty: float, total: int) -> tuple[int, int]:
+    """Snell et al. §5: breadth for hard questions, depth for easy ones."""
+    width = max(1, int(total * difficulty))
+    return width, max(1, total // width)       # (parallel samples, revisions)
+```
+
+</CodeFrame>
+
+`difficulty` is the awkward input. Snell et al. estimate it from the base model's
+own pass rate on a small sample, which costs compute before the real budget is
+spent — so the adaptive policy is only worth it when the budget is large enough
+for the estimate to pay for itself.

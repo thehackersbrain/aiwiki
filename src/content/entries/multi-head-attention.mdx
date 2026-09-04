@@ -1,0 +1,141 @@
+---
+name: 'Multi-Head Attention'
+desc: 'h attention operations in d/h-dimensional subspaces, summed back into the residual stream.'
+category: 'architectures'
+complexity: 'O(n²·d)'
+memory: 'O(h·n²)'
+path: 'architectures/attention'
+difficulty: 'intermediate'
+described: '2017'
+status: 'standard'
+statusNote: 'Universal. The open question is the number of heads and how their keys and values are shared, not whether to split them.'
+revised: 2026-09-01
+added: 2024-10-17
+tags: ['attention', 'transformer', 'core']
+lede: 'Not one attention operation over <i>d</i> dimensions but <i>h</i> of them over <i>d/h</i>, run in parallel and summed. The parameter count is unchanged; what changes is how many things the layer can attend to at once.'
+metrics:
+  caption: 'd = 4096, h = 32, n = 4096, fp16'
+  rows:
+    - { label: 'Params / layer', value: '67 M' }
+    - { label: 'Same at h = 1', value: '67 M' }
+    - { label: 'Attn matrices', value: '1.0 GB', accent: true }
+implNote:
+  label: 'annotation'
+  html: 'The reshape is the whole trick: <code>[B, N, D] → [B, H, N, D/H]</code> before the matmul and back after. Everything else is single-head attention run in a batch dimension.'
+related: [scaled-dot-product-attention, multi-query-attention, grouped-query-attention, induction-heads]
+refs:
+  - cite: 'Vaswani et al. — Attention Is All You Need (2017)'
+    id: 'arXiv:1706.03762'
+    href: https://arxiv.org/abs/1706.03762
+  - cite: 'Elhage et al. — A Mathematical Framework for Transformer Circuits (2021)'
+    id: 'transformer-circuits'
+    href: https://transformer-circuits.pub/2021/framework/index.html
+  - cite: 'Michel et al. — Are Sixteen Heads Really Better than One? (2019)'
+    id: 'arXiv:1905.10650'
+    href: https://arxiv.org/abs/1905.10650
+---
+
+A single attention operation produces one weighted average per query. Whatever
+the model wants from a position — the subject of the sentence, the matching
+bracket, the last occurrence of this token — it must be extracted by one softmax
+over one similarity function. Multi-head attention runs $h$ of them over disjoint
+$d_h = d/h$-dimensional subspaces and adds the results.
+
+<Eq caption="eq. 1 — h independent reads, one write" source="Vaswani et al. §3.2.2" lead>
+
+$$
+\mathrm{MHA}(X) = \sum_{i=1}^{h} \mathrm{Attention}\!\left( X W^Q_i,\; X W^K_i,\; X W^V_i \right) W^O_i
+$$
+
+</Eq>
+
+<Note label="annotation">
+The usual presentation concatenates the heads and multiplies by one $W^O$. That
+is the same thing: concatenation followed by a matmul *is* a sum of the blocks
+of $W^O$ applied to each head.
+</Note>
+
+Written as a sum rather than a concatenation, the structure is easier to read.
+Each head has its own read matrices $W^Q_i, W^K_i, W^V_i \in \R^{d \times d_h}$
+and its own write matrix $W^O_i \in \R^{d_h \times d}$, and it contributes to the
+residual stream independently of the others. Heads do not interact within a
+layer; they only ever meet by adding into the same stream.
+
+### The parameter count does not change
+
+With $d_h = d/h$, the four projections total $4 d^2$ regardless of $h$. Splitting
+into more heads is free in parameters and nearly free in FLOPs — it buys
+parallel reads rather than capacity.
+
+<Eq caption="eq. 2 — per-layer projection parameters">
+
+$$
+h \cdot \bigl( 3 \, d \, d_h + d_h \, d \bigr) = 4 d^2
+\quad\text{for any } h \text{ dividing } d
+$$
+
+</Eq>
+
+What does change is the attention matrices: $h$ of them, each $n \times n$. That
+term is why context length is expensive, and why it is the first thing
+[FlashAttention](/entries/flash-attention) refuses to materialise.
+
+### What a head is for
+
+<Note label="caveat">
+"Head $i$ does $X$" is a claim about a particular model, not about the
+architecture. Heads are not assigned roles; they are found to have them.
+</Note>
+
+The circuits literature treats each head as a pair of low-rank operators: a $QK$
+matrix deciding *where* to read, and an $OV$ matrix deciding *what* to write. The
+two are independent, which is why a head can be described by where it attends
+without reference to what it copies — and why
+[induction heads](/entries/induction-heads) can be identified by their attention
+pattern alone.
+
+Pruning studies find heads are not equally load-bearing: many can be removed at
+test time with almost no loss, while a few are individually critical. The
+redundancy appears to be useful during training and largely surplus afterwards.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor, nn
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, d_model: int, n_heads: int) -> None:
+        super().__init__()
+        assert d_model % n_heads == 0
+        self.h = n_heads
+        self.d_head = d_model // n_heads
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+
+    def forward(self, x: Tensor, causal: bool = True) -> Tensor:
+        b, n, _ = x.shape
+        # One matmul for all three projections, then split heads out.
+        q, k, v = self.qkv(x).chunk(3, dim=-1)
+        q, k, v = (
+            t.view(b, n, self.h, self.d_head).transpose(1, 2) for t in (q, k, v)
+        )
+
+        out = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, is_causal=causal
+        )
+        # Concatenate the heads back into the model dimension.
+        out = out.transpose(1, 2).reshape(b, n, self.h * self.d_head)
+        return self.proj(out)
+```
+
+</CodeFrame>
+
+Fusing $W^Q, W^K, W^V$ into one `Linear` is worth doing: it turns three
+small matmuls into one large one, which matters more than it looks at batch
+sizes where the GEMMs are launch-bound. The `transpose(1, 2)` before and after
+is the only real cost of the head decomposition, and it is a view plus a
+contiguous copy, not arithmetic.

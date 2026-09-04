@@ -1,0 +1,127 @@
+---
+name: 'Group Normalisation'
+desc: 'Normalise over channel groups within one example; batch size drops out.'
+category: 'architectures'
+complexity: 'O(n·d)'
+path: 'architectures/normalisation'
+difficulty: 'intermediate'
+described: '2018'
+status: 'common'
+statusNote: 'The default in diffusion UNets and in detection backbones, where batches are small. Absent from language models, which have no channel structure to group.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['normalisation', 'vision']
+lede: 'One knob interpolates between LayerNorm and per-channel normalisation: how many groups the channels are split into. At one group it is LayerNorm, at C groups it is InstanceNorm, and the useful setting is neither.'
+metrics:
+  caption: 'ResNet-50 ImageNet error, batch size 2'
+  rows:
+    - { label: 'BatchNorm', value: '34.7%' }
+    - { label: 'GroupNorm', value: '24.8%', accent: true }
+    - { label: 'Groups used', value: '32' }
+implNote:
+  label: 'in practice'
+  html: 'Thirty-two groups, or eight channels per group, whichever the channel count permits — Wu &amp; He found the result flat between those and degrading outside. It must divide the channel count exactly.'
+related: [batch-normalisation, layer-normalisation, rmsnorm, pre-norm-and-post-norm]
+refs:
+  - cite: 'Wu & He — Group Normalization (2018)'
+    id: 'arXiv:1803.08494'
+    href: https://arxiv.org/abs/1803.08494
+  - cite: 'Ulyanov et al. — Instance Normalization: The Missing Ingredient for Fast Stylization (2016)'
+    id: 'arXiv:1607.08022'
+    href: https://arxiv.org/abs/1607.08022
+  - cite: 'Ho et al. — Denoising Diffusion Probabilistic Models (2020)'
+    id: 'arXiv:2006.11239'
+    href: https://arxiv.org/abs/2006.11239
+---
+
+[BatchNorm](/entries/batch-normalisation) fails at small batch size, and several
+things in vision force small batches — detection and segmentation, which need
+high-resolution inputs, and diffusion training, where the model is large and the
+images are not small. GroupNorm is the answer that vision arrived at, and it is a
+within-example scheme like everything that works on sequences.
+
+<Eq lead caption="eq. 1 — statistics over a slice of channels and all pixels">
+
+$$
+\mu_{b,g} = \frac{1}{|\mathcal{G}_g| HW} \sum_{c \in \mathcal{G}_g}\sum_{h,w} x_{b,c,h,w}
+$$
+
+</Eq>
+
+with $\sigma$ over the same index set, and $\mathcal{G}_g$ one of $G$ contiguous
+blocks of channels. The batch index $b$ appears on the left, so each example is
+normalised alone: no running statistics, no train/eval divergence, no dependence
+on what else is in the batch.
+
+### One knob, three known schemes
+
+The group count recovers the whole family.
+
+| $G$ | Statistics over | Known as |
+| --- | --- | --- |
+| $1$ | all channels, all pixels | LayerNorm (convolutional form) |
+| $C$ | one channel, all pixels | InstanceNorm |
+| $32$ | 32 channels, all pixels | GroupNorm |
+
+Both endpoints are worse than the middle, and the reason is a fact about what
+convolutional channels are. LayerNorm at $G = 1$ assumes every channel should
+share a scale, which is wrong — an edge detector and a colour channel have no
+business being normalised together. InstanceNorm at $G = C$ removes each
+channel's magnitude entirely, which discards contrast information the classifier
+wants. Grouping keeps related filters together and lets unrelated ones differ.
+
+<Note label="aside">
+This has an older precedent than the paper. Grouped filter banks — SIFT, HOG —
+normalise within a group of orientation bins for exactly the same reason, and
+GroupNorm is that convention rediscovered inside a learned network.
+</Note>
+
+### Where it is actually used now
+
+Diffusion. Every UNet in the DDPM lineage uses GroupNorm at 32 groups, in each
+residual block, before the activation — a detail inherited essentially unchanged
+from Ho et al. and reproduced in Stable Diffusion and its descendants. It is
+there because diffusion training runs at batch sizes that would make BatchNorm's
+statistics useless, and because the sampler runs at batch size 1.
+
+Transformer-based diffusion (DiT and after) drops it for
+[LayerNorm](/entries/layer-normalisation), which is the same thing at $G = 1$ —
+the channel-grouping argument does not apply once the tensor is a sequence of
+tokens rather than a stack of feature maps.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor, nn
+
+
+class GroupNorm(nn.Module):
+    def __init__(self, groups: int, channels: int, eps: float = 1e-5):
+        super().__init__()
+        if channels % groups:
+            raise ValueError(f"{channels} channels does not divide into {groups} groups")
+        self.groups, self.eps = groups, eps
+        self.weight = nn.Parameter(torch.ones(channels))
+        self.bias = nn.Parameter(torch.zeros(channels))
+
+    def forward(self, x: Tensor) -> Tensor:                   # [B, C, H, W]
+        b, c, h, w = x.shape
+        x = x.reshape(b, self.groups, -1)                     # fold C/G, H, W together
+
+        mu = x.mean(-1, keepdim=True)
+        var = x.var(-1, keepdim=True, unbiased=False)
+        x = (x - mu) * torch.rsqrt(var + self.eps)
+
+        x = x.reshape(b, c, h, w)
+        return x * self.weight[:, None, None] + self.bias[:, None, None]
+```
+
+</CodeFrame>
+
+The reshape assumes groups are contiguous in channel order, which means the
+grouping is decided by however the preceding convolution happened to order its
+output filters — arbitrary, and it does not matter, because the network learns an
+ordering that suits the grouping rather than the other way round.

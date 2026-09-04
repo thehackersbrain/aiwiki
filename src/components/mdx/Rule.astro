@@ -1,0 +1,26 @@
+---
+interface Props {
+  /** Accent label placed in the margin, level with the rule. */
+  label: string;
+  /** Draw the hairline above it. The first label in a body does not. */
+  divider?: boolean;
+}
+
+const { label, divider = true } = Astro.props;
+---
+
+<div
+  data-margin-rule
+  class:list={[
+    'not-prose',
+    divider ? 'mt-10 border-t border-rule pt-10' : 'mt-0',
+  ]}
+>
+  <div class="md:relative md:h-0">
+    <h2
+      class="label m-0 mb-4 font-normal text-accent md:absolute md:top-0 md:right-[calc(100%+3rem)] md:mb-0 md:w-[210px]"
+    >
+      {label}
+    </h2>
+  </div>
+</div>

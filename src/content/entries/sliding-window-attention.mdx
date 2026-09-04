@@ -1,0 +1,33 @@
+---
+name: 'Sliding-Window Attention'
+desc: 'Local band mask; receptive field grows linearly with depth.'
+category: 'architectures'
+complexity: 'O(n·w·d)'
+path: 'architectures/attention'
+difficulty: 'intermediate'
+described: '2020'
+status: 'common'
+statusNote: 'Standard in hybrid and long-context designs, usually interleaved with full-attention layers rather than used alone.'
+revised: 2026-07-21
+added: 2024-08-31
+tags: ['attention', 'sparse']
+stub: true
+lede: 'Each token attends only to the w tokens preceding it, making cost linear in sequence length and the effective receptive field L·w after L layers.'
+related: [scaled-dot-product-attention, flash-attention]
+refs:
+  - cite: 'Beltagy et al. — Longformer: The Long-Document Transformer (2020)'
+    id: 'arXiv:2004.05150'
+    href: https://arxiv.org/abs/2004.05150
+  - cite: 'Child et al. — Generating Long Sequences with Sparse Transformers (2019)'
+    id: 'arXiv:1904.10509'
+    href: https://arxiv.org/abs/1904.10509
+---
+
+Masking every query to a band of $w$ preceding keys makes the cost $O(n \cdot w
+\cdot d)$ rather than $O(n^2 d)$, and stacking $L$ such layers gives an effective
+receptive field of $L \cdot w$ — information propagates, but only at one window
+per layer.
+
+What is not yet settled here, and the reason this is a stub, is how the band
+interacts with the position scheme and with attention sinks: the first few tokens
+appear to matter far more than the band alone would predict.

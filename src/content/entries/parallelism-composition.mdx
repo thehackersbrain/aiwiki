@@ -1,0 +1,158 @@
+---
+name: 'Parallelism Composition'
+desc: 'Four or five strategies at once, and the topology decides the order.'
+category: 'training'
+complexity: '—'
+path: 'training/distributed'
+difficulty: 'advanced'
+described: '2021'
+status: 'standard'
+statusNote: 'What a frontier training configuration is. The individual strategies are textbook; arranging them against a specific cluster is the part that is still craft.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['distributed', 'training', 'scaling']
+lede: 'No single parallelism reaches ten thousand devices. The configuration that does is a product of four or five of them, ordered so the chattiest sits on the fastest wire.'
+metrics:
+  caption: 'A representative 16 384-GPU layout'
+  rows:
+    - { label: 'Tensor × context', value: '8 (intra-node)' }
+    - { label: 'Pipeline', value: '16 (inter-node)' }
+    - { label: 'Data / ZeRO', value: '128', accent: true }
+implNote:
+  label: 'annotation'
+  html: 'The ordering rule is the whole of it: rank the strategies by bytes moved per unit of compute, and assign them to links in the same order. Everything else is arithmetic.'
+related: [tensor-parallelism, pipeline-parallelism, data-parallelism, context-parallelism, zero-sharding, expert-parallelism, collective-communication]
+refs:
+  - cite: 'Narayanan et al. — Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM (2021)'
+    id: 'arXiv:2104.04473'
+    href: https://arxiv.org/abs/2104.04473
+  - cite: 'Dubey et al. — The Llama 3 Herd of Models (2024)'
+    id: 'arXiv:2407.21783'
+    href: https://arxiv.org/abs/2407.21783
+  - cite: 'DeepSeek-AI — DeepSeek-V3 Technical Report (2024)'
+    id: 'arXiv:2412.19437'
+    href: https://arxiv.org/abs/2412.19437
+---
+
+Each strategy on this branch has a limit. Tensor parallelism saturates the
+interconnect past a node. Pipeline parallelism has a bubble that worsens with
+more stages. Data parallelism runs out at the critical batch size. Context
+parallelism is bounded by sequence length.
+
+A frontier run uses all of them, and the arrangement is determined by one
+quantity.
+
+<Eq lead caption="eq. 1 — the ordering rule">
+
+$$
+\text{intensity} = \frac{\text{bytes communicated}}{\text{FLOPs performed}}
+$$
+
+</Eq>
+
+Sort the strategies by intensity, sort the links by bandwidth, and match them up.
+
+| Strategy | Per step | Placement |
+| --- | --- | --- |
+| tensor | 4 collectives per layer | inside a node |
+| context | $N-1$ hops per attention | inside a node |
+| expert | 2 all-to-all per MoE layer | inside a node, or few nodes |
+| pipeline | 1 activation per boundary | across nodes |
+| data / ZeRO | 1 reduce per step | across everything |
+
+Tensor parallelism is typically capped at the NVLink domain — 8 on most nodes —
+because the ninth device is across PCIe and the collective inherits its
+bandwidth.
+
+### The arithmetic
+
+<Eq caption="eq. 2 — the degrees multiply out to the device count">
+
+$$
+N_{\text{devices}} = \mathrm{TP} \times \mathrm{CP} \times \mathrm{PP} \times \mathrm{DP},
+\qquad
+\text{batch} = \mathrm{DP} \times b_{\text{micro}} \times \text{accum}
+$$
+
+</Eq>
+
+Both constraints bind at once, which is what makes the configuration awkward.
+Raising pipeline depth to fit a larger model reduces the data-parallel degree at
+fixed device count, which reduces the batch, which raises the bubble fraction
+because there are fewer micro-batches to fill it.
+
+<Note label="annotation">
+Llama 3's 405B run used TP 8, CP 1–16 depending on the stage, PP 16 and DP 128
+across 16 384 GPUs. The context-parallel degree changes between stages because
+the long-context phase came last — the layout is not a constant of the run.
+</Note>
+
+### What goes wrong
+
+**Rank ordering.** The mapping from global rank to (tp, cp, pp, dp) coordinates
+decides which group lands on which link. Get it wrong and tensor-parallel groups
+straddle nodes while data-parallel groups sit inside them — a configuration that
+trains correctly at a fraction of the throughput, with no error and no obvious
+symptom.
+
+**Stragglers.** Every collective is a barrier, so the slowest rank sets the pace
+for its group. One thermally throttled GPU in sixteen thousand slows the entire
+job, and finding it means per-rank step timing.
+
+**Imbalance.** Pipeline stages must be balanced in time; expert parallelism needs
+[load balancing](/entries/loss-free-load-balancing); context parallelism needs
+the zigzag assignment. Each is a separate mechanism for the same problem.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · building the process groups">
+
+```python
+import torch.distributed as dist
+
+
+def build_mesh(tp: int, cp: int, pp: int, dp: int):
+    """Rank layout, fastest-varying dimension first.
+
+    Global rank = ((dp_i * pp + pp_i) * cp + cp_i) * tp + tp_i
+
+    tp varies fastest, so a tensor-parallel group is contiguous ranks —
+    which the launcher places on one node. That single choice is what
+    keeps the chattiest collective on NVLink.
+    """
+    world = tp * cp * pp * dp
+    assert dist.get_world_size() == world
+
+    mesh = dist.device_mesh.init_device_mesh(
+        "cuda", (dp, pp, cp, tp), mesh_dim_names=("dp", "pp", "cp", "tp")
+    )
+    return mesh
+
+
+def sanity_check(mesh) -> None:
+    """Assert the intra-node groups are actually intra-node. Cheap, and it
+    catches the misconfiguration that costs half the cluster's throughput."""
+    local = int(os.environ["LOCAL_WORLD_SIZE"])
+    tp_ranks = mesh["tp"].mesh.tolist()
+    assert max(tp_ranks) // local == min(tp_ranks) // local, "TP group spans nodes"
+```
+
+</CodeFrame>
+
+That assertion is worth writing. The failure it catches is silent, expensive, and
+survives for as long as nobody compares measured throughput against a model FLOPs
+utilisation estimate — which on a new cluster is often the whole first month.
+
+<Rule label="How to arrive at a configuration" />
+
+1. **Tensor parallel** to the NVLink domain, or until the layer fits.
+2. **Context parallel** if the sequence does not fit; multiply into the same node
+   budget.
+3. **Pipeline** across nodes until the model fits in aggregate.
+4. **Data parallel** with everything left, up to the critical batch size.
+5. **ZeRO or FSDP** over the data-parallel group to shard what remains.
+
+Then measure. Model FLOPs utilisation — achieved FLOPs over peak — is the number
+that says whether the layout is right, and anything below about 35% on a modern
+cluster means one of the five steps is wrong rather than that the model is
+demanding.

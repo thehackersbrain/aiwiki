@@ -1,0 +1,163 @@
+---
+name: 'Fault Tolerance'
+desc: 'At ten thousand devices something fails hourly; the run has to survive it.'
+category: 'training'
+complexity: '—'
+path: 'training/distributed'
+difficulty: 'intermediate'
+described: '2022'
+status: 'common'
+statusNote: 'Unavoidable above about a thousand devices and mostly solved by engineering rather than by research. The published mean-time-between-failure numbers are the useful part.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['distributed', 'training']
+lede: 'A month-long run on sixteen thousand GPUs will be interrupted hundreds of times. Checkpointing frequency, restart cost and failure rate form a straightforward optimisation, and getting it wrong wastes a large fraction of a cluster.'
+metrics:
+  caption: 'Llama 3 405B, 54 days'
+  rows:
+    - { label: 'Interruptions', value: '466' }
+    - { label: 'Unplanned', value: '419' }
+    - { label: 'Effective uptime', value: '≈ 90%', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'A checkpoint must capture the optimiser state, the data-loader position and the RNG state, not only the weights. Restarting with a fresh data order re-shows examples the model has already seen, which is a silent quality regression rather than a crash.'
+related: [parallelism-composition, zero-sharding, collective-communication, data-parallelism, memory-efficient-optimisers, nondeterminism]
+refs:
+  - cite: 'Dubey et al. — The Llama 3 Herd of Models (2024)'
+    id: 'arXiv:2407.21783'
+    href: https://arxiv.org/abs/2407.21783
+  - cite: 'Chowdhery et al. — PaLM: Scaling Language Modeling with Pathways (2022)'
+    id: 'arXiv:2204.02311'
+    href: https://arxiv.org/abs/2204.02311
+  - cite: 'Eisenman et al. — Check-N-Run: A Checkpointing System for Training Deep Learning Recommendation Models (2022)'
+    id: 'arXiv:2010.08679'
+    href: https://arxiv.org/abs/2010.08679
+---
+
+A GPU has a mean time between failures measured in years. Sixteen thousand of
+them, plus the network, the storage and the power, gives a system MTBF measured
+in hours.
+
+Llama 3's 405B run is the best-documented case: 466 interruptions over 54 days,
+419 of them unplanned, and about 78% traced to hardware — GPUs and HBM
+predominantly. Roughly one unplanned stop every three hours, sustained for two
+months.
+
+Since every [collective](/entries/collective-communication) is a barrier, one
+dead rank stops the entire job. There is no partial progress.
+
+### The checkpoint interval
+
+<Eq lead caption="eq. 1 — lost time per interval, minimised over T">
+
+$$
+\mathbb{E}[\text{waste}] = \underbrace{\frac{T}{\mathrm{MTBF}}\cdot\left(\frac{T}{2} + R\right)}_{\text{redone work + restart}} + \underbrace{C}_{\text{checkpoint cost}}
+$$
+
+</Eq>
+
+Differentiating gives the classical result, Young's formula:
+
+<Eq caption="eq. 2 — the optimal interval">
+
+$$
+T^{*} = \sqrt{2\,C\cdot\mathrm{MTBF}}
+$$
+
+</Eq>
+
+At a 3-hour MTBF and a 5-minute checkpoint, $T^* \approx 42$ minutes. The
+quantity that matters most is $C$, and it appears under a square root — so
+halving the checkpoint cost only improves the interval by 30%, but it also
+reduces the fixed overhead directly, which is where the real gain is.
+
+### Making the checkpoint cheap
+
+A 405B model's [optimiser state](/entries/memory-efficient-optimisers) is several
+terabytes. Written synchronously to shared storage, that is many minutes with
+every device idle.
+
+**Shard it.** Under [ZeRO](/entries/zero-sharding) each rank already holds a
+slice; each writes its own, in parallel, and the aggregate bandwidth is the
+cluster's rather than one node's.
+
+**Write asynchronously.** Copy the state to host memory — fast, and the GPUs
+resume immediately — then flush to storage from a background thread. This turns
+minutes of idle time into seconds.
+
+**Keep it in memory.** Some systems hold a checkpoint in a peer node's RAM as
+well as on disk, so recovery from a single-node failure never touches storage.
+
+<Note label="annotation">
+The correctness requirement is that the checkpoint be <em>consistent</em>: every
+rank's slice from the same step. Async writing must therefore snapshot at a
+barrier and flush afterwards, not flush lazily from wherever each rank happens to
+be — a mixed-step checkpoint restores into a subtly corrupted optimiser state
+that trains without error.
+</Note>
+
+### What must be saved
+
+| Item | Consequence of omitting |
+| --- | --- |
+| weights | obvious |
+| optimiser moments | loses momentum; a visible loss spike |
+| data-loader position | re-shows seen data |
+| RNG state | different dropout and augmentation stream |
+| learning-rate schedule step | resumes at the wrong rate |
+| loss-scaler state (fp16) | a few skipped steps |
+
+Only the first two crash anything if wrong. The rest degrade the run quietly,
+which is why they are the ones that get missed.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch.distributed.checkpoint">
+
+```python
+import torch.distributed.checkpoint as dcp
+from torch.distributed.checkpoint.state_dict import get_state_dict
+
+
+def save(model, optimizer, loader, step: int, path: str) -> None:
+    model_sd, optim_sd = get_state_dict(model, optimizer)
+    state = {
+        "model": model_sd,
+        "optim": optim_sd,
+        "step": step,
+        "loader": loader.state_dict(),          # position in the stream
+        "rng": torch.cuda.get_rng_state_all(),
+    }
+    # Sharded and parallel: every rank writes its own slice at once.
+    dcp.save(state, checkpoint_id=f"{path}/step-{step}", async_save=True)
+
+
+def resume(model, optimizer, loader, path: str) -> int:
+    model_sd, optim_sd = get_state_dict(model, optimizer)
+    state = {"model": model_sd, "optim": optim_sd, "step": 0,
+             "loader": loader.state_dict(), "rng": None}
+    dcp.load(state, checkpoint_id=path)
+
+    torch.cuda.set_rng_state_all(state["rng"])
+    loader.load_state_dict(state["loader"])
+    return state["step"]
+```
+
+</CodeFrame>
+
+<Rule label="Beyond restarting" />
+
+**Detection.** Most of the time saved is in noticing quickly. A hung collective
+produces no error — the job sits at a barrier indefinitely — so a watchdog on
+collective duration, and on per-rank step time, is what turns a silent hang into
+a fast restart.
+
+**Elastic training.** `torchrun --nnodes=min:max` lets the job continue on fewer
+nodes after a failure and re-expand when they return. It changes the
+data-parallel degree and therefore the effective batch, so the learning rate
+should follow — usually ignored, and a small source of irreproducibility.
+
+**Bad batches.** Not every interruption is hardware. PaLM's authors report loss
+spikes that were not reproducible from the same checkpoint on different data,
+and their mitigation was to restart a few hundred steps back and skip the batches
+around the spike — a restart protocol for a problem that is not a failure at all.

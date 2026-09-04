@@ -1,0 +1,152 @@
+---
+name: 'HiPPO'
+desc: 'The initialisation that makes a linear recurrence remember: online polynomial projection.'
+category: 'architectures'
+complexity: 'O(n·d·N)'
+path: 'architectures/recurrence'
+difficulty: 'advanced'
+described: '2020'
+status: 'common'
+statusNote: 'Load-bearing for the S4 line and the reason those models worked when earlier linear RNNs did not. Later work found the specific matrix matters less than it first appeared.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['recurrence', 'sequence']
+lede: 'A random linear recurrence forgets exponentially. Derive the matrix that instead keeps an optimal polynomial approximation of everything seen so far, and the same architecture handles sequences of sixteen thousand steps.'
+metrics:
+  caption: 'Sequential CIFAR, 1024 steps'
+  rows:
+    - { label: 'LSTM', value: '≈ 60%' }
+    - { label: 'Random-init SSM', value: 'fails' }
+    - { label: 'HiPPO-init SSM', value: '> 90%', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'HiPPO is an <em>initialisation</em>, not a constraint. A is trained from it, and drifts. What the derivation supplies is a starting point from which gradient descent can reach a good solution — the same role a good weight init plays anywhere, with a much better argument behind it.'
+related: [state-space-models, parallel-scan, recurrent-neural-networks, rotary-position-embedding, state-space-duality]
+refs:
+  - cite: 'Gu et al. — HiPPO: Recurrent Memory with Optimal Polynomial Projections (2020)'
+    id: 'arXiv:2008.07669'
+    href: https://arxiv.org/abs/2008.07669
+  - cite: 'Gu et al. — Efficiently Modeling Long Sequences with Structured State Spaces (2021)'
+    id: 'arXiv:2111.00396'
+    href: https://arxiv.org/abs/2111.00396
+  - cite: 'Orvieto et al. — Resurrecting Recurrent Neural Networks for Long Sequences (2023)'
+    id: 'arXiv:2303.06349'
+    href: https://arxiv.org/abs/2303.06349
+---
+
+A linear recurrence $h_t = A h_{t-1} + B x_t$ with a random $A$ forgets at a rate
+set by $A$'s eigenvalues. Nothing about a random matrix makes the forgetting
+useful — the state ends up holding a decaying blur of the recent past and nothing
+of the distant one.
+
+HiPPO asks a sharper question. Suppose the state's job is to hold the best
+$N$-coefficient approximation of the *entire* input history so far. What must $A$
+be?
+
+### Memory as projection
+
+Treat the input as a function $x(t)$ and the state as its coefficients against a
+basis of orthogonal polynomials, under a measure that weights how much each part
+of the past counts.
+
+<Eq lead caption="eq. 1 — the state is a projection, maintained online">
+
+$$
+h(t) = \Bigl\langle x\big|_{\le t},\; p_n \Bigr\rangle_{\mu^{(t)}}, \qquad n < N
+$$
+
+</Eq>
+
+The requirement is that this stay true as $t$ advances — that the coefficients of
+the best approximation at time $t+dt$ follow from those at time $t$ by a linear
+update. Remarkably, for the standard measures they do, and differentiating the
+projection gives an $A$ in closed form.
+
+<Eq caption="eq. 2 — HiPPO-LegS, the uniform-weight case">
+
+$$
+A_{nk} = -\begin{cases}
+\sqrt{(2n+1)(2k+1)} & n > k \\
+n+1 & n = k \\
+0 & n < k
+\end{cases}
+$$
+
+</Eq>
+
+Lower-triangular, with entries growing as $\sqrt{nk}$. Nothing about it looks like
+a matrix anyone would guess, and that is the point — it is derived, not searched.
+
+<Note label="annotation">
+The measure encodes what "remember" means. LegS weights all history uniformly, so
+the state is a scale-invariant summary of everything. LegT weights a sliding
+window, giving a fixed-length memory. LagT decays exponentially, which is what a
+gated RNN approximates. Choosing the measure is choosing the forgetting policy,
+and it is the only choice being made.
+</Note>
+
+### Why it mattered
+
+S4 is a linear recurrence, a [parallel scan](/entries/parallel-scan), and this
+initialisation. Remove the initialisation and the architecture fails outright on
+long-range tasks — the Long Range Arena's Path-X, at 16 384 steps, went from
+"nobody has ever beaten chance" to solved.
+
+The specific claim is narrow and worth keeping straight: HiPPO does not make the
+model more expressive. The same $A$ is reachable by gradient descent in
+principle. What it does is put the optimisation somewhere it can succeed from,
+and for this architecture the gap between a reachable optimum and a reached one
+turned out to be the whole result.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · numpy">
+
+```python
+import numpy as np
+
+
+def hippo_legs(n: int) -> np.ndarray:
+    """HiPPO-LegS transition matrix. Gu et al. 2020, eq. 2."""
+    q = np.arange(n)
+    r = 2 * q + 1
+    m = -np.tril(np.sqrt(r[:, None] * r[None, :]), -1)        # n > k
+    np.fill_diagonal(m, -(q + 1))                             # n = k
+    return m                                                  # strictly lower + diag
+
+
+def normal_plus_low_rank(n: int) -> tuple[np.ndarray, np.ndarray]:
+    """S4's decomposition: A = normal − P Pᵀ, which is what makes the
+    convolution kernel computable without materialising A^t."""
+    a = hippo_legs(n)
+    p = np.sqrt(np.arange(n) + 0.5)
+    return a + p[:, None] * p[None, :], p
+```
+
+</CodeFrame>
+
+That decomposition is where S4's difficulty lives. Running the recurrence needs
+powers of $A$, which for a dense $N \times N$ matrix is prohibitive; writing $A$
+as normal-plus-low-rank makes the powers computable in $O(N \log N)$ via a Cauchy
+kernel. Several pages of the S4 paper are about that and none of it is about
+sequence modelling.
+
+<Rule label="How the story ended" />
+
+Two later results reframe it.
+
+**S4D** replaces the derived matrix with a diagonal one whose eigenvalues are
+initialised along the same part of the complex plane, and performs about as well.
+The dense structure was not essential; the eigenvalue placement was.
+
+**The LRU paper** goes further, taking an ordinary linear RNN and applying three
+changes — diagonal complex parameterisation, stable exponential parameterisation
+of the eigenvalue magnitudes, and normalisation at initialisation — and matches
+S4 on Long Range Arena with no HiPPO at all.
+
+The honest reading is that HiPPO answered a question nobody had posed correctly
+and, in doing so, revealed what the answer needed to look like: eigenvalues just
+inside the unit circle, spread over a range of timescales. It got there by
+derivation. Once seen, the same configuration can be had by initialising for it
+directly — which is what [Mamba](/entries/state-space-models) does, keeping the
+diagonal form and the timescale spread and dropping the polynomial argument.

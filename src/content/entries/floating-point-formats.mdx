@@ -1,0 +1,149 @@
+---
+name: 'Floating-Point Formats'
+desc: 'What bf16, fp16, fp8 and fp4 each give up, and which failure follows.'
+category: 'miscellany'
+complexity: '—'
+path: 'miscellany/numerics'
+difficulty: 'introductory'
+described: '2018'
+status: 'standard'
+statusNote: 'bf16 for training and fp8 for inference is the current settled answer. fp4 is where the argument is live.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['numerics', 'training', 'inference', 'core']
+lede: 'Every format spends its bits on either range or precision. Which one you are short of decides how the run fails — silently wrong, or loudly NaN.'
+metrics:
+  caption: 'Exponent / mantissa bits, and what breaks'
+  rows:
+    - { label: 'fp16 · 5 / 10', value: 'overflows' }
+    - { label: 'bf16 · 8 / 7', value: 'rounds' }
+    - { label: 'fp8 e4m3 · 4 / 3', value: 'needs scaling', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'bf16 has the same exponent range as fp32 and three fewer mantissa bits than fp16. Casting fp32 → bf16 is a truncation of the low sixteen bits and cannot overflow; casting fp32 → fp16 can, and does, at values above 65 504.'
+related: [gptq, qlora, rmsnorm, layer-normalisation, tensor-layout-conventions, nondeterminism]
+refs:
+  - cite: 'Micikevicius et al. — Mixed Precision Training (2017)'
+    id: 'arXiv:1710.03740'
+    href: https://arxiv.org/abs/1710.03740
+  - cite: 'Micikevicius et al. — FP8 Formats for Deep Learning (2022)'
+    id: 'arXiv:2209.05433'
+    href: https://arxiv.org/abs/2209.05433
+  - cite: 'Kalamkar et al. — A Study of BFLOAT16 for Deep Learning Training (2019)'
+    id: 'arXiv:1905.12322'
+    href: https://arxiv.org/abs/1905.12322
+---
+
+A floating-point number is a sign, an exponent and a mantissa. The exponent sets
+how far apart the largest and smallest representable magnitudes are; the mantissa
+sets how finely spaced the values are within that span. A format is a decision
+about how to split a fixed bit budget between the two, and every such decision is
+a bet on which kind of error the workload can tolerate.
+
+| Format | Exponent | Mantissa | Max finite | Smallest normal |
+| --- | --- | --- | --- | --- |
+| fp32 | 8 | 23 | 3.4e38 | 1.2e−38 |
+| tf32 | 8 | 10 | 3.4e38 | 1.2e−38 |
+| bf16 | 8 | 7 | 3.4e38 | 1.2e−38 |
+| fp16 | 5 | 10 | 65 504 | 6.1e−5 |
+| fp8 e4m3 | 4 | 3 | 448 | 1.5e−2 |
+| fp8 e5m2 | 5 | 2 | 57 344 | 6.1e−5 |
+
+### Why bf16 displaced fp16
+
+fp16 came first and has more precision. It also has a dynamic range that gradient
+magnitudes routinely leave. A gradient of $10^{-8}$ is not small for a deep
+network; in fp16 it is zero, and the update it should have produced never
+happens. At the other end, an activation spike above 65 504 becomes infinity, and
+one infinity propagates to a NaN loss within a step.
+
+The mitigation was *loss scaling*: multiply the loss by a large constant before
+the backward pass so that gradients land in fp16's representable band, then
+divide it back out before the optimiser step. Dynamic loss scaling automates the
+constant by doubling it periodically and halving it whenever the gradients
+overflow — which means a training run that intermittently discards steps as a
+matter of course.
+
+<Note label="annotation">
+bf16 deletes the whole apparatus. Same exponent as fp32, so anything fp32 can
+hold bf16 can hold; the price is three mantissa bits, which for stochastic
+gradient descent is noise on top of noise. No loss scaling, no skipped steps, and
+casting to and from fp32 is a truncation.
+</Note>
+
+The precision loss is not free everywhere, and the exceptions are the reductions:
+sums over the feature dimension in [normalisation](/entries/layer-normalisation),
+the softmax denominator, the optimiser's second-moment accumulator. All of those
+are kept in fp32 in every serious implementation, which is what "mixed precision"
+actually means — the weights and activations are half precision, the accumulations
+are not.
+
+### fp8, and why it needs a scale
+
+Four exponent bits reach 448. Activations in a large model exceed that routinely,
+so fp8 is not a format one simply casts into — every tensor carries a scale
+factor, and the value stored is $x / s$ with $s$ chosen so the tensor's maximum
+lands near the top of the range.
+
+The two variants split the work. **e4m3** has more mantissa and less range, and
+holds weights and activations. **e5m2** has more range and less mantissa, and
+holds gradients, which span more orders of magnitude and tolerate coarser
+steps. Getting this backwards is a real and common mistake.
+
+<Eq lead caption="eq. 1 — per-tensor scaling, chosen from the observed maximum">
+
+$$
+\hat{x} = \mathrm{cast}_{\text{fp8}}\!\left(\frac{x}{s}\right),
+\qquad
+s = \frac{\max|x|}{F_{\max}}
+$$
+
+</Eq>
+
+Because $\max|x|$ is not known until the tensor exists, production implementations
+use *delayed scaling*: keep a short history of recent maxima, predict the next
+one, and correct if the prediction was too low. Recomputing the scale from the
+current tensor is exact and costs a full extra pass over it.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor
+
+FP8_E4M3_MAX = 448.0
+
+
+def to_fp8(x: Tensor, amax: Tensor | None = None) -> tuple[Tensor, Tensor]:
+    """Scale into range, then cast. Returns the tensor and its scale."""
+    amax = x.abs().amax() if amax is None else amax
+    # clamp: an all-zero tensor would otherwise divide by zero.
+    scale = (amax / FP8_E4M3_MAX).clamp(min=1e-12)
+    return (x / scale).to(torch.float8_e4m3fn), scale
+
+
+def from_fp8(x: Tensor, scale: Tensor, dtype=torch.bfloat16) -> Tensor:
+    return x.to(dtype) * scale
+```
+
+</CodeFrame>
+
+The matmul is where the win is. An fp8 tensor-core matmul runs at roughly twice
+the throughput of bf16 on Hopper and later, and — more importantly for serving —
+halves the bytes moved, which is the actual bound. The accumulator inside the
+kernel is still fp32; fp8 describes the operands, never the sum.
+
+<Rule label="Below eight bits" />
+
+fp4 (e2m1) has six representable magnitudes. Per-tensor scaling is hopeless at
+that width, so the block moves to *micro-scaling*: a shared exponent per group of
+16 or 32 elements, so the scale tracks local structure rather than the whole
+tensor. Blackwell implements this in hardware as MXFP4 and NVFP4.
+
+Whether four-bit *training* works is genuinely open. Four-bit inference is
+settled — [GPTQ](/entries/gptq) and its successors are in production — and the
+distinction is that inference quantises a finished weight once, against a
+calibration set, while training has to keep gradients meaningful through a format
+with six magnitudes in it.

@@ -1,0 +1,96 @@
+---
+name: 'LlamaIndex'
+desc: 'A retrieval framework: ingestion, chunking, indexing and query pipelines.'
+category: 'tooling'
+complexity: '—'
+path: 'tooling/orchestration'
+difficulty: 'introductory'
+described: '2022'
+status: 'common'
+statusNote: 'The RAG-focused counterpart to LangChain, and better at that job. Both have expanded into the other’s territory, so the distinction is one of emphasis rather than capability.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['tooling', 'orchestration', 'retrieval']
+lede: 'Retrieval-augmented generation is four decisions — how to chunk, how to embed, how to retrieve, how to assemble the prompt. This is a library that makes all four explicit and gives each a sensible default.'
+implNote:
+  label: 'in practice'
+  html: 'Chunk size is the parameter that decides whether a RAG system works. Too small and a chunk lacks the context to be understood; too large and the embedding averages several topics into a vector that matches nothing well.'
+related: [vector-databases, langchain, model-context-protocol, agent-frameworks, contamination-detection]
+refs:
+  - cite: 'LlamaIndex documentation'
+    id: 'docs.llamaindex.ai'
+    href: https://docs.llamaindex.ai
+  - cite: 'Lewis et al. — Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks (2020)'
+    id: 'arXiv:2005.11401'
+    href: https://arxiv.org/abs/2005.11401
+  - cite: 'Gao et al. — Retrieval-Augmented Generation for Large Language Models: A Survey (2023)'
+    id: 'arXiv:2312.10997'
+    href: https://arxiv.org/abs/2312.10997
+---
+
+A model does not know your documents, and fine-tuning on them is a poor way to
+teach it facts. The alternative is to retrieve the relevant passages at query
+time and put them in the prompt.
+
+LlamaIndex is a library for the pipeline that implies.
+
+<CodeFrame meta="python">
+
+```python
+from llama_index.core import VectorStoreIndex, SimpleDirectoryReader
+from llama_index.core.node_parser import SentenceSplitter
+
+docs = SimpleDirectoryReader("./corpus").load_data()
+
+index = VectorStoreIndex.from_documents(
+    docs,
+    transformations=[SentenceSplitter(chunk_size=512, chunk_overlap=64)],
+)
+
+engine = index.as_query_engine(similarity_top_k=5, response_mode="compact")
+print(engine.query("What did the 2024 report say about capacity?"))
+```
+
+</CodeFrame>
+
+### The four decisions
+
+**Chunking.** Splitting documents into retrievable units. The default recursive
+splitter respects paragraph and sentence boundaries; overlap keeps a sentence
+split across two chunks recoverable from either. This is the parameter that
+decides whether the system works, and 256–512 tokens with 10–20% overlap is the
+place to start.
+
+**Embedding.** Which model turns text into a vector. It must be the same at index
+time and query time — a mismatch produces results that are wrong rather than an
+error.
+
+**Retrieval.** Dense similarity, keyword BM25, or both. Hybrid retrieval beats
+either alone on most corpora, because embeddings are poor at exact identifiers
+and BM25 is poor at paraphrase.
+
+**Synthesis.** How the retrieved chunks become a prompt. `compact` packs as many
+as fit; `refine` iterates over them; `tree_summarize` reduces hierarchically for
+large sets.
+
+### What it is for
+
+- **Document question answering**, which is the case it is built around.
+- **Ingestion.** Loaders for PDFs, Notion, Slack, databases and the rest — the
+  unglamorous part of the work and most of it.
+- **Making the pipeline legible.** Each stage is swappable, which matters because
+  RAG quality is almost entirely a matter of tuning these stages.
+
+### What it is not for
+
+Agent orchestration with complex control flow — LangGraph and the
+[agent frameworks](/entries/agent-frameworks) are better shaped for that. And it
+is not a database: it wraps a [vector store](/entries/vector-databases) and does
+not replace one.
+
+<Note label="caveat">
+RAG evaluation is harder than RAG. A pipeline that returns plausible answers can
+be retrieving the wrong passages and having the model paper over it. Measure
+retrieval separately from generation — recall@k against known-relevant documents
+— or you are tuning the visible half of a two-stage system.
+</Note>

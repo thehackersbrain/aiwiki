@@ -1,0 +1,136 @@
+---
+name: 'Hybrid Recurrent-Attention'
+desc: 'A few attention layers among many recurrent ones, because the ratio beats either extreme.'
+category: 'architectures'
+complexity: 'O(n·d + n²·d/r)'
+path: 'architectures/recurrence'
+difficulty: 'intermediate'
+described: '2024'
+status: 'common'
+statusNote: 'How every shipped recurrent model is actually built. Jamba, Griffin, Zamba, Samba and Nemotron-H are all some ratio of the two; none is pure.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['recurrence', 'attention', 'long-context', 'inference']
+lede: 'Pure recurrence cannot recall an arbitrary distant token. Pure attention cannot decode in constant memory. One attention layer in six or eight recovers the recall and keeps most of the cache saving.'
+metrics:
+  caption: 'Reported ratios'
+  rows:
+    - { label: 'Jamba', value: '1 : 7' }
+    - { label: 'Samba / Griffin', value: '1 : 1 … 1 : 5' }
+    - { label: 'KV cache saved', value: '≈ 8×', accent: true }
+implNote:
+  label: 'in practice'
+  html: 'The attention layers are usually windowed rather than global. Local attention plus a global recurrence covers both ranges, and the KV cache is then bounded by the window rather than by the context.'
+related: [state-space-models, sliding-window-attention, state-space-duality, rwkv, attention-sinks, paged-attention]
+refs:
+  - cite: 'Lieber et al. — Jamba: A Hybrid Transformer-Mamba Language Model (2024)'
+    id: 'arXiv:2403.19887'
+    href: https://arxiv.org/abs/2403.19887
+  - cite: 'De et al. — Griffin: Mixing Gated Linear Recurrences with Local Attention (2024)'
+    id: 'arXiv:2402.19427'
+    href: https://arxiv.org/abs/2402.19427
+  - cite: 'Ren et al. — Samba: Simple Hybrid State Space Models for Efficient Unlimited Context (2024)'
+    id: 'arXiv:2406.07522'
+    href: https://arxiv.org/abs/2406.07522
+  - cite: 'Waleffe et al. — An Empirical Study of Mamba-based Language Models (2024)'
+    id: 'arXiv:2406.07887'
+    href: https://arxiv.org/abs/2406.07887
+---
+
+The comparison that settles the shelf is not recurrence against attention. It is
+that each fails at exactly what the other does well, and the failures are
+complementary enough that mixing them is not a compromise.
+
+**Recurrence** decodes in constant memory and cannot recall a specific distant
+token. Its state is a fixed-size summary; retrieving a phone number from forty
+thousand tokens back requires that the number survived the summarisation, and
+nothing guarantees it did.
+
+**Attention** recalls anything at all and pays a cache that grows with context —
+the thing that makes long-context serving expensive.
+
+<Note label="annotation">
+Waleffe et al. put a number on the recall gap by training matched 8B models. Pure
+Mamba trails on tasks requiring in-context retrieval, notably five-shot formats
+where the answer must be copied from the prompt, and a hybrid with about 8%
+attention layers closes the gap and then exceeds the pure transformer.
+</Note>
+
+### The ratio
+
+<Eq lead caption="eq. 1 — cache is proportional to the attention fraction">
+
+$$
+\text{cache} \;\propto\; \frac{L}{r} \cdot n \cdot d
+\qquad\text{for one attention layer in } r
+$$
+
+</Eq>
+
+At $r = 8$ the KV cache is an eighth of a transformer's, which is the difference
+between 256k context fitting on one device and not. And the quality curve is flat
+over a wide range of $r$ — everything between 1:4 and 1:8 performs about the
+same, so the ratio is chosen by the memory budget rather than by ablation.
+
+Jamba's 1:7 with MoE in the recurrent layers reaches 256k context on a single
+80GB device. Griffin interleaves gated linear recurrences with *local* attention,
+so even its attention layers have bounded cache, and matches Llama-2 quality at
+6B while training on six times fewer tokens.
+
+### Where the attention layers go
+
+Not evenly, in the designs that ablate it. The first block is attention in most
+of them, on the reasoning that the model needs unrestricted mixing before the
+recurrent state has anything worth summarising; the last block is usually
+recurrent. Beyond those two the placement within the middle appears not to matter
+much, which is consistent with what the
+[layer-ablation](/entries/logit-lens) literature finds generally.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+from torch import Tensor, nn
+
+
+class HybridStack(nn.Module):
+    """One attention layer in every `ratio`; the rest recurrent."""
+
+    def __init__(self, dim: int, layers: int, ratio: int = 8, window: int = 4096):
+        super().__init__()
+        self.blocks = nn.ModuleList(
+            # Attention first, then every ratio-th layer. The last stays recurrent.
+            SlidingWindowAttentionBlock(dim, window=window)
+            if i == 0 or (i % ratio == 0 and i != layers - 1)
+            else MambaBlock(dim)
+            for i in range(layers)
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        for block in self.blocks:
+            x = block(x)
+        return x
+```
+
+</CodeFrame>
+
+The serving consequence is that two kinds of state now have to be managed
+together: a KV cache that grows and is paged, and a recurrent state that is fixed
+per sequence. [Paged attention](/entries/paged-attention) handles the first and
+was not designed for the second, so hybrid inference stacks carry a second
+allocator — small, but a separate thing to get right, and the usual source of
+bugs when a sequence is pre-empted and resumed.
+
+<Rule label="What this says about the shelf" />
+
+Every entry here has been a route to the same destination: linear-time sequence
+mixing with a constant decode state. All of them arrive, and all of them arrive
+with the same limitation, because it is a property of fixed-size state rather
+than of any particular parameterisation.
+
+The honest summary of five years of work is that recurrence did not replace
+attention and was never going to. It replaced *most* of it, which is a smaller
+claim and a more useful one — the cache is where the money goes, and cutting it
+eightfold while keeping the recall is worth more than an architecture with a
+better story.

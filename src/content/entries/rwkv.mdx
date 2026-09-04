@@ -1,0 +1,142 @@
+---
+name: 'RWKV'
+desc: 'A transformer-shaped block whose token mixer is an exponentially decaying sum.'
+category: 'architectures'
+complexity: 'O(n·d)'
+memory: 'O(d)'
+path: 'architectures/recurrence'
+difficulty: 'intermediate'
+described: '2023'
+status: 'emerging'
+statusNote: 'Trained to 14B and beyond by a community rather than a lab, and genuinely competitive at that size. Untested where it matters most, which is at frontier scale.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['recurrence', 'sequence', 'inference']
+lede: 'Keep the transformer’s block structure and replace attention with a weighted sum whose weights decay with distance. It trains as a parallel formula and runs as a recurrence, because it is both.'
+metrics:
+  caption: 'Decode, 7B, per token'
+  rows:
+    - { label: 'Transformer state @ 8k', value: 'grows with n' }
+    - { label: 'RWKV state', value: 'constant' }
+    - { label: 'Time per token', value: 'O(1)', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'The recurrence is numerically delicate: it is a ratio of two exponentially growing sums. Every correct implementation carries a running maximum and subtracts it from both, which is the same log-sum-exp trick a softmax needs and for the same reason.'
+related: [linear-attention, state-space-models, lstm-and-gru, parallel-scan, state-space-duality, attention-sinks]
+refs:
+  - cite: 'Peng et al. — RWKV: Reinventing RNNs for the Transformer Era (2023)'
+    id: 'arXiv:2305.13048'
+    href: https://arxiv.org/abs/2305.13048
+  - cite: 'Peng et al. — Eagle and Finch: RWKV with Matrix-Valued States and Dynamic Recurrence (2024)'
+    id: 'arXiv:2404.05892'
+    href: https://arxiv.org/abs/2404.05892
+  - cite: 'Katharopoulos et al. — Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention (2020)'
+    id: 'arXiv:2006.16236'
+    href: https://arxiv.org/abs/2006.16236
+---
+
+Attention scores every pair. RWKV asks what happens if the score between two
+positions is a fixed function of their distance and the key alone — no
+query–key interaction at all.
+
+<Eq lead caption="eq. 1 — the WKV operator, attention’s shape with the query removed">
+
+$$
+\mathrm{wkv}_t = \frac{\sum_{i<t} e^{-(t-1-i)w + k_i} v_i \;+\; e^{u + k_t} v_t}
+{\sum_{i<t} e^{-(t-1-i)w + k_i} \;+\; e^{u + k_t}}
+$$
+
+</Eq>
+
+The numerator is a weighted sum of values; the denominator normalises it. The
+weight on position $i$ is $e^{k_i}$ — how much that token wants to be
+attended — multiplied by $e^{-(t-1-i)w}$, a per-channel exponential decay in
+distance. $u$ is a separate bonus for the current token, present because
+otherwise the decay would treat "now" as merely the nearest thing to the past.
+
+The receptance $r_t = \sigma(W_r x_t)$ then gates the output, which is the
+[LSTM](/entries/lstm-and-gru)'s output gate under a different name. R, W, K, V.
+
+### Why it is both parallel and recurrent
+
+Eq. 1 has no term coupling two positions through a learned matrix, so the sums
+telescope.
+
+<Eq caption="eq. 2 — the same quantity as a two-state recurrence">
+
+$$
+a_t = e^{-w} a_{t-1} + e^{k_t} v_t,
+\qquad
+b_t = e^{-w} b_{t-1} + e^{k_t},
+\qquad
+\mathrm{wkv}_t \approx \frac{a_t}{b_t}
+$$
+
+</Eq>
+
+Training uses the parallel form and a [scan](/entries/parallel-scan); generation
+uses the recurrence, with a state of two vectors per layer regardless of how many
+tokens have gone by. Not an approximation of one by the other — the same
+arithmetic, regrouped.
+
+<Note label="annotation">
+$a_t$ and $b_t$ both grow like $e^{k}$ accumulated over the sequence and overflow
+within a few hundred tokens in fp32. Implementations carry a running maximum
+alongside them and store shifted values, exactly as a stable softmax does. Read
+any RWKV kernel and most of it is this bookkeeping.
+</Note>
+
+### What it gives up
+
+The decay $w$ is learned per channel and, in the original formulation, fixed —
+independent of content. A transformer can decide that token 900 is exactly what
+token 4000 needs; RWKV can only decide that some channels forget slowly. Recall
+of a specific distant token is the measurable weakness, and it is the same
+weakness every fixed-decay model has.
+
+The Eagle and Finch revision addresses it directly: Finch makes $w$ depend on the
+input — a data-dependent decay, which is precisely
+[Mamba's selection](/entries/state-space-models) arriving by a different route —
+and moves the state from a vector to a matrix, giving the recurrence somewhere to
+put more than one thing at a time.
+
+That convergence is the interesting part. Mamba started from a continuous linear
+system and added input dependence; RWKV started from an RNN and added it; gated
+[linear attention](/entries/linear-attention) started from attention and added
+it. All three landed on the same structure, and
+[state space duality](/entries/state-space-duality) is the paper that says so
+explicitly.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch · the numerically stable recurrence">
+
+```python
+import torch
+from torch import Tensor
+
+
+def wkv_step(
+    state: tuple[Tensor, Tensor, Tensor], k: Tensor, v: Tensor, w: Tensor, u: Tensor
+):
+    """One decode step. state = (numerator, denominator, running max)."""
+    a, b, p = state
+
+    # Current token: bonus u instead of decay, and it is not yet in the state.
+    q = torch.maximum(p, u + k)
+    e1, e2 = torch.exp(p - q), torch.exp(u + k - q)
+    out = (e1 * a + e2 * v) / (e1 * b + e2)
+
+    # Now fold it in, decaying what was there.
+    q = torch.maximum(p - w, k)
+    e1, e2 = torch.exp(p - w - q), torch.exp(k - q)
+    return out, (e1 * a + e2 * v, e1 * b + e2, q)
+```
+
+</CodeFrame>
+
+Every exponent in that function is non-positive by construction — the running
+maximum is subtracted before any `exp`. Written the obvious way instead, matching
+eq. 1 term for term, the model produces `inf/inf` and then NaN somewhere around
+the two-hundredth token, and it does so only at long context, which makes it a
+bug that survives testing.

@@ -1,0 +1,137 @@
+---
+name: 'xPos'
+desc: 'Rotary embeddings with a per-dimension exponential decay, for stable extrapolation.'
+category: 'architectures'
+complexity: 'O(n·d)'
+path: 'architectures/position'
+difficulty: 'advanced'
+described: '2022'
+status: 'emerging'
+statusNote: 'Sound and largely unadopted in language models. Its real afterlife is RetNet and the linear-attention family, where the decay term is structural rather than optional.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['position', 'attention', 'long-context']
+lede: 'RoPE rotates; xPos rotates and shrinks. A distance-dependent scale factor on each dimension pair damps the high frequencies that make rotary attention unstable past its training length.'
+implNote:
+  label: 'caveat'
+  html: 'The decay is asymmetric between queries and keys — <code>ζ<sup>m</sup></code> on one and <code>ζ<sup>−n</sup></code> on the other — so that only the difference survives the dot product. Apply the same sign to both and the scheme silently becomes a position-dependent norm.'
+related: [rotary-position-embedding, rope-scaling, alibi, linear-attention, state-space-models]
+refs:
+  - cite: 'Sun et al. — A Length-Extrapolatable Transformer (2022)'
+    id: 'arXiv:2212.10554'
+    href: https://arxiv.org/abs/2212.10554
+  - cite: 'Sun et al. — Retentive Network: A Successor to Transformer for Large Language Models (2023)'
+    id: 'arXiv:2307.08621'
+    href: https://arxiv.org/abs/2307.08621
+  - cite: 'Press et al. — Train Short, Test Long: ALiBi (2021)'
+    id: 'arXiv:2108.12409'
+    href: https://arxiv.org/abs/2108.12409
+---
+
+Rotary attention fails at long distance in a specific way. The fast dimension
+pairs, having wrapped many times, contribute what is effectively noise to the
+score — and because the pairs are summed, that noise is added to whatever the
+slow pairs were saying. The signal is there; it is buried.
+
+[ALiBi](/entries/alibi) solves this by making distance monotonically costly. xPos
+solves it inside the rotation, by attenuating each pair according to how fast it
+turns.
+
+<Eq lead caption="eq. 1 — rotation, scaled">
+
+$$
+\tilde{q}_m = q_m\, R_{m}\, \zeta^{m}, \qquad
+\tilde{k}_n = k_n\, R_{n}\, \zeta^{-n}, \qquad
+\tilde{q}_m^\top \tilde{k}_n \propto \zeta^{\,m-n}\cos\bigl((m-n)\theta\bigr)
+$$
+
+</Eq>
+
+The scale cancels into $\zeta^{m-n}$ for the same reason the rotation cancels
+into $R_{m-n}$: opposite signs on query and key, so only the offset survives. What
+was a pure oscillation is now a damped one.
+
+<Note label="annotation">
+$\zeta_i$ is set per dimension pair, larger for the slow pairs and smaller for
+the fast ones, so the dimensions that carry long-range information decay slowly
+and the ones that carry local information die off quickly. Sun et al. use
+$\zeta_i = (i/(d/2) + \gamma)/(1 + \gamma)$ with $\gamma = 0.4$.
+</Note>
+
+### Attention resolution
+
+The paper's contribution is arguably the metric rather than the method. It defines
+*attention resolution* — how sharply a head can distinguish adjacent positions —
+and shows that both RoPE and ALiBi trade it away at long distance, differently.
+
+<Eq caption="eq. 2 — expected score, decomposed">
+
+$$
+\mathbb{E}\bigl[\tilde{q}_m^\top \tilde{k}_n\bigr]
+= \sum_{i} \zeta_i^{\,m-n} \cos\bigl((m-n)\theta_i\bigr) \cdot \mathbb{E}[q^{(i)}k^{(i)}]
+$$
+
+</Eq>
+
+With $\zeta = 1$ this is RoPE, and the cosines at high $\theta_i$ oscillate
+without bound as $|m-n|$ grows. With $\zeta < 1$ those terms vanish and the sum
+converges to the contribution of the slow pairs alone — which is exactly the
+relative-position signal one wants at distance.
+
+### Blockwise causal attention
+
+xPos ships with a second, more pragmatic piece. At inference the sequence is
+split into blocks of the training length; within a block, attention is normal;
+across blocks, each query attends to its own block and the one before it. Nothing
+ever sees an offset larger than the model was trained on.
+
+This is a [sliding window](/entries/sliding-window-attention) with the window
+snapped to a grid, and it is doing most of the practical extrapolation work in
+the paper's evaluation. The decay term is what makes the block boundary
+unobtrusive rather than a discontinuity.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor
+
+
+def xpos_scale(dim: int, gamma: float = 0.4) -> Tensor:
+    """ζ per dimension pair: near 1 for slow pairs, smaller for fast ones."""
+    i = torch.arange(0, dim, 2).float() / dim                 # [d/2] in [0, 1)
+    return (i + gamma) / (1.0 + gamma)
+
+
+def apply_xpos(
+    q: Tensor, k: Tensor, pos: Tensor, freqs: Tensor, zeta: Tensor
+) -> tuple[Tensor, Tensor]:
+    """q, k: [B, H, T, D]. Rotation as in RoPE, plus opposite-signed decay."""
+    angle = pos[:, None] * freqs[None, :]                     # [T, d/2]
+    cos, sin = angle.cos(), angle.sin()
+
+    # Opposite exponents: only ζ^(m-n) survives the dot product.
+    decay = zeta[None, :] ** pos[:, None]                     # [T, d/2]
+    q = rotate(q, cos, sin) * decay.repeat_interleave(2, -1)
+    k = rotate(k, cos, sin) / decay.repeat_interleave(2, -1)
+    return q, k
+```
+
+</CodeFrame>
+
+The division on the key side is the numerical hazard. $\zeta^{-n}$ grows without
+bound, and in fp16 it overflows a few thousand positions in. Production code
+subtracts a running offset from the exponent so that the decay is computed
+relative to the current block rather than the start of the sequence — which is
+the same reason the blockwise scheme exists.
+
+<Rule label="Where it went" />
+
+Language models did not adopt it; [RoPE scaling](/entries/rope-scaling) reached
+longer contexts on existing checkpoints, and xPos requires training from scratch.
+The idea resurfaced in RetNet, where the decay $\zeta^{m-n}$ is precisely what
+turns attention into a recurrence with a fixed-size state — the retention
+mechanism is xPos with the softmax removed, and there the decay is not a
+regulariser but the reason the recurrent form exists at all.

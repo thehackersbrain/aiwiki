@@ -1,0 +1,145 @@
+---
+name: 'Loss-Free Load Balancing'
+desc: 'Balance experts with a per-expert bias on the router, not with a gradient.'
+category: 'architectures'
+complexity: 'O(E)'
+path: 'architectures/sparse'
+difficulty: 'advanced'
+described: '2024'
+status: 'common'
+statusNote: 'Introduced for DeepSeek-V3 and adopted quickly. It removes a term that was known to be in tension with the language-modelling objective, which is a rare kind of improvement.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['sparse', 'training']
+lede: 'The auxiliary loss balances experts by making the model worse at predicting text. Replace it with a bias that is nudged up or down by a control loop and the objective is left alone.'
+metrics:
+  caption: 'DeepSeek-V3'
+  rows:
+    - { label: 'Aux-loss weight', value: '0' }
+    - { label: 'Bias update rate γ', value: '0.001' }
+    - { label: 'Gradient contribution', value: 'none', accent: true }
+implNote:
+  html: 'The bias enters selection and not weighting. It decides <em>which</em> experts are chosen; the combination weights come from the unbiased scores, so a nudged expert does not get a louder vote.'
+  label: 'caveat'
+related: [mixture-of-experts-routing, expert-capacity-and-token-dropping, shared-and-fine-grained-experts, expert-choice-routing, expert-parallelism]
+refs:
+  - cite: 'Wang et al. — Auxiliary-Loss-Free Load Balancing Strategy for Mixture-of-Experts (2024)'
+    id: 'arXiv:2408.15664'
+    href: https://arxiv.org/abs/2408.15664
+  - cite: 'DeepSeek-AI — DeepSeek-V3 Technical Report (2024)'
+    id: 'arXiv:2412.19437'
+    href: https://arxiv.org/abs/2412.19437
+  - cite: 'Fedus et al. — Switch Transformers (2021)'
+    id: 'arXiv:2101.03961'
+    href: https://arxiv.org/abs/2101.03961
+---
+
+The [auxiliary balancing loss](/entries/expert-capacity-and-token-dropping) works
+by adding a term to the objective that is minimised when routing is uniform. It
+therefore competes with the language-modelling term, and the coefficient $\alpha$
+sets the exchange rate between "balanced" and "correct".
+
+There is no good value. Small $\alpha$ lets the router collapse; large $\alpha$
+pushes it towards uniform routing, which is routing that carries no information.
+The whole apparatus is a workaround for a constraint that is not really part of
+the learning problem — balance is an engineering requirement about buffers and
+devices, and it has been smuggled into the loss.
+
+### A bias instead of a gradient
+
+Give each expert a scalar $b_i$, added to its score for the purposes of
+*selection only*, and update it outside the optimiser.
+
+<Eq lead caption="eq. 1 — the bias picks; the raw score weights">
+
+$$
+\mathrm{top}_k\bigl(s_i + b_i\bigr)
+\qquad\text{selected, then combined with}\qquad
+g_i = \frac{s_i}{\sum_{j \in \mathrm{top}_k} s_j}
+$$
+
+</Eq>
+
+<Eq caption="eq. 2 — a proportional controller, one step per batch">
+
+$$
+b_i \leftarrow b_i + \gamma \cdot \mathrm{sign}\bigl(\bar{c} - c_i\bigr)
+$$
+
+</Eq>
+
+where $c_i$ is the number of tokens expert $i$ received and $\bar{c}$ the mean.
+Overloaded experts get their bias lowered, starved ones get it raised, and the
+system settles. It is a control loop, not an optimisation: $b$ receives no
+gradient and appears nowhere in the backward pass.
+
+<Note label="annotation">
+The separation in eq. 1 is what makes this sound. If the bias also scaled the
+expert's contribution, the controller would be reaching into the forward
+computation and changing the function the model computes. Restricted to
+selection, it only changes <em>which</em> expert handles a token — which is
+precisely the degree of freedom the balancing constraint is entitled to.
+</Note>
+
+### Why sign rather than magnitude
+
+The update uses $\mathrm{sign}$, not the imbalance itself. That makes every step
+the same size, which sounds crude and is deliberate: an expert that is briefly
+overloaded because of an unusual batch gets the same small nudge as one that is
+persistently overloaded, so the controller responds to sustained imbalance and
+ignores noise. A proportional update on the raw counts oscillates.
+
+$\gamma = 0.001$ against per-expert scores of order 1 means the bias takes
+hundreds of steps to move appreciably — slow relative to the router, which is the
+correct relationship between a controller and the thing it controls.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor, nn
+
+
+class LossFreeRouter(nn.Module):
+    def __init__(self, dim: int, n_experts: int, k: int, gamma: float = 1e-3):
+        super().__init__()
+        self.gate = nn.Linear(dim, n_experts, bias=False)
+        # A buffer, not a parameter: it must not reach the optimiser.
+        self.register_buffer("bias", torch.zeros(n_experts))
+        self.k, self.gamma = k, gamma
+
+    def forward(self, x: Tensor) -> tuple[Tensor, Tensor]:    # [T, D]
+        scores = self.gate(x).sigmoid()                       # [T, E]
+
+        idx = (scores + self.bias).topk(self.k, dim=-1).indices
+        weight = scores.gather(-1, idx)
+        weight = weight / weight.sum(-1, keepdim=True)        # unbiased weights
+
+        if self.training:
+            self._rebalance(idx, scores.size(-1))
+        return idx, weight
+
+    @torch.no_grad()
+    def _rebalance(self, idx: Tensor, n_experts: int) -> None:
+        load = torch.bincount(idx.flatten(), minlength=n_experts).float()
+        # sign, not magnitude: respond to sustained imbalance, ignore noise.
+        self.bias += self.gamma * torch.sign(load.mean() - load)
+```
+
+</CodeFrame>
+
+Two things about that buffer. It must be excluded from weight decay, which would
+otherwise pull it towards zero and fight the controller. And under data
+parallelism the load counts must be all-reduced before the update, or each rank
+maintains a different bias and the ranks diverge — a bug that shows up as
+balanced routing on each device and unbalanced routing globally.
+
+<Rule label="The remaining caveat" />
+
+The controller balances over whatever window it sees. DeepSeek-V3 pairs it with a
+small sequence-level auxiliary loss anyway, at a weight low enough not to matter
+for the objective, because a batch can be globally balanced while every
+individual sequence routes to one expert — and a long generation that hammers a
+single expert is a latency problem even when the training statistics look fine.

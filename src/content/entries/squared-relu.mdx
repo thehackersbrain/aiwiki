@@ -1,0 +1,144 @@
+---
+name: 'Squared ReLU'
+desc: 'ReLU, then square: cheaper than a gate and far sparser than either.'
+category: 'architectures'
+complexity: 'O(n·d)'
+path: 'architectures/ffn'
+difficulty: 'intermediate'
+described: '2021'
+status: 'emerging'
+statusNote: 'Found by architecture search, ignored for three years, and now the activation of choice for people who want activation sparsity they can exploit at inference.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['ffn', 'inference']
+lede: 'Two matrices and one elementwise square match the gated block that needs three. The interesting property is not the quality — it is that ninety-odd percent of the outputs are exactly zero.'
+metrics:
+  caption: 'Activation sparsity, decoder FFN'
+  rows:
+    - { label: 'GELU / SiLU', value: '≈ 0% exact zeros' }
+    - { label: 'ReLU', value: '≈ 90%' }
+    - { label: 'ReLU²', value: '> 95%', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'The gradient is 2·max(x,0), which is unbounded above — unlike every gated activation, whose derivative saturates. Large activations therefore produce large gradients, and the block wants gradient clipping in a way SwiGLU does not.'
+related: [gelu, swiglu, activation-sparsity, feed-forward-networks, feed-forward-as-key-value-memory]
+refs:
+  - cite: 'So et al. — Primer: Searching for Efficient Transformers for Language Modeling (2021)'
+    id: 'arXiv:2109.08668'
+    href: https://arxiv.org/abs/2109.08668
+  - cite: 'Mirzadeh et al. — ReLU Strikes Back: Exploiting Activation Sparsity in LLMs (2023)'
+    id: 'arXiv:2310.04564'
+    href: https://arxiv.org/abs/2310.04564
+  - cite: 'Zhang et al. — ReLU²Wins: Discovering Efficient Activation Functions for Sparse LLMs (2024)'
+    id: 'arXiv:2402.03804'
+    href: https://arxiv.org/abs/2402.03804
+---
+
+Primer was an architecture search over transformer variants, and it returned two
+modifications worth keeping. One was a depthwise convolution on the attention
+projections. The other was this:
+
+<Eq lead caption="eq. 1 — that is the whole function">
+
+$$
+\mathrm{ReLU}^2(x) = \max(0, x)^2
+$$
+
+</Eq>
+
+Squaring after the threshold. It sounds like nothing, and it produces a
+feed-forward block that trains as well as [SwiGLU](/entries/swiglu) using two
+matrices where SwiGLU needs three.
+
+### Why squaring helps
+
+A gate multiplies two learned projections of the same input, which makes the
+block quadratic in $x$ — that is the substance of what gating buys, and the
+reason gated blocks beat ungated ones. $\max(0,x)^2$ is also quadratic in $x$,
+and gets there without a second matrix.
+
+The comparison is not exactly like for like: the gate's two projections are
+independent, so it can express $\,(Ax)(Bx)$ for different $A$ and $B$, whereas
+squaring only gives $(Ax)^2$. Empirically that extra freedom is worth very
+little, which is consistent with the broader finding that the activation matters
+less than whether the block is quadratic at all.
+
+<Note label="annotation">
+Sharpness is the other half. Squaring compresses small activations towards zero
+and stretches large ones apart, so the block's output is dominated by fewer
+units. That is a downside for gradient flow and an upside for everything
+downstream that would like to skip the zeros.
+</Note>
+
+### The sparsity, which is the actual reason to care
+
+Every ReLU-family activation produces exact zeros. GELU and SiLU do not — they
+produce values near zero, which is not the same thing at all, because a matmul
+cannot skip a small number, only an absent one.
+
+Mirzadeh et al. measured this across models and found ReLU FFNs running at around
+90% exact zeros with no quality cost, and ReLU² higher still. That number is
+directly exploitable: the down-projection $W_2$ only needs the rows corresponding
+to nonzero activations, so the memory traffic of the largest matrix in the block
+falls by an order of magnitude.
+
+<Eq caption="eq. 2 — only the live rows are read">
+
+$$
+y = \sum_{i \,:\, h_i \neq 0} h_i\, W_2^{(:,i)}
+$$
+
+</Eq>
+
+For decode-time inference, which is bandwidth-bound rather than compute-bound,
+that is the whole game — see [activation
+sparsity](/entries/activation-sparsity) for what it takes to actually collect it.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+
+
+class SquaredReLUFFN(nn.Module):
+    """Two matrices at 4× width, against SwiGLU's three at 8/3×."""
+
+    def __init__(self, dim: int, hidden: int | None = None):
+        super().__init__()
+        hidden = hidden or 4 * dim
+        self.up = nn.Linear(dim, hidden, bias=False)
+        self.down = nn.Linear(hidden, dim, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = F.relu(self.up(x))
+        return self.down(h * h)          # square after the threshold, not before
+
+
+def sparsity(h: Tensor) -> float:
+    """Fraction of exact zeros — the number worth logging during training."""
+    return (h == 0).float().mean().item()
+```
+
+</CodeFrame>
+
+`h * h` rather than `h.pow(2)` is not superstition: `pow` with a general exponent
+dispatches to a slower kernel, and at this tensor's size the block is bandwidth-
+bound anyway, so the difference shows up.
+
+<Rule label="Why it is not the default" />
+
+Two reasons, and only one of them is technical.
+
+The unbounded gradient is real. A gated activation's derivative saturates;
+$2\max(x,0)$ does not, so a large activation early in training produces a
+proportionally large gradient, and runs that would have survived with SwiGLU can
+diverge. Clipping fixes it and is one more thing to tune.
+
+The other reason is that SwiGLU arrived first, Llama used it, and everything
+downstream copied Llama. Primer's result predates that and was largely
+overlooked; the current interest comes from the inference side rather than from
+anyone rereading the search results.

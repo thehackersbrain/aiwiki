@@ -1,0 +1,100 @@
+---
+name: 'Proximal Policy Optimisation'
+desc: 'Clipped surrogate advantage objective with KL control to a reference.'
+category: 'training'
+complexity: 'O(T·d)'
+path: 'training/objectives'
+difficulty: 'advanced'
+described: '2017'
+status: 'common'
+statusNote: 'Still used where an explicit reward model and online sampling earn their cost — reasoning training especially — and no longer the obvious first choice.'
+revised: 2026-08-18
+added: 2026-01-14
+tags: ['RL', 'alignment']
+lede: 'Maximise an importance-weighted advantage, but clip the ratio so a single update cannot move the policy arbitrarily far.'
+implNote:
+  label: 'caveat'
+  html: 'The clip stops the objective rewarding further movement. It does not stop a large step on the first minibatch of an epoch — an explicit KL early-stop is the load-bearing safeguard.'
+related: [reward-modelling, kl-regularisation, direct-preference-optimisation, grpo, supervised-fine-tuning]
+refs:
+  - cite: 'Schulman et al. — Proximal Policy Optimization Algorithms (2017)'
+    id: 'arXiv:1707.06347'
+    href: https://arxiv.org/abs/1707.06347
+  - cite: 'Schulman et al. — High-Dimensional Continuous Control Using GAE (2015)'
+    id: 'arXiv:1506.02438'
+    href: https://arxiv.org/abs/1506.02438
+  - cite: 'Ouyang et al. — Training Language Models to Follow Instructions (2022)'
+    id: 'arXiv:2203.02155'
+    href: https://arxiv.org/abs/2203.02155
+---
+
+The policy-gradient surrogate is unbiased only near the sampling policy. PPO
+enforces that locality bluntly: it takes the minimum of the unclipped and clipped
+objectives, which removes the incentive to push the probability ratio outside
+$[1-\epsilon,\, 1+\epsilon]$.
+
+<Eq caption="eq. 1 — ε typically 0.2" lead>
+
+$$
+L^{\text{CLIP}} = \E \min\bigl( r_t \hat{A}_t,\;
+\clip(r_t, 1-\epsilon, 1+\epsilon)\, \hat{A}_t \bigr),
+\qquad r_t = \frac{\pi(a_t \mid s_t)}{\pi_{\text{old}}(a_t \mid s_t)}
+$$
+
+</Eq>
+
+<Note label="caveat">
+One scalar for a whole sequence is an extremely sparse signal. Much of what makes
+RLHF work is the KL term, not the reward.
+</Note>
+
+In the RLHF setting the reward is a single scalar at the end of the sequence,
+shaped by a per-token KL penalty against the reference policy. Advantages come
+from GAE over that shaped reward.
+
+<Eq caption="eq. 2">
+
+$$
+r_t^{\text{shaped}} = \mathbb{1}[t = T] \cdot R(x, y)
+- \beta \bigl( \log \pi(a_t \mid s_t) - \log \pi_{\text{ref}}(a_t \mid s_t) \bigr)
+$$
+
+</Eq>
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor
+
+
+def ppo_clip_loss(
+    logp: Tensor, logp_old: Tensor, adv: Tensor,
+    eps: float = 0.2,
+) -> Tensor:
+    ratio = (logp - logp_old).exp()
+    unclipped = ratio * adv
+    clipped = ratio.clamp(1 - eps, 1 + eps) * adv
+    return -torch.min(unclipped, clipped).mean()
+
+
+def gae(rewards: Tensor, values: Tensor, gamma=1.0, lam=0.95) -> Tensor:
+    """rewards, values: [T]. Returns advantages [T]."""
+    adv = torch.zeros_like(rewards)
+    running = 0.0
+    for t in reversed(range(len(rewards))):
+        next_v = values[t + 1] if t + 1 < len(values) else 0.0
+        delta = rewards[t] + gamma * next_v - values[t]
+        running = delta + gamma * lam * running
+        adv[t] = running
+    return adv
+```
+
+</CodeFrame>
+
+Normalise advantages over the batch, not over the sequence — per-sequence
+normalisation destroys the relative ranking between samples that the update
+depends on. Compute the ratio in log space as shown; exponentiating two
+probabilities and dividing loses precision exactly where the ratio matters.

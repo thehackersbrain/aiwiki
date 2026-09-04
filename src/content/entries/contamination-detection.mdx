@@ -1,0 +1,57 @@
+---
+name: 'Contamination Detection'
+desc: 'n-gram and canary overlap tests between benchmark and pretraining data.'
+category: 'evaluation'
+complexity: 'O(N)'
+path: 'evaluation/data'
+difficulty: 'intermediate'
+described: '2020'
+status: 'common'
+revised: 2026-07-21
+added: 2026-03-04
+tags: ['metric', 'data']
+lede: 'Assume the benchmark is in the training set until shown otherwise. The question is not whether contamination happened but how much of the score it explains.'
+related: [perplexity, membership-inference, elo-bradley-terry-scoring]
+refs:
+  - cite: 'Brown et al. — Language Models are Few-Shot Learners, §4 (2020)'
+    id: 'arXiv:2005.14165'
+    href: https://arxiv.org/abs/2005.14165
+  - cite: 'Oren et al. — Proving Test Set Contamination in Black Box Language Models (2023)'
+    id: 'arXiv:2310.17623'
+    href: https://arxiv.org/abs/2310.17623
+  - cite: 'Zhang et al. — A Careful Examination of Large Language Model Performance on Grade School Arithmetic (2024)'
+    id: 'arXiv:2405.00332'
+    href: https://arxiv.org/abs/2405.00332
+---
+
+With corpus access, contamination is a string-matching problem: mark a test example
+dirty if a sufficiently long $n$-gram of it appears in training. Thirteen tokens is
+the common threshold, chosen so that natural collisions are rare in English but
+paraphrase is not caught.
+
+<Note label="aside">
+An elegant test: it needs no access to the training data, only the assumption that
+a clean model cannot tell one ordering from another.
+</Note>
+
+Without corpus access — the normal case — the tests are behavioural. The cleanest
+is an exchangeability test: under no contamination, a model's log-likelihood should
+be invariant to the order of a benchmark's multiple-choice options or of its
+examples. A significant preference for the canonical ordering is evidence of
+memorisation, since only a memorised copy carries the ordering.
+
+<Eq caption="eq. 1 — permutation test over orderings" source="Oren et al. §3" lead>
+
+$$
+H_0: \;\; \log p(\text{canonical}) \;\overset{d}{=}\; \log p(\text{shuffled})
+$$
+
+</Eq>
+
+Canaries are the prospective fix: publish a benchmark with an embedded random
+string and a request to exclude it, then later ask the model to complete the
+string. This detects only honest contamination, which is nevertheless most of it.
+
+> The strongest available evidence is usually a held-out replication: build a fresh
+> test set by the same procedure and compare. A model that drops several points on
+> the replication was reading, not reasoning.

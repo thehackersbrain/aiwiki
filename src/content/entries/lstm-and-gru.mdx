@@ -1,0 +1,162 @@
+---
+name: 'LSTM and GRU'
+desc: 'Gates and an additive cell path, so the gradient has somewhere to travel.'
+category: 'architectures'
+complexity: 'O(n·d²)'
+memory: 'O(d)'
+path: 'architectures/recurrence'
+difficulty: 'introductory'
+described: '1997'
+status: 'superseded'
+statusNote: 'Twenty years of sequence modelling, ended by attention in about two. Still correct for small on-device models, and the gating idea outlived the architecture entirely.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['recurrence', 'sequence', 'core']
+lede: 'Give the state a path through the network that is addition rather than multiplication, and put learned gates on what enters and leaves it. The gradient stops vanishing; the loop stays sequential.'
+metrics:
+  caption: 'Per step, hidden size d'
+  rows:
+    - { label: 'LSTM gates', value: '4' }
+    - { label: 'GRU gates', value: '3' }
+    - { label: 'Parallel over t', value: 'no', accent: true }
+implNote:
+  label: 'in practice'
+  html: 'Initialise the forget-gate bias to 1 or 2. At zero the gate opens halfway, the cell halves at every step, and the model spends its first epochs learning to remember anything at all.'
+related: [recurrent-neural-networks, state-space-models, swiglu, rwkv, parallel-scan]
+refs:
+  - cite: 'Hochreiter & Schmidhuber — Long Short-Term Memory (1997)'
+    id: 'Neural Computation 9(8)'
+    href: https://direct.mit.edu/neco/article/9/8/1735/6109
+  - cite: 'Cho et al. — Learning Phrase Representations using RNN Encoder-Decoder (2014)'
+    id: 'arXiv:1406.1078'
+    href: https://arxiv.org/abs/1406.1078
+  - cite: 'Greff et al. — LSTM: A Search Space Odyssey (2015)'
+    id: 'arXiv:1503.04069'
+    href: https://arxiv.org/abs/1503.04069
+---
+
+The [vanishing gradient](/entries/recurrent-neural-networks) is a product of
+Jacobians. The LSTM's answer is to add a path along which that Jacobian is
+approximately the identity.
+
+<Eq lead caption="eq. 1 — the cell state is added to, not transformed">
+
+$$
+c_t = f_t \odot c_{t-1} + i_t \odot \tilde{c}_t
+$$
+
+</Eq>
+
+No matrix multiplies $c_{t-1}$. It is scaled elementwise by a gate and something
+is added. If $f_t \approx 1$ the derivative $\partial c_t / \partial c_{t-1}$ is
+approximately 1, and the gradient traverses a hundred steps undiminished — the
+*constant error carousel*, in the original paper's phrase.
+
+<Eq caption="eq. 2 — the full cell">
+
+$$
+\begin{aligned}
+f_t &= \sigma(W_f [h_{t-1}, x_t]) &\quad \text{forget: keep how much of } c_{t-1} \\
+i_t &= \sigma(W_i [h_{t-1}, x_t]) &\quad \text{input: admit how much of } \tilde{c}_t \\
+o_t &= \sigma(W_o [h_{t-1}, x_t]) &\quad \text{output: expose how much of } c_t \\
+\tilde{c}_t &= \tanh(W_c [h_{t-1}, x_t]) &\quad \text{candidate} \\
+h_t &= o_t \odot \tanh(c_t)
+\end{aligned}
+$$
+
+</Eq>
+
+Two states, not one. $c$ is the memory and is only ever gated and added to; $h$ is
+the exposed view of it and is what the next layer and the next step see. Keeping
+them separate is what allows the model to hold something without acting on it.
+
+<Note label="annotation">
+The forget gate is not in the 1997 paper — Gers et al. added it in 2000, and the
+original LSTM could not clear its memory at all. It is now the component that
+matters most: ablation studies remove each gate in turn and removing the forget
+gate is by a wide margin the most damaging.
+</Note>
+
+### GRU
+
+Cho et al.'s simplification merges the cell and hidden states, and ties the input
+and forget gates so that what is admitted is exactly what is displaced.
+
+<Eq caption="eq. 3 — one state, one convex combination">
+
+$$
+h_t = (1 - z_t) \odot h_{t-1} + z_t \odot \tilde{h}_t
+$$
+
+</Eq>
+
+Three gates instead of four, about 25% fewer parameters, and — across every
+careful comparison, including Greff et al.'s eight-variant study — no consistent
+difference in quality. Which variant to use is a matter of what the framework
+defaults to.
+
+### What actually killed it
+
+Not quality. LSTMs were state of the art in translation until 2017 and their
+long-range behaviour is respectable.
+
+They were killed by eq. 1's shape. $h_t$ depends on $h_{t-1}$, so training
+cannot parallelise over the sequence — a length-1024 sequence is 1024 dependent
+kernel launches. Attention computes all positions at once, and on hardware that
+rewards parallelism above all else, the quadratic cost was worth paying.
+
+<Note label="caveat">
+Which is worth stating precisely, because it bears on everything else on this
+shelf: attention did not win by being a better model of sequences. It won by
+being a better fit for the machine. Every linear-recurrence design since —
+<a href="/entries/state-space-models">SSMs</a>, <a href="/entries/rwkv">RWKV</a>,
+gated linear attention — is an attempt to recover the RNN's inference properties
+without giving back the parallel training that attention supplied.
+</Note>
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor, nn
+
+
+class LSTMCell(nn.Module):
+    def __init__(self, dim: int, hidden: int):
+        super().__init__()
+        # One matmul for all four gates, then split — four small matmuls
+        # would be four kernel launches per step, and there are T of those.
+        self.w = nn.Linear(dim + hidden, 4 * hidden)
+        self.hidden = hidden
+
+        # Forget-gate bias to 1: start out remembering, learn to forget.
+        with torch.no_grad():
+            self.w.bias[hidden : 2 * hidden].fill_(1.0)
+
+    def forward(self, x: Tensor, state: tuple[Tensor, Tensor]) -> tuple[Tensor, Tensor]:
+        h, c = state
+        i, f, g, o = self.w(torch.cat([x, h], dim=-1)).chunk(4, dim=-1)
+
+        c = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)
+        h = torch.sigmoid(o) * torch.tanh(c)
+        return h, c
+```
+
+</CodeFrame>
+
+The fused gate projection is the standard optimisation and it is why cuDNN's
+LSTM is several times faster than a hand-written loop: it fuses across gates,
+across layers, and across the batch, leaving only the unavoidable dependency
+along $t$.
+
+<Rule label="What survived" />
+
+The architecture is gone; the gate is everywhere. [SwiGLU](/entries/swiglu) is a
+multiplicative gate on a feed-forward block. Mamba's
+[selection mechanism](/entries/state-space-models) is an input-dependent forget
+gate under another name. [RWKV](/entries/rwkv) writes its decay as exactly that.
+The 1997 insight — that a network should learn what to keep rather than being
+forced to transform everything — outlived the recurrence it was invented to
+rescue.

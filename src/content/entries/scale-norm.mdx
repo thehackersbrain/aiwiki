@@ -1,0 +1,124 @@
+---
+name: 'ScaleNorm'
+desc: 'Project onto a learned-radius sphere: one scalar for the whole layer.'
+category: 'architectures'
+complexity: 'O(n·d)'
+path: 'architectures/normalisation'
+difficulty: 'intermediate'
+described: '2019'
+status: 'superseded'
+statusNote: 'Reached the same conclusion as RMSNorm a few months earlier and lost on the detail — a single scalar is one step too far, and the per-channel gain is what the field kept.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['normalisation']
+lede: 'If the re-centring can go, how much else can? ScaleNorm keeps only the direction of the activation and a single learned radius, replacing d gain parameters with one.'
+metrics:
+  caption: 'Parameters per norm layer, d = 4096'
+  rows:
+    - { label: 'LayerNorm', value: '8 192' }
+    - { label: 'RMSNorm', value: '4 096' }
+    - { label: 'ScaleNorm', value: '1', accent: true }
+implNote:
+  label: 'annotation'
+  html: 'Nguyen &amp; Salazar initialise g to √d, which makes the layer approximately norm-preserving at the start — the expected ℓ₂ norm of a unit-variance vector in d dimensions is exactly that.'
+related: [rmsnorm, layer-normalisation, pre-norm-and-post-norm, dynamic-tanh]
+refs:
+  - cite: 'Nguyen & Salazar — Transformers without Tears: Improving the Normalization of Self-Attention (2019)'
+    id: 'arXiv:1910.05895'
+    href: https://arxiv.org/abs/1910.05895
+  - cite: 'Zhang & Sennrich — Root Mean Square Layer Normalization (2019)'
+    id: 'arXiv:1910.07467'
+    href: https://arxiv.org/abs/1910.07467
+  - cite: 'Xiong et al. — On Layer Normalization in the Transformer Architecture (2020)'
+    id: 'arXiv:2002.04745'
+    href: https://arxiv.org/abs/2002.04745
+---
+
+Three papers in 2019 asked the same question — how much of LayerNorm is load
+bearing — and gave three answers of increasing severity. [RMSNorm](/entries/rmsnorm)
+dropped the mean and kept $d$ gains. ScaleNorm dropped the mean and kept one.
+
+<Eq lead caption="eq. 1 — direction preserved, magnitude learned">
+
+$$
+\mathrm{ScaleNorm}(x) = g\,\frac{x}{\|x\|_2}, \qquad g \in \mathbb{R}
+$$
+
+</Eq>
+
+Every activation vector is projected onto a sphere of learned radius $g$. The
+representation is now pure direction, and the only thing the layer can adjust is
+how big the sphere is.
+
+Set against RMSNorm the difference is one of arithmetic rather than kind:
+$\|x\|_2 = \sqrt{d}\cdot\mathrm{RMS}(x)$, so the two normalisers differ by a
+constant. What actually differs is the gain — a vector in one, a scalar in the
+other.
+
+<Note label="annotation">
+That is the whole experiment, and it has a clean interpretation. A per-channel
+gain lets the layer decide that dimension 1174 should be loud and 302 quiet; a
+scalar cannot. The question is whether that per-channel freedom does anything,
+and the answer turned out to be yes.
+</Note>
+
+### What the paper found, and what happened after
+
+Nguyen & Salazar were working on low-resource translation, where they combined
+ScaleNorm with pre-norm placement and warmup-free training, and reported gains
+over post-norm LayerNorm baselines — plus a useful observation that the learned
+$g$ ends up roughly constant across depth, which is a reason to think the
+per-channel gains were not doing much.
+
+They also introduced FixNorm — the same $\ell_2$ projection applied to the word
+embeddings — which is the part of the paper that quietly survived: normalised
+embeddings with a learned temperature are now standard in retrieval and
+contrastive setups.
+
+ScaleNorm itself did not survive. At the scale it was tested — translation
+models of tens of millions of parameters — the single scalar was sufficient. At
+the scale the field moved to, it was not: the per-channel gain absorbs
+systematic differences in how much each residual-stream direction is used, and
+those differences grow with width. RMSNorm is in every current model and
+ScaleNorm is in none.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import math
+
+import torch
+from torch import Tensor, nn
+
+
+class ScaleNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-5):
+        super().__init__()
+        # √d: the expected ℓ₂ norm of a unit-variance vector in d dimensions,
+        # so the layer starts out approximately norm-preserving.
+        self.g = nn.Parameter(torch.tensor(math.sqrt(dim)))
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        dtype = x.dtype
+        n = x.float().norm(dim=-1, keepdim=True).clamp(min=self.eps)
+        return (x.float() / n * self.g).to(dtype)
+```
+
+</CodeFrame>
+
+`clamp` rather than the usual additive epsilon: the denominator here is a norm
+rather than a variance, so it is already on the scale of the activations, and
+adding $10^{-5}$ to a quantity of order 60 does nothing at all. The failure this
+guards against is a genuinely zero vector, which happens more often than expected
+after a ReLU-family activation.
+
+<Rule label="Why it is worth keeping on the shelf" />
+
+Read together, ScaleNorm and [DyT](/entries/dynamic-tanh) bracket the question
+from both sides across six years. Both remove machinery from the normalisation
+layer and report that the model does not mind; one of them was right about the
+scale it tested and wrong about the scale that came next. That is the specific
+risk to hold in mind when reading the second.

@@ -1,0 +1,148 @@
+---
+title: 'Splitting the work'
+desc: 'Data parallelism is one collective, and the reason it scales when nothing else does.'
+lede: 'Every rank holds the model, sees different data, and one all-reduce keeps them identical. The interesting part is why the cost of that collective does not grow with the number of ranks.'
+series: 'making-it-fit'
+part: 3
+minutes: 9
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['memory', 'training', 'distributed']
+related: [data-parallelism, collective-communication, zero-sharding, gradient-accumulation, learning-rate-schedules]
+refs:
+  - cite: 'Goyal et al. — Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour (2017)'
+    id: 'arXiv:1706.02677'
+    href: https://arxiv.org/abs/1706.02677
+  - cite: 'Patarasuk & Yuan — Bandwidth Optimal All-reduce Algorithms for Clusters of Workstations (2009)'
+    id: 'JPDC 69(2)'
+    href: https://www.sciencedirect.com/science/article/pii/S0743731508001767
+  - cite: 'Rajbhandari et al. — ZeRO: Memory Optimizations Toward Training Trillion Parameter Models (2019)'
+    id: 'arXiv:1910.02054'
+    href: https://arxiv.org/abs/1910.02054
+---
+
+Parts 1 and 2 were about one device. This part adds more of them in the simplest
+way available.
+
+### The identity
+
+The gradient of a sum is the sum of gradients. So the batch can be split, each
+device can compute on its slice, and the results added.
+
+<Eq lead caption="eq. 1 — one collective per step">
+
+$$
+g = \frac{1}{N}\sum_{i=1}^{N} g_i
+$$
+
+</Eq>
+
+Every rank starts identical, computes its own gradient, all-reduces, and steps.
+Because they all apply the same averaged gradient to the same weights, they stay
+identical — and nothing else needs synchronising. One tensor, once per step.
+
+This is [gradient accumulation](/entries/gradient-accumulation) with the
+micro-batches running concurrently instead of sequentially, which is a nice way
+to see that they are the same idea against different resources: accumulation
+spends time to save memory, data parallelism spends devices.
+
+### Why the collective does not get worse
+
+The thing I did not understand for an embarrassingly long time is why this
+scales. Surely averaging across a thousand ranks costs a thousand times as much
+as across two?
+
+It does not, and the ring algorithm is why. Arrange the ranks in a circle, split
+the gradient into $N$ chunks. Each rank sends one chunk to its neighbour and adds
+what it receives; after $N-1$ steps every rank holds the complete sum for exactly
+one chunk. Then circulate those around, another $N-1$ steps.
+
+<Eq caption="eq. 2 — bytes per rank, and the limit as N grows">
+
+$$
+2\,\frac{N-1}{N}\cdot S \;\longrightarrow\; 2S
+$$
+
+</Eq>
+
+Twice the gradient size per rank, approaching a constant. The *latency* term
+grows with $N$ — $2(N-1)$ hops — which is why small tensors are the problem and
+why frameworks bucket hundreds of parameter tensors into a few large messages.
+
+That flat bandwidth cost is the reason data parallelism is the outermost layer of
+every distributed configuration. It is the only strategy whose communication does
+not degrade with scale.
+
+<Note label="annotation">
+There is a second identity worth carrying: all-reduce = reduce-scatter +
+all-gather. It looks like an implementation detail and it is the hinge of the
+next section — if a rank only needs <em>its shard</em> of the summed gradient,
+the second half can be skipped.
+</Note>
+
+### The waste
+
+Every rank holds a full copy of the parameters, gradients and optimiser state.
+That is part 1's 16 bytes per parameter, replicated $N$ times, to store one
+model's worth of information.
+
+For 1024 ranks that is 1023 redundant copies of the optimiser state — which part
+1 established is two thirds of the total.
+
+[ZeRO](/entries/zero-sharding) removes the redundancy in three stages. Shard the
+optimiser state; then the gradients; then the parameters themselves, gathering
+each layer's weights just before they are needed and releasing them after. Stage
+3 is $16P/N$ per device rather than $16P$.
+
+<Eq caption="eq. 3 — where the extra communication comes from">
+
+$$
+\text{stage 1--2: unchanged bytes} \qquad
+\text{stage 3: } +\ \text{all-gather of parameters, per layer}
+$$
+
+</Eq>
+
+Stages 1 and 2 are close to free, because of the identity above — the all-reduce
+was already going to happen and is simply decomposed. Stage 3 genuinely adds
+traffic, since parameters must be gathered on the way forward and again on the
+way back, and whether that is affordable is a question about the interconnect.
+
+### The thing that has to stay identical
+
+Everything above assumes the ranks remain in lockstep, and the ways that quietly
+fails are worth listing because none of them raises an error.
+
+**A different data order.** `DistributedSampler` needs `set_epoch` called every
+epoch, or every rank uses the same permutation for the whole run. The model sees
+one fixed ordering forever. No error, slightly worse model.
+
+**A rank that skips a collective.** Any branch that differs between ranks — an
+empty micro-batch, a conditional early exit — deadlocks the job at the next
+barrier. The symptom is a hang with no output, which is a worse failure than a
+crash because it looks like slowness.
+
+**Clipping in the wrong place.** [Gradient clipping](/entries/gradient-clipping)
+before the all-reduce clips a partial gradient against a global threshold, so
+each rank scales differently and the averaged direction is wrong. Trains fine,
+produces a worse model.
+
+<Note label="caveat">
+Every one of those degrades the run without failing it. This is the general
+character of distributed bugs and the reason I now assert invariants rather than
+inspect losses — a loss curve that looks normal is very weak evidence that a
+thousand processes are doing the same thing.
+</Note>
+
+### Where it stops
+
+Two limits. Data parallelism requires the model to fit on one device, which is
+what ZeRO stage 3 and the model-splitting strategies address. And the effective
+batch grows with the rank count, so past the critical batch size the extra
+devices are buying gradient variance reduction that the optimiser cannot use.
+
+<Rule label="Next" />
+
+The last part is about what a real configuration looks like when four of these
+run at once, and about the failure that costs half a cluster's throughput without
+producing a single error message.

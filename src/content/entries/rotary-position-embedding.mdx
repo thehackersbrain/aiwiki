@@ -1,0 +1,94 @@
+---
+name: 'Rotary Position Embedding'
+desc: 'Relative position injected as a per-pair rotation in complex subspaces.'
+category: 'architectures'
+complexity: 'O(n·d)'
+memory: 'O(n·d)'
+path: 'architectures/position'
+difficulty: 'intermediate'
+described: '2021'
+status: 'standard'
+statusNote: 'Effectively unanimous. The live questions are about extending it — base frequency, interpolation, per-dimension scaling — not about replacing it.'
+revised: 2026-08-18
+added: 2026-03-18
+tags: ['position', 'attention']
+lede: 'Position enters through a rotation applied to queries and keys, chosen so that the dot product between two positions depends only on their offset.'
+implNote:
+  label: 'caveat'
+  html: 'Two pairing conventions exist — adjacent dimensions, or halves. They are not interchangeable across checkpoints, and the failure is silent.'
+related: [rope-scaling, sinusoidal-position-encoding, multimodal-rope, xpos, scaled-dot-product-attention, flash-attention]
+refs:
+  - cite: 'Su et al. — RoFormer: Enhanced Transformer with Rotary Position Embedding (2021)'
+    id: 'arXiv:2104.09864'
+    href: https://arxiv.org/abs/2104.09864
+  - cite: 'Chen et al. — Extending Context Window via Position Interpolation (2023)'
+    id: 'arXiv:2306.15595'
+    href: https://arxiv.org/abs/2306.15595
+  - cite: 'Press et al. — Train Short, Test Long: ALiBi (2021)'
+    id: 'arXiv:2108.12409'
+    href: https://arxiv.org/abs/2108.12409
+---
+
+Split each $d$-dimensional query into $d/2$ planes. RoPE rotates plane $i$ at
+position $m$ by angle $m\theta_i$, with $\theta_i = b^{-2i/d}$ and base $b$
+typically $10^4$. Because rotations compose, the inner product between a rotated
+query at $m$ and a rotated key at $n$ collapses to a function of $m - n$.
+
+<Eq caption="eq. 1 — relativity from orthogonality of R" lead>
+
+$$
+\langle R_m q,\; R_n k \rangle = \langle q,\; R_{n-m} k \rangle
+$$
+
+</Eq>
+
+<Note label="annotation">
+The base was never tuned. $10^4$ comes from the sinusoidal embeddings of 2017 and
+was carried forward unexamined.
+</Note>
+
+The low-frequency planes rotate slowly and carry long-range order; the
+high-frequency ones alias almost immediately. Context extension methods exploit
+exactly this split — position interpolation divides every angle by the extension
+factor, while NTK-aware scaling raises the base instead so that high frequencies
+are left alone.
+
+<Eq caption="eq. 2 — NTK-aware base rescale for extension factor s">
+
+$$
+\theta_i = b^{-2i/d}, \qquad b' = b \cdot s^{\,d/(d-2)}
+$$
+
+</Eq>
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor
+
+
+def rope_cache(seq_len: int, dim: int, base: float = 10_000.0):
+    """Precompute cos/sin tables of shape [seq_len, dim // 2]."""
+    inv_freq = base ** -(torch.arange(0, dim, 2).float() / dim)
+    t = torch.arange(seq_len).float()
+    angles = torch.outer(t, inv_freq)
+    return angles.cos(), angles.sin()
+
+
+def apply_rope(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
+    """x: [B, H, N, D] with D even. Rotates adjacent pairs."""
+    x1, x2 = x[..., 0::2], x[..., 1::2]
+    cos, sin = cos[None, None], sin[None, None]
+    out = torch.stack(
+        (x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1
+    )
+    return out.flatten(-2)
+```
+
+</CodeFrame>
+
+Build the tables in fp32 and cast at the point of use — computing the angles in
+fp16 loses enough precision at long context to visibly degrade retrieval.

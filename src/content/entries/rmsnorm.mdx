@@ -1,0 +1,75 @@
+---
+name: 'RMSNorm'
+desc: 'Re-scaling without re-centring; LayerNorm minus the mean subtraction.'
+category: 'architectures'
+complexity: 'O(n·d)'
+path: 'architectures/normalisation'
+difficulty: 'introductory'
+described: '2019'
+status: 'standard'
+statusNote: 'The default normalisation. LayerNorm still appears, and the mean-subtraction it does was found not to be load-bearing.'
+revised: 2026-07-28
+added: 2024-09-10
+tags: ['normalisation', 'core']
+lede: 'LayerNorm without the mean subtraction, on the observation that the re-scaling does the work and the re-centring mostly does not.'
+related: [layer-normalisation, pre-norm-and-post-norm, scale-norm, dynamic-tanh, scaled-dot-product-attention]
+refs:
+  - cite: 'Zhang & Sennrich — Root Mean Square Layer Normalization (2019)'
+    id: 'arXiv:1910.07467'
+    href: https://arxiv.org/abs/1910.07467
+  - cite: 'Xiong et al. — On Layer Normalization in the Transformer Architecture (2020)'
+    id: 'arXiv:2002.04745'
+    href: https://arxiv.org/abs/2002.04745
+---
+
+RMSNorm divides an activation vector by its root mean square and applies a learned
+per-channel gain. Dropping the mean subtraction removes one reduction pass and one
+term from the backward pass, at no measured cost in convergence for transformer
+language models.
+
+<Eq lead caption="eq. 1">
+
+$$
+\mathrm{RMSNorm}(x) = g \odot \frac{x}{\sqrt{\tfrac{1}{d}\sum_i x_i^2 + \varepsilon}}
+$$
+
+</Eq>
+
+<Note label="annotation">
+Placement matters more than the choice of norm. Pre-norm blocks train stably at
+depth because the residual stream stays an identity path; post-norm blocks need
+warmup to survive the same depth.
+</Note>
+
+The $\varepsilon$ sits inside the square root, not outside it — a detail that
+changes the gradient near zero and differs between implementations often enough to
+be worth checking when porting weights.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor, nn
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+
+    def forward(self, x: Tensor) -> Tensor:
+        dtype = x.dtype
+        x = x.float()                              # accumulate in fp32
+        rms = x.pow(2).mean(-1, keepdim=True)
+        x = x * torch.rsqrt(rms + self.eps)
+        return (x.to(dtype) * self.weight)
+```
+
+</CodeFrame>
+
+The upcast is not optional. In bf16 the sum of squares over a 4096-wide vector
+loses enough mantissa that the norm drifts by a fraction of a percent per layer,
+and the drift compounds with depth.

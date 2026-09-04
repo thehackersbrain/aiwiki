@@ -1,0 +1,129 @@
+---
+name: 'Prefix Caching'
+desc: 'Reuse KV blocks across requests that share a prompt prefix.'
+category: 'inference'
+complexity: 'O(1)'
+path: 'inference/kv-cache'
+difficulty: 'intermediate'
+described: '2023'
+status: 'standard'
+statusNote: 'Standard in serving, and the single largest win available for workloads with a shared system prompt.'
+revised: 2026-07-29
+added: 2025-03-25
+tags: ['kv-cache', 'serving']
+lede: 'Two requests with the same system prompt compute the same keys and values for it. Hash the blocks, keep them, and the second request skips straight to the part that differs.'
+metrics:
+  caption: '4k system prompt, 200-token user turn, 70B model'
+  rows:
+    - { label: 'Prefill without', value: '4200 tok' }
+    - { label: 'Prefill with', value: '200 tok' }
+    - { label: 'TTFT', value: '−94%', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'A shared cache across users is a shared timing side channel: a cache hit is measurably faster, which leaks whether someone else has sent a given prefix.'
+related: [paged-attention, continuous-batching, multi-query-attention]
+refs:
+  - cite: 'Zheng et al. — SGLang: Efficient Execution of Structured Language Model Programs (2023)'
+    id: 'arXiv:2312.07104'
+    href: https://arxiv.org/abs/2312.07104
+  - cite: 'Kwon et al. — Efficient Memory Management for LLM Serving with PagedAttention (2023)'
+    id: 'arXiv:2309.06180'
+    href: https://arxiv.org/abs/2309.06180
+  - cite: 'Gim et al. — Prompt Cache: Modular Attention Reuse for Low-Latency Inference (2023)'
+    id: 'arXiv:2311.04934'
+    href: https://arxiv.org/abs/2311.04934
+---
+
+Under a causal mask, the key and value vectors at position $i$ depend only on
+tokens $\le i$. Two sequences sharing a prefix therefore produce *identical* KV
+entries across that prefix — not similar, identical.
+
+<Eq caption="eq. 1 — the property the whole technique rests on" lead>
+
+$$
+x_{1:i} = x'_{1:i}
+\;\Longrightarrow\;
+(K, V)_{1:i} = (K', V')_{1:i}
+$$
+
+</Eq>
+
+<Note label="annotation">
+This is why it composes with paged attention rather than competing with it.
+Blocks are already the unit of allocation; caching makes them the unit of
+sharing too.
+</Note>
+
+Given a block-structured cache, the implementation is a hash table. Each block
+is keyed by the hash of its own tokens chained with the hash of the block before
+it, so a match implies the entire prefix matches.
+
+<Eq caption="eq. 2 — chained block hash">
+
+$$
+h_b = H\bigl( h_{b-1} \,\|\, \text{tokens}_b \bigr)
+$$
+
+</Eq>
+
+Blocks are reference-counted and evicted LRU when the pool runs short. A radix
+tree over the token sequence gives the same result with cheaper longest-prefix
+lookup, which is what SGLang uses.
+
+### What breaks it
+
+- **Anything that varies at the front.** A timestamp or user id in the system
+  prompt gives every request a unique first block and a 0% hit rate. Put the
+  variable part last.
+- **Position-dependent state that is not positional.** RoPE is applied to
+  queries and keys at their absolute index, so a cached block is only valid at
+  the position it was computed for. Reusing a block at a different offset is
+  wrong, and it is wrong silently.
+- **Sampling parameters.** These do not affect KV at all, and a cache keyed on
+  them is throwing away hits for nothing.
+
+> The security note is not hypothetical. If the cache is shared across tenants,
+> the time to first token is an oracle for "has anyone recently sent this
+> prefix". Partition the cache per tenant unless the prefixes are public.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · sketch">
+
+```python
+import hashlib
+
+
+class PrefixCache:
+    """Maps a chained block hash to a physical KV block."""
+
+    def __init__(self, block_size: int = 16):
+        self.block_size = block_size
+        self.blocks: dict[bytes, int] = {}
+        self.refcount: dict[bytes, int] = {}
+
+    def _hash(self, parent: bytes, tokens: tuple[int, ...]) -> bytes:
+        payload = parent + b"".join(t.to_bytes(4, "little") for t in tokens)
+        return hashlib.blake2b(payload, digest_size=16).digest()
+
+    def match(self, tokens: list[int]) -> tuple[list[int], int]:
+        """Returns physical blocks for the longest cached prefix."""
+        hit, parent, matched = [], b"", 0
+        for start in range(0, len(tokens) - self.block_size + 1, self.block_size):
+            chunk = tuple(tokens[start : start + self.block_size])
+            parent = self._hash(parent, chunk)
+            if parent not in self.blocks:
+                break
+            hit.append(self.blocks[parent])
+            self.refcount[parent] += 1
+            matched += self.block_size
+        return hit, matched
+```
+
+</CodeFrame>
+
+Only *full* blocks are cacheable — a partial trailing block has no stable hash
+because the next token will change it. Chaining the parent hash into each block
+is what makes a hit on block $n$ imply blocks $1 \dots n-1$ matched too; hashing
+blocks independently would let two different prefixes collide onto the same
+cached block, which corrupts the output rather than merely slowing it down.

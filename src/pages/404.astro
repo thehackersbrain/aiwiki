@@ -1,0 +1,27 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Rail from '../components/Rail.astro';
+---
+
+<BaseLayout
+  title="No such entry"
+  tabTitle="No such entry — AI Grimoire"
+  description="Nothing is filed under that path. It may have been renamed, or it may be one of the notes that never made it past the stub bar."
+  nav={null}
+  noindex
+>
+  <main class="mx-auto max-w-[1180px] animate-rise px-6 pb-20 sm:px-12">
+    <Rail label="404" divider={false} class="pt-16">
+      <h1 class="mt-0 mb-5 text-[40px] leading-[1.14] font-normal tracking-[-0.024em] text-bone">
+        No such entry
+      </h1>
+      <p class="mt-0 mb-8 max-w-[62ch] text-[18px] text-lede text-pretty">
+        Nothing is filed under that path. It may have been renamed, or it may be one of
+        the notes that never made it past the stub bar.
+      </p>
+      <a href="/entries" class="border-b border-accent pb-[3px] font-mono text-[11px] tracking-[0.14em] uppercase text-accent">
+        Browse the index →
+      </a>
+    </Rail>
+  </main>
+</BaseLayout>

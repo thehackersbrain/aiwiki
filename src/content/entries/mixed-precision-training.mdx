@@ -1,0 +1,155 @@
+---
+name: 'Mixed-Precision Training'
+desc: 'Half-precision compute, full-precision accumulation, and the master copy in between.'
+category: 'training'
+complexity: 'O(P)'
+memory: 'O(P)'
+path: 'training/memory'
+difficulty: 'intermediate'
+described: '2017'
+status: 'standard'
+statusNote: 'Universal. Nothing above a few hundred million parameters is trained in fp32, and the bookkeeping below is what makes that safe.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['memory', 'training', 'numerics', 'core']
+lede: 'Mixed precision is not a cast. It is a policy about which tensors are half, which are full, and where the boundary sits — and the fp32 master weights it requires make it cost memory before it saves any.'
+metrics:
+  caption: 'Bytes per parameter'
+  rows:
+    - { label: 'Pure fp32', value: '16' }
+    - { label: 'Mixed precision', value: '18' }
+    - { label: 'Activations', value: 'halved', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Mixed precision uses <em>more</em> memory for weights, not less — the bf16 copy is additional to the fp32 master. The saving is in activations and in bandwidth, and on a small model with a long sequence it is still a large net win.'
+related: [floating-point-formats, activation-memory-accounting, memory-efficient-optimisers, layer-normalisation, gradient-clipping, nondeterminism]
+refs:
+  - cite: 'Micikevicius et al. — Mixed Precision Training (2017)'
+    id: 'arXiv:1710.03740'
+    href: https://arxiv.org/abs/1710.03740
+  - cite: 'Kalamkar et al. — A Study of BFLOAT16 for Deep Learning Training (2019)'
+    id: 'arXiv:1905.12322'
+    href: https://arxiv.org/abs/1905.12322
+  - cite: 'Rajbhandari et al. — ZeRO: Memory Optimizations Toward Training Trillion Parameter Models (2019)'
+    id: 'arXiv:1910.02054'
+    href: https://arxiv.org/abs/1910.02054
+---
+
+[Floating-point formats](/entries/floating-point-formats) covers what bf16 and
+fp16 are. This entry is about the training loop built around them, which is more
+than a cast and has one requirement that surprises people.
+
+### Why a master copy is needed
+
+The problem is not the forward pass. It is the update.
+
+<Eq lead caption="eq. 1 — the step that vanishes">
+
+$$
+\theta \leftarrow \theta - \eta\, \hat{g},
+\qquad \eta \hat{g} \sim 10^{-7},\;\; \theta \sim 10^{-2}
+$$
+
+</Eq>
+
+bf16 has seven mantissa bits, so it resolves about three significant decimal
+digits. Adding $10^{-7}$ to $10^{-2}$ in bf16 returns $10^{-2}$ unchanged. The
+update does not round — it is discarded entirely, and the parameter never moves
+again.
+
+So the optimiser keeps an fp32 *master* copy, applies the update there, and casts
+down to bf16 for the next forward pass. The half-precision weights are a
+derived artefact, regenerated every step.
+
+<Eq caption="eq. 2 — the memory, and why it goes up">
+
+$$
+\underbrace{4P}_{\text{fp32 master}} + \underbrace{2P}_{\text{bf16}}
++ \underbrace{2P}_{\text{grads}} + \underbrace{8P}_{\text{Adam}}
++ \underbrace{2P}_{\text{fp32 grad accum}} = 18P
+$$
+
+</Eq>
+
+Against pure fp32's $16P$. Mixed precision costs weight memory and saves
+activation memory, and since activations dominate at realistic batch and
+sequence sizes the total is a large win — but stating it as "halves memory" is
+wrong and leads to allocation failures.
+
+<Note label="annotation">
+This is one reason <a href="/entries/zero-sharding">ZeRO</a> pairs so naturally
+with it. The master weights and optimiser state are exactly the tensors that are
+only needed at update time, so sharding them across data-parallel ranks costs
+almost nothing in communication.
+</Note>
+
+### The precision policy
+
+Not every operation is safe in half precision. The rule is that anything
+*accumulating* over many terms stays in fp32.
+
+| Operation | Precision | Why |
+| --- | --- | --- |
+| matmul | bf16 in, fp32 accumulate | tensor cores do this in hardware |
+| layernorm / softmax | fp32 | reductions over the feature dimension |
+| loss | fp32 | log-sum-exp over a large vocabulary |
+| optimiser step | fp32 | eq. 1 |
+| elementwise, activations | bf16 | no accumulation |
+
+`torch.autocast` implements this as a per-operator table. It is worth knowing
+that the table exists and can be wrong for a custom operator — a hand-written
+kernel gets no entry, runs in whatever dtype it is handed, and is the usual
+explanation for a model that trains in fp32 and diverges in bf16.
+
+### fp16 and loss scaling
+
+With bf16 the story ends there. With fp16 there is one more piece: five exponent
+bits do not reach the small gradients, which flush to zero.
+
+Loss scaling multiplies the loss by a large constant before the backward pass so
+gradients land in range, then divides it out before the optimiser sees them.
+Dynamic scaling adjusts the constant — double it periodically, halve it and
+*skip the step* whenever an overflow appears.
+
+That skipping is the part worth knowing about: a well-tuned fp16 run discards a
+small fraction of its steps as a matter of routine. bf16 needs none of it, which
+is the practical reason it took over.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import nn
+
+
+def train_step(model: nn.Module, opt, batch, scaler=None) -> float:
+    """bf16 needs no scaler; fp16 does. Otherwise identical."""
+    opt.zero_grad(set_to_none=True)
+
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        # Only the forward runs under autocast. The backward inherits the
+        # dtypes autograd recorded — wrapping it too is a no-op at best.
+        loss = model(**batch).loss
+
+    if scaler is None:
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        opt.step()
+    else:
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)                       # before clipping, not after
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(opt)                           # skips on overflow
+        scaler.update()
+
+    return loss.item()
+```
+
+</CodeFrame>
+
+`unscale_` before clipping is the detail that is easy to miss and quiet when
+wrong. Clipping a scaled gradient compares its norm against a threshold on a
+completely different scale, so either everything is clipped or nothing is, and
+the run simply trains a bit worse without any error.

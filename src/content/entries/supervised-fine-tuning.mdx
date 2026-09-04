@@ -1,0 +1,100 @@
+---
+name: 'Supervised Fine-Tuning'
+desc: 'Cross-entropy on completion tokens only; the step that makes a base model answer.'
+category: 'fine-tuning'
+complexity: 'O(n·d²)'
+path: 'fine-tuning/sft'
+difficulty: 'introductory'
+described: '2021'
+status: 'standard'
+revised: 2026-08-12
+added: 2024-10-22
+tags: ['fine-tuning', 'alignment']
+lede: 'The same next-token objective as pretraining, on a corpus of demonstrations, with the loss masked to the parts the model is meant to produce.'
+implNote:
+  label: 'caveat'
+  html: 'Getting the loss mask wrong is the most common bug in the whole pipeline, and it does not raise an error — it trains the model to generate your prompts.'
+related: [lora, qlora, direct-preference-optimisation, perplexity]
+refs:
+  - cite: 'Wei et al. — Finetuned Language Models Are Zero-Shot Learners (2021)'
+    id: 'arXiv:2109.01652'
+    href: https://arxiv.org/abs/2109.01652
+  - cite: 'Ouyang et al. — Training Language Models to Follow Instructions (2022)'
+    id: 'arXiv:2203.02155'
+    href: https://arxiv.org/abs/2203.02155
+  - cite: 'Zhou et al. — LIMA: Less Is More for Alignment (2023)'
+    id: 'arXiv:2305.11206'
+    href: https://arxiv.org/abs/2305.11206
+---
+
+A base model completes text. It does not answer questions, because a question
+in its training distribution was as likely to be followed by more questions as
+by an answer. SFT changes the distribution, not the objective.
+
+<Eq caption="eq. 1 — the mask is the entire difference from pretraining" lead>
+
+$$
+\mathcal{L} = -\sum_{t} \mathbb{1}[\, t \in \text{completion} \,]
+\; \log p_\theta(y_t \mid y_{<t}, x)
+$$
+
+</Eq>
+
+<Note label="annotation">
+Train on the prompt tokens too and the model learns to write plausible user
+turns. It will then, given half a conversation, helpfully invent the rest of it.
+</Note>
+
+### Data, not gradient steps
+
+LIMA's result is the one worth internalising: 1,000 carefully curated examples
+outperformed 52,000 scraped ones. The claim is that the model already has the
+capability from pretraining and SFT is selecting a response *format* — a small,
+consistent, high-quality set specifies that format better than a large
+inconsistent one.
+
+The practical consequences are all about the data:
+
+- Deduplicate aggressively. A repeated example is a repeated gradient.
+- Keep the format uniform. Two chat templates in one dataset teach neither.
+- Cap the epochs at 2–3. Beyond that the model memorises the demonstrations and
+  its held-out loss rises while its training loss keeps falling.
+
+> A rising validation loss during SFT is not automatically a problem. The
+> objective is not to predict held-out demonstrations well; it is to produce
+> useful completions, and those two diverge early.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor
+
+IGNORE = -100   # cross_entropy skips these positions
+
+
+def build_example(tokenizer, prompt: str, completion: str) -> dict[str, Tensor]:
+    prompt_ids = tokenizer(prompt, add_special_tokens=False).input_ids
+    completion_ids = tokenizer(
+        completion + tokenizer.eos_token, add_special_tokens=False
+    ).input_ids
+
+    input_ids = prompt_ids + completion_ids
+    labels = [IGNORE] * len(prompt_ids) + completion_ids
+
+    return {
+        "input_ids": torch.tensor(input_ids),
+        "labels": torch.tensor(labels),
+    }
+```
+
+</CodeFrame>
+
+The EOS token belongs inside the supervised span. Leave it out and the model is
+never taught to stop, which shows up as completions that run on until the
+length cap. When packing several examples into one sequence for throughput,
+either reset the attention mask at every document boundary or accept that the
+model can attend across unrelated examples — most implementations quietly do
+the latter.

@@ -1,0 +1,134 @@
+---
+name: 'Emergent Abilities'
+desc: 'Capabilities that appear abruptly with scale, and the argument that the abruptness is the metric.'
+category: 'training'
+complexity: '—'
+path: 'training/scaling'
+difficulty: 'intermediate'
+described: '2022'
+status: 'common'
+statusNote: 'The strong version — sharp, unpredictable phase transitions — did not survive scrutiny. The weak version, that downstream capability is hard to forecast from loss, is intact and still awkward.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['scaling', 'evaluation']
+lede: 'Some abilities appear to switch on at a threshold rather than improve gradually. Most of those curves flatten out when the metric stops being all-or-nothing — but not the underlying problem, which is that loss does not tell you what a model can do.'
+metrics:
+  caption: 'The same model on the same task'
+  rows:
+    - { label: 'Exact-match accuracy', value: 'sharp jump' }
+    - { label: 'Token edit distance', value: 'smooth' }
+    - { label: 'Underlying loss', value: 'smooth', accent: true }
+implNote:
+  label: 'annotation'
+  html: 'The test is cheap and worth running on any emergence claim: re-plot with a continuous metric. If the discontinuity survives, it is in the model; if it vanishes, it was in the scoring.'
+related: [chinchilla-scaling-laws, perplexity, statistical-power, llm-as-judge, test-time-compute-scaling, kaplan-scaling-laws]
+refs:
+  - cite: 'Wei et al. — Emergent Abilities of Large Language Models (2022)'
+    id: 'arXiv:2206.07682'
+    href: https://arxiv.org/abs/2206.07682
+  - cite: 'Schaeffer et al. — Are Emergent Abilities of Large Language Models a Mirage? (2023)'
+    id: 'arXiv:2304.15004'
+    href: https://arxiv.org/abs/2304.15004
+  - cite: 'Ganguli et al. — Predictability and Surprise in Large Generative Models (2022)'
+    id: 'arXiv:2202.07785'
+    href: https://arxiv.org/abs/2202.07785
+---
+
+Loss falls smoothly with scale. Some benchmark curves do not — they sit at chance
+across several orders of magnitude and then rise sharply. Wei et al. catalogued
+over a hundred such tasks and named the phenomenon emergence, defining it as an
+ability "not present in smaller models but present in larger ones".
+
+If true in the strong sense, it is a serious problem: capability would be
+unforecastable from anything measurable in advance, and safety evaluation of a
+model would tell you nothing about the next one.
+
+### The mirage argument
+
+Schaeffer et al. observed that the tasks showing sharp emergence share a
+property. They are scored with a *discontinuous* metric — exact string match,
+multiple-choice accuracy, "all five digits correct".
+
+Consider arithmetic. A model's per-token accuracy improves smoothly with scale.
+Exact match on a five-digit answer requires all five tokens right at once.
+
+<Eq lead caption="eq. 1 — a smooth improvement, raised to a power">
+
+$$
+p_{\text{exact}} = p_{\text{token}}^{\,n}
+$$
+
+</Eq>
+
+At $n = 5$, per-token accuracy rising smoothly from 0.3 to 0.9 takes exact match
+from 0.002 to 0.59 — a curve that looks flat, then vertical, produced by nothing
+but the exponent.
+
+<Note label="annotation">
+The claim is not that models do not improve. It is that the <em>shape</em> of the
+improvement — the thing emergence is a claim about — is an artefact of the
+scoring function, and re-plotting the same predictions with token edit distance
+or Brier score gives a smooth curve.
+</Note>
+
+They go further and manufacture the effect on demand: applying a discontinuous
+metric to a vision model produces "emergent" abilities in a setting where nobody
+had claimed any.
+
+### What survives
+
+Two things, and they are not nothing.
+
+**Discontinuous metrics are what people care about.** A model that gets four
+digits of five right is wrong. If the deployment question is whether the model
+can do the task, the sharp curve is the honest one and the smooth curve is the
+diagnostic. The mirage argument reframes the mechanism without making the
+capability jump less real to a user.
+
+**Loss does not predict capability.** This is the durable version. Two models at
+the same pre-training loss can differ substantially on downstream tasks, and the
+mapping from loss to any particular ability is not something we can compute.
+Scaling laws forecast loss precisely and forecast capability not at all, which is
+the gap Ganguli et al. call *predictability and surprise*: the aggregate is
+predictable, the specifics are not.
+
+### The state of the question
+
+The strong claim — genuine phase transitions in capability — has not been
+supported once the metric is controlled for. A handful of candidate cases remain
+under discussion, and the honest position is that none is well established.
+
+The practical consequence is unchanged. If you want to know whether a model can
+do something, measure that thing; the loss curve will not tell you, and neither
+will the previous model. And when you do measure it, use a continuous metric for
+the trend and a discontinuous one for the deployment decision — they are
+answering different questions and conflating them is how the argument started.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python">
+
+```python
+def exact_match_curve(token_accuracy: list[float], length: int) -> list[float]:
+    """Turn a smooth per-token curve into an 'emergent' one. Schaeffer et al. §3."""
+    return [p**length for p in token_accuracy]
+
+
+def is_metric_artefact(scores: dict[str, list[float]]) -> str:
+    """Plot the same predictions under a continuous metric. If the jump goes,
+    it was the scoring; if it stays, the claim survives this test."""
+    sharp = max(
+        b - a for a, b in zip(scores["exact_match"], scores["exact_match"][1:])
+    )
+    smooth = max(
+        b - a for a, b in zip(scores["edit_distance"], scores["edit_distance"][1:])
+    )
+    return "metric artefact" if sharp > 4 * smooth else "survives the substitution"
+```
+
+</CodeFrame>
+
+That second function is a rule of thumb rather than a test — the factor of four
+is a judgement call and the comparison assumes both metrics are on comparable
+scales. It is written down because the substitution is the thing worth doing, not
+because the threshold means anything.

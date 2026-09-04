@@ -1,0 +1,107 @@
+---
+name: 'SwiGLU'
+desc: 'Gated feed-forward block; a Swish gate multiplied into a linear branch.'
+category: 'architectures'
+complexity: 'O(n·d²)'
+path: 'architectures/ffn'
+difficulty: 'introductory'
+described: '2020'
+status: 'standard'
+statusNote: 'The default feed-forward block. Gating is settled; which activation gates is not, and barely matters.'
+revised: 2026-08-21
+added: 2025-03-14
+tags: ['ffn', 'core']
+lede: 'The feed-forward block, with its single ReLU replaced by a multiplicative gate. Three matrices instead of two, and the width shrunk by ⅔ to pay for it.'
+implNote:
+  label: 'caveat'
+  html: 'The ⅔ is what makes the comparison fair. Swap SwiGLU in at unchanged width and you have added 50% more FFN parameters, which is a different experiment.'
+related: [feed-forward-networks, gelu, squared-relu, feed-forward-as-key-value-memory, mixture-of-experts-routing, rmsnorm]
+refs:
+  - cite: 'Shazeer — GLU Variants Improve Transformer (2020)'
+    id: 'arXiv:2002.05202'
+    href: https://arxiv.org/abs/2002.05202
+  - cite: 'Dauphin et al. — Language Modeling with Gated Convolutional Networks (2016)'
+    id: 'arXiv:1612.08083'
+    href: https://arxiv.org/abs/1612.08083
+  - cite: 'Ramachandran et al. — Searching for Activation Functions (2017)'
+    id: 'arXiv:1710.05941'
+    href: https://arxiv.org/abs/1710.05941
+---
+
+The original transformer's feed-forward block is two matrices with a
+pointwise nonlinearity between them. A gated linear unit splits the first
+projection in two and multiplies one branch, passed through an activation,
+into the other.
+
+<Eq caption="eq. 1 — Swish/SiLU gate, elementwise product" lead>
+
+$$
+\mathrm{SwiGLU}(x) = \bigl( \mathrm{Swish}_\beta(x W_1) \odot x W_3 \bigr) W_2,
+\qquad
+\mathrm{Swish}_\beta(z) = z\,\sigma(\beta z)
+$$
+
+</Eq>
+
+At $\beta = 1$ the activation is SiLU, which is what every released
+implementation uses; $\beta$ is almost never learned.
+
+<Note label="annotation">
+The gate is data-dependent multiplication — the one operation a stack of
+matmuls and pointwise functions cannot otherwise express.
+</Note>
+
+### Paying for the third matrix
+
+A gated block has three weight matrices where the classic block has two, so
+holding the parameter count fixed against a $4d$ classic block means shrinking
+the hidden width by a factor of $\tfrac{2}{3}$.
+
+<Eq caption="eq. 2 — parameters held equal">
+
+$$
+2 \cdot d \cdot d_{\text{ff}} \;=\; 3 \cdot d \cdot d_{\text{ff}}'
+\quad\Longrightarrow\quad
+d_{\text{ff}}' = \tfrac{2}{3} d_{\text{ff}} = \tfrac{8}{3} d
+$$
+
+</Eq>
+
+In practice $d_{\text{ff}}'$ is rounded to a multiple of 128 or 256 so the
+matmul tiles evenly; the ratio you see in a config file is rarely exactly
+$8/3$ for that reason alone.
+
+> Shazeer's own verdict on why gating helps is worth quoting for its honesty:
+> the variants are offered "divine benevolence" as the explanation. The
+> empirical result has held up across a decade of models regardless.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch.nn.functional as F
+from torch import Tensor, nn
+
+
+class SwiGLU(nn.Module):
+    def __init__(self, d_model: int, multiple_of: int = 256):
+        super().__init__()
+        hidden = int(2 / 3 * 4 * d_model)
+        # round up so the matmul tiles evenly
+        hidden = multiple_of * ((hidden + multiple_of - 1) // multiple_of)
+
+        self.gate = nn.Linear(d_model, hidden, bias=False)   # W1
+        self.up = nn.Linear(d_model, hidden, bias=False)     # W3
+        self.down = nn.Linear(hidden, d_model, bias=False)   # W2
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.down(F.silu(self.gate(x)) * self.up(x))
+```
+
+</CodeFrame>
+
+Fusing `gate` and `up` into one `nn.Linear(d_model, 2 * hidden)` and splitting
+the result is worth a few percent of step time, at the cost of a checkpoint
+layout that no longer matches anyone else's. Biases are omitted throughout, as
+they are in every modern decoder.

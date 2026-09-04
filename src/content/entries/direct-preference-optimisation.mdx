@@ -1,0 +1,97 @@
+---
+name: 'Direct Preference Optimisation'
+desc: 'Closed-form preference objective that removes the reward model.'
+category: 'training'
+complexity: 'O(d)'
+path: 'training/objectives'
+difficulty: 'advanced'
+described: '2023'
+status: 'standard'
+statusNote: 'The default post-training preference method. Simpler than PPO and, for most of what it is asked to do, as good.'
+revised: 2026-08-25
+added: 2024-11-25
+tags: ['RL', 'alignment']
+lede: 'The KL-regularised RL objective has a closed-form optimum. Substitute it back into the Bradley–Terry likelihood and the reward model disappears, leaving a classification loss on preference pairs.'
+implNote:
+  label: 'in practice'
+  html: 'β between 0.1 and 0.5. Below about 0.05 the policy drifts far enough that the reference has stopped constraining anything.'
+related: [kl-regularisation, reward-modelling, proximal-policy-optimisation, grpo, elo-bradley-terry-scoring]
+refs:
+  - cite: 'Rafailov et al. — Direct Preference Optimization (2023)'
+    id: 'arXiv:2305.18290'
+    href: https://arxiv.org/abs/2305.18290
+  - cite: 'Ziegler et al. — Fine-Tuning Language Models from Human Preferences (2019)'
+    id: 'arXiv:1909.08593'
+    href: https://arxiv.org/abs/1909.08593
+  - cite: 'Azar et al. — A General Theoretical Paradigm to Understand Learning from Preferences (2023)'
+    id: 'arXiv:2310.12036'
+    href: https://arxiv.org/abs/2310.12036
+---
+
+RLHF maximises expected reward under a KL penalty toward a reference policy. That
+problem is solved analytically by a Boltzmann tilt of the reference, which means
+any reward function can be written in terms of the optimal policy it induces.
+
+<Eq caption="eq. 1 — optimum of the KL-regularised objective" lead>
+
+$$
+\pi^{*}(y \mid x) = \frac{1}{Z(x)}\, \pi_{\text{ref}}(y \mid x)
+\exp\!\left( \frac{r(x, y)}{\beta} \right)
+$$
+
+</Eq>
+
+<Note label="annotation">
+$\log Z(x)$ cancels only because Bradley–Terry sees a difference of rewards at a
+fixed prompt. Compare across prompts and it does not.
+</Note>
+
+Inverting eq. 1 gives $r(x,y) = \beta \log \frac{\pi(y \mid x)}{\pi_{\text{ref}}(y
+\mid x)} + \beta \log Z(x)$. Under Bradley–Terry only reward **differences** within
+a prompt matter, so the intractable partition function cancels and the preference
+likelihood becomes a logistic loss on the implicit reward margin.
+
+<Eq caption="eq. 2" source="Rafailov et al. §4">
+
+$$
+L_{\text{DPO}} = -\,\E \log \sigma\!\left(
+\beta \log \frac{\pi(y_w \mid x)}{\pi_{\text{ref}}(y_w \mid x)}
+- \beta \log \frac{\pi(y_l \mid x)}{\pi_{\text{ref}}(y_l \mid x)}
+\right)
+$$
+
+</Eq>
+
+> $\beta$ is not a learning rate. It sets how far the policy is allowed to move
+> from the reference, and it is the only handle on the failure mode where both
+> chosen and rejected log-probabilities fall together while the margin technically
+> improves.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch.nn.functional as F
+from torch import Tensor
+
+
+def dpo_loss(
+    pi_chosen: Tensor, pi_rejected: Tensor,      # policy logprobs, summed
+    ref_chosen: Tensor, ref_rejected: Tensor,    # reference logprobs, frozen
+    beta: float = 0.1,
+) -> Tensor:
+    chosen_logratio = pi_chosen - ref_chosen
+    rejected_logratio = pi_rejected - ref_rejected
+    margin = beta * (chosen_logratio - rejected_logratio)
+    return -F.logsigmoid(margin).mean()
+```
+
+</CodeFrame>
+
+The log-probabilities must be summed over completion tokens only, with the prompt
+masked out — averaging instead silently reweights the objective by completion
+length and biases the policy toward short answers. Track chosen and rejected
+log-ratios separately during training: a healthy run raises the margin, an
+unhealthy one lowers both terms and widens the gap by falling more slowly on the
+chosen side.

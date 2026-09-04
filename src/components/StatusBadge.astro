@@ -1,0 +1,50 @@
+---
+import { STATUS, type Status } from '../lib/status';
+
+interface Props {
+  status: Status;
+  /** Show the full label rather than the abbreviation. */
+  full?: boolean;
+  /** `sm` sits inline in a listing; `md` stands beside a page title. */
+  size?: 'sm' | 'md';
+  class?: string;
+}
+
+const { status, full = false, size = 'sm', class: className } = Astro.props;
+const meta = STATUS[status];
+
+// Sizes are picked here rather than passed as overriding classes: two competing
+// `h-*` utilities in one class list are resolved by stylesheet order, not by
+// the order they were written, so the override is not reliably the winner.
+const SIZES = {
+  sm: 'h-[18px] gap-1.5 px-2 text-[9px]',
+  md: 'h-[26px] gap-2 px-2.5 text-[10px]',
+} as const;
+---
+
+{/*
+  A flex box rather than an inline box: mono capitals have a tall ascent and a
+  deep descender, so a padded inline-block centres the *line*, not the letters,
+  and the word sits visibly high. Centring a flex line box fixes it, and a fixed
+  height keeps every badge on a row the same size whatever word is in it.
+
+  The dot carries the colour at small sizes, where a 1px border and a 9px word
+  are both easy to miss; the word is always present, so the colour is never the
+  only thing saying what this is.
+*/}
+<span
+  data-status={status}
+  title={meta.tooltip}
+  class:list={[
+    'inline-flex items-center border align-[2px] font-mono leading-none tracking-[0.14em] whitespace-nowrap uppercase',
+    SIZES[size],
+    className,
+  ]}
+  style={`color: var(--status-${status}); border-color: var(--status-${status}-edge); background: var(--status-${status}-wash)`}
+>
+  <span
+    aria-hidden="true"
+    class="inline-block size-[4px] shrink-0 rounded-full"
+    style="background: currentColor"></span>
+  <span class="translate-y-[0.5px]">{full ? meta.label : meta.short}</span>
+</span>

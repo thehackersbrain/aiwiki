@@ -1,0 +1,122 @@
+---
+name: 'Feed-Forward Networks'
+desc: 'Two matrices and a nonlinearity, applied to each position alone.'
+category: 'architectures'
+complexity: 'O(n·d²)'
+memory: 'O(n·d_ff)'
+path: 'architectures/ffn'
+difficulty: 'introductory'
+described: '2017'
+status: 'standard'
+statusNote: 'Half of every transformer block ever built. The gated variant replaced the exact form; the role it plays has not changed since 2017.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['ffn', 'core']
+lede: 'Attention moves information between positions. The feed-forward block is where anything is done with it — and it is where two thirds of the parameters are.'
+metrics:
+  caption: 'Llama-2-7B, per layer'
+  rows:
+    - { label: 'Attention params', value: '67 M' }
+    - { label: 'FFN params', value: '135 M', accent: true }
+    - { label: 'Share of total', value: '≈ 67%' }
+implNote:
+  label: 'annotation'
+  html: 'Position-wise means the same two matrices are applied to every token independently. The block has no idea a sequence exists; from its point of view it is a batch of unrelated vectors.'
+related: [swiglu, gelu, scaled-dot-product-attention, feed-forward-as-key-value-memory, parallel-attention-and-ffn, rmsnorm]
+refs:
+  - cite: 'Vaswani et al. — Attention Is All You Need (2017)'
+    id: 'arXiv:1706.03762'
+    href: https://arxiv.org/abs/1706.03762
+  - cite: 'Geva et al. — Transformer Feed-Forward Layers Are Key-Value Memories (2020)'
+    id: 'arXiv:2012.14913'
+    href: https://arxiv.org/abs/2012.14913
+  - cite: 'Shazeer — GLU Variants Improve Transformer (2020)'
+    id: 'arXiv:2002.05202'
+    href: https://arxiv.org/abs/2002.05202
+---
+
+A transformer block is two things: attention, and this. Attention is the part
+everyone studies and the part the papers are named after. The feed-forward block
+is where the parameters are.
+
+<Eq lead caption="eq. 1 — up, nonlinearity, down">
+
+$$
+\mathrm{FFN}(x) = W_2\,\phi(W_1 x + b_1) + b_2,
+\qquad W_1 \in \mathbb{R}^{d_{ff} \times d},\;\; W_2 \in \mathbb{R}^{d \times d_{ff}}
+$$
+
+</Eq>
+
+Project up to a wider space, apply a nonlinearity, project back. The
+conventional width is $d_{ff} = 4d$, which gives $8d^2$ parameters against
+attention's $4d^2$ — hence two thirds of the model, in the half of the block that
+gets a third of the attention.
+
+### Position-wise
+
+The same $W_1$ and $W_2$ are applied to every token, independently. Nothing in
+the block sees a neighbour. This is the division of labour that makes the
+transformer work: attention is the only operation that mixes positions, and the
+feed-forward block is the only one with the capacity to transform what it finds
+there.
+
+<Note label="annotation">
+It is worth being precise about what "position-wise" costs. The block is a matmul
+over $[B \cdot T, d]$, which is arithmetically dense and perfectly parallel — no
+sequence dependency, no mask, nothing to synchronise. It is also, at batch size
+one during decoding, entirely memory-bound: $8d^2$ parameters read to process a
+single token.
+</Note>
+
+### Why 4×
+
+The ratio is inherited from the original paper and has never been strongly
+justified. What evidence exists says the block is not very sensitive to it —
+between roughly $2d$ and $8d$, quality tracks parameter count rather than the
+ratio itself, so the choice is a question of how you would rather spend a
+parameter budget.
+
+Two things have moved it. [Gated variants](/entries/swiglu) use three matrices
+instead of two, so the width is scaled by $\tfrac{2}{3}$ to hold the parameter
+count fixed — $d_{ff} \approx \tfrac{8}{3}d$, usually rounded to a multiple of
+256 for the hardware. And [mixture-of-experts](/entries/mixture-of-experts-routing)
+replaces the single block with many, at which point the per-expert width becomes
+a granularity question rather than a capacity one.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+from torch import Tensor, nn
+
+
+class FeedForward(nn.Module):
+    def __init__(self, dim: int, hidden: int | None = None, bias: bool = False):
+        super().__init__()
+        hidden = hidden or 4 * dim
+        self.up = nn.Linear(dim, hidden, bias=bias)
+        self.down = nn.Linear(hidden, dim, bias=bias)
+        self.act = nn.GELU()
+
+    def forward(self, x: Tensor) -> Tensor:                   # [B, T, D]
+        return self.down(self.act(self.up(x)))
+```
+
+</CodeFrame>
+
+Biases are gone from most modern implementations. They are the smallest tensors
+in the model and removing them measurably improves training stability at scale —
+one of several places where a parameter that costs nothing turns out to be worth
+less than nothing.
+
+<Rule label="What it is doing" />
+
+The mechanistic reading is that $W_1$'s rows are pattern detectors and $W_2$'s
+columns are what gets written back when a pattern fires — a
+[key-value memory](/entries/feed-forward-as-key-value-memory), with $d_{ff}$
+entries per layer. That view is well supported and it explains a great deal:
+why factual knowledge localises to feed-forward blocks, why editing a fact means
+editing $W_2$, and why the block's activations are extremely sparse in practice
+even though nothing asked them to be.

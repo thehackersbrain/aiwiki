@@ -1,0 +1,146 @@
+---
+name: 'Linear Attention'
+desc: 'Drop the softmax, reassociate the matmuls, and decode in constant memory.'
+category: 'architectures'
+complexity: 'O(n·d²)'
+memory: 'O(d²)'
+path: 'architectures/attention'
+difficulty: 'advanced'
+described: '2020'
+status: 'emerging'
+statusNote: 'The gated variants are genuinely competitive and are shipping in hybrid models. Whether they can match exact attention on long-range recall alone is still open.'
+revised: 2026-08-29
+added: 2025-04-11
+tags: ['attention', 'efficiency', 'recurrence']
+lede: 'The quadratic term comes from computing QKᵀ first. Replace the softmax with a feature map and matrix multiplication becomes associative again — so compute KᵀV instead, and the cost is linear in sequence length.'
+metrics:
+  caption: 'd = 64 per head, cost per head'
+  rows:
+    - { label: 'Softmax, n = 8192', value: '4.3 G' }
+    - { label: 'Linear, n = 8192', value: '67 M' }
+    - { label: 'Break-even n', value: '≈ 128', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'The chunked form is not an optimisation detail. The pure recurrent form has no sequence parallelism at all, so a training implementation that uses it is bound by depth × length serial steps.'
+related: [scaled-dot-product-attention, state-space-models, sliding-window-attention, flash-attention]
+refs:
+  - cite: 'Katharopoulos et al. — Transformers are RNNs (2020)'
+    id: 'arXiv:2006.16236'
+    href: https://arxiv.org/abs/2006.16236
+  - cite: 'Choromanski et al. — Rethinking Attention with Performers (2020)'
+    id: 'arXiv:2009.14794'
+    href: https://arxiv.org/abs/2009.14794
+  - cite: 'Yang et al. — Gated Linear Attention Transformers with Hardware-Efficient Training (2023)'
+    id: 'arXiv:2312.06635'
+    href: https://arxiv.org/abs/2312.06635
+---
+
+Attention is quadratic because of the order of two matrix multiplications, not
+because of the amount of information it moves. $Q K^{\top}$ is $n \times n$;
+$K^{\top} V$ is $d \times d$. The softmax between them is what forbids the second
+grouping, because $\softmax(QK^{\top})V$ does not factor.
+
+Remove it. Write the similarity as an inner product of feature maps and the
+associativity comes back.
+
+<Eq caption="eq. 1 — the same numerator, regrouped" source="Katharopoulos et al. §3.2" lead>
+
+$$
+\underbrace{\bigl( \phi(Q) \phi(K)^{\top} \bigr) V}_{O(n^2 d)}
+\;=\;
+\underbrace{\phi(Q) \bigl( \phi(K)^{\top} V \bigr)}_{O(n d^2)}
+$$
+
+</Eq>
+
+<Note label="annotation">
+$\phi$ must be non-negative, or the denominator can vanish and the "weights" stop
+being an average. $\phi(x) = \mathrm{elu}(x) + 1$ is the standard cheap choice.
+</Note>
+
+The normalisation carries over: divide by $\phi(q_i)^{\top} \sum_j \phi(k_j)$
+rather than by a row sum of exponentials. The result is a weighted average with
+non-negative weights — just not a softmax, and not a sharp one.
+
+### It is a linear RNN
+
+<Eq caption="eq. 2 — causal case, as a recurrence over a matrix-valued state">
+
+$$
+S_t = S_{t-1} + \phi(k_t) v_t^{\top}, \qquad
+z_t = z_{t-1} + \phi(k_t), \qquad
+o_t = \frac{\phi(q_t)^{\top} S_t}{\phi(q_t)^{\top} z_t}
+$$
+
+</Eq>
+
+With the mask applied, the cumulative sums *are* a recurrent state: a $d \times d$
+matrix $S$ and a $d$-vector $z$, both of fixed size. Decoding is then $O(d^2)$ per
+token with no cache that grows — the property that makes this family interesting,
+and the same property [state space models](/entries/state-space-models) arrive at
+from the other direction.
+
+### What is actually lost
+
+<Note label="caveat">
+"Linear attention underperforms" is a claim about the ungated variants. The gated
+ones are competitive, and the gate is doing something specific: allowing the state
+to forget.
+</Note>
+
+A softmax can concentrate almost all its mass on one position. A fixed $d \times
+d$ state cannot: it is a lossy summary of everything seen so far, and the capacity
+is $d^2$ regardless of $n$. Exact recall of a specific earlier token — the thing
+[induction heads](/entries/induction-heads) do — degrades as the sequence exceeds
+that capacity.
+
+The ungated recurrence in eq. 2 also only ever adds, so old information is never
+removed, only diluted. Gated variants insert a decay term, $S_t = G_t \odot
+S_{t-1} + \phi(k_t) v_t^{\top}$, which recovers much of the gap and is what the
+current generation of these models actually uses.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor
+
+
+def linear_attention_chunked(
+    q: Tensor, k: Tensor, v: Tensor, chunk: int = 128  # [B, H, N, D]
+) -> Tensor:
+    """Chunked parallel form: quadratic within a chunk, recurrent across them."""
+    q, k = torch.nn.functional.elu(q) + 1, torch.nn.functional.elu(k) + 1
+    b, h, n, d = q.shape
+
+    state = q.new_zeros(b, h, d, v.size(-1))   # running K^T V
+    z = q.new_zeros(b, h, d)                   # running sum of phi(k)
+    out = []
+
+    for i in range(0, n, chunk):
+        qc, kc, vc = q[..., i : i + chunk, :], k[..., i : i + chunk, :], v[..., i : i + chunk, :]
+
+        # Contribution of every earlier chunk, through the summarised state.
+        inter = qc @ state
+        # Contribution of this chunk, computed the quadratic way and masked.
+        mask = torch.ones(qc.size(-2), kc.size(-2), dtype=torch.bool, device=q.device).triu(1)
+        intra = (qc @ kc.transpose(-2, -1)).masked_fill(mask, 0.0) @ vc
+
+        denom = qc @ z.unsqueeze(-1) + (qc @ kc.transpose(-2, -1)).masked_fill(mask, 0.0).sum(-1, keepdim=True)
+        out.append((inter + intra) / denom.clamp(min=1e-6))
+
+        state = state + kc.transpose(-2, -1) @ vc
+        z = z + kc.sum(dim=-2)
+
+    return torch.cat(out, dim=-2)
+```
+
+</CodeFrame>
+
+The chunked form is the one to implement. The purely recurrent version is $n$
+serial steps and trains at a fraction of the throughput; the purely parallel
+version reintroduces the $n^2$ term it was supposed to remove. Chunking pays
+$O(c^2)$ inside a chunk and $O(d^2)$ between chunks, and $c \approx 128$ is
+usually where the two balance on current hardware.

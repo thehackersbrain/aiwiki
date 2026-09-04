@@ -1,0 +1,132 @@
+---
+title: 'Counting the bytes'
+desc: 'Where training memory actually goes, and why the answer is rarely the weights.'
+lede: 'I spent a long time treating out-of-memory errors as something to react to. Doing the arithmetic once, in advance, turns a list of tricks into a decision procedure.'
+series: 'making-it-fit'
+part: 1
+minutes: 8
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['memory', 'training', 'foundations']
+related: [activation-memory-accounting, mixed-precision-training, memory-efficient-optimisers, gradient-checkpointing, zero-sharding]
+refs:
+  - cite: 'Korthikanti et al. — Reducing Activation Recomputation in Large Transformer Models (2022)'
+    id: 'arXiv:2205.05198'
+    href: https://arxiv.org/abs/2205.05198
+  - cite: 'Rajbhandari et al. — ZeRO: Memory Optimizations Toward Training Trillion Parameter Models (2019)'
+    id: 'arXiv:1910.02054'
+    href: https://arxiv.org/abs/1910.02054
+  - cite: 'Micikevicius et al. — Mixed Precision Training (2017)'
+    id: 'arXiv:1710.03740'
+    href: https://arxiv.org/abs/1710.03740
+---
+
+A 7B model in bf16 is 14 GB. An 80 GB card should fit it five times over. It does
+not fit once, and the first time that happened to me I reached for gradient
+checkpointing without knowing what I was trading away.
+
+The arithmetic takes ten minutes and it makes every subsequent decision obvious.
+
+### Four occupants
+
+<Eq lead caption="eq. 1 — mixed-precision AdamW, per parameter">
+
+$$
+\underbrace{2}_{\text{bf16 weights}} + \underbrace{2}_{\text{grads}} +
+\underbrace{4}_{\text{fp32 master}} + \underbrace{4+4}_{m,\;v}
+= 16 \;\text{bytes}
+$$
+
+</Eq>
+
+For 7B that is 112 GB. Before a single activation, and the card has 80.
+
+The piece that surprised me is the fp32 master copy. Mixed precision is
+advertised as halving memory and it *increases* weight memory — the bf16 copy is
+additional, not a replacement. The reason is that bf16 has seven mantissa bits,
+so adding a $10^{-7}$ update to a $10^{-2}$ parameter returns the parameter
+unchanged. The update is not rounded; it is discarded, and the parameter stops
+moving. The master copy exists so the optimiser has somewhere the arithmetic
+works.
+
+<Note label="annotation">
+Two thirds of that 16 is optimiser state. Not the model — the bookkeeping the
+optimiser keeps about the model. That single fact reorders the whole list of
+things worth trying.
+</Note>
+
+### The fifth occupant, which is the variable one
+
+Activations. Everything the forward pass computed that the backward pass will
+need, and it scales with batch and sequence rather than with parameters.
+
+<Eq caption="eq. 2 — per layer, per Korthikanti et al.">
+
+$$
+M_{\text{layer}} = s\,b\,h\left(34 + 5\,\frac{a \cdot s}{h}\right)
+$$
+
+</Eq>
+
+Two terms. The 34 is about a dozen tensors of size $sbh$ — layer norm inputs,
+the QKV projections, the FFN hidden state and its activation input, dropout
+masks. None individually large, and there are a lot of them across $L$ layers.
+
+The second term carries $s^2$, because the attention score matrix is
+$[b, a, s, s]$ and is stored per layer. At $s = 4096$, $a = 32$, $b = 4$ that is
+2.7 GB *per layer* against roughly 0.6 GB for everything else.
+
+So for a long-sequence run the answer to "where is my memory" is: the score
+matrices, by a factor of four or five, and everything else is noise.
+
+### Which is why the first move is free
+
+[FlashAttention](/entries/flash-attention) never writes the score matrix to
+memory. It tiles the computation, keeps a running softmax normaliser, and stores
+only the log-sum-exp statistics needed to recompute scores during the backward
+pass.
+
+The quadratic term goes to zero. Not reduced — gone, exactly, with no
+approximation and while being *faster* than the version that materialised it.
+
+<Note label="caveat">
+This is why I now write the formula down before touching anything else. I once
+enabled full gradient checkpointing — a 36% compute penalty — on a run whose real
+problem was the score matrices, on a stack that had FlashAttention available and
+switched off. The checkpointing worked. It also cost a third of the throughput to
+solve a problem that had a free solution.
+</Note>
+
+### The ladder, in order of what it costs
+
+Having the two equations turns the technique list into an ordering.
+
+| Move | Attacks | Cost |
+| --- | --- | --- |
+| FlashAttention | the $s^2$ term | none, negative |
+| smaller micro-batch + accumulation | all activations | wall-clock below ~8 |
+| selective recomputation | most of the 34 | ~4% FLOPs |
+| 8-bit optimiser states | the $4{+}4$ | none measured |
+| full recomputation | the 34 | ~36% FLOPs |
+| ZeRO / FSDP | the $16$, across ranks | collectives |
+| offload to host | anything | PCIe bandwidth |
+
+Work down it. Most runs stop after three rows.
+
+### The distinction that took me longest
+
+[ZeRO](/entries/zero-sharding) and gradient checkpointing sound like alternatives
+and address different occupants entirely. ZeRO shards parameters, gradients and
+optimiser state across data-parallel ranks — the 16 in eq. 1 — and does *nothing*
+for activations. Checkpointing addresses activations and does nothing for the 16.
+
+A run that is out of memory because of a long sequence will not be helped by
+ZeRO stage 3, however much it shards. A run that is out of memory because the
+optimiser state does not fit will not be helped by checkpointing. Knowing which
+number is large tells you which of the two you need, and the numbers are two
+equations away.
+
+<Rule label="Next" />
+
+Part 2 is about the largest single lever on that list — recomputation — and the
+argument for why it should never be applied uniformly.

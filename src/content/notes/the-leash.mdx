@@ -1,0 +1,174 @@
+---
+title: 'The leash'
+desc: 'The KL term is not a stabiliser. It is what keeps the reward meaningful, and PPO is what it costs.'
+lede: 'Write the constrained objective down and the optimal policy has a closed form you cannot sample from. Everything about PPO follows from that one inconvenience.'
+series: 'alignment-from-scratch'
+part: 4
+minutes: 10
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['alignment', 'objectives', 'training']
+related: [kl-regularisation, proximal-policy-optimisation, reward-modelling, supervised-fine-tuning, grpo]
+refs:
+  - cite: 'Ziegler et al. — Fine-Tuning Language Models from Human Preferences (2019)'
+    id: 'arXiv:1909.08593'
+    href: https://arxiv.org/abs/1909.08593
+  - cite: 'Schulman et al. — Proximal Policy Optimization Algorithms (2017)'
+    id: 'arXiv:1707.06347'
+    href: https://arxiv.org/abs/1707.06347
+  - cite: 'Schulman — Approximating KL Divergence (2020)'
+    id: 'joschu.net'
+    href: http://joschu.net/blog/kl-approx.html
+  - cite: 'Ahmadian et al. — Back to Basics: Revisiting REINFORCE-Style Optimization for RLHF (2024)'
+    id: 'arXiv:2402.14740'
+    href: https://arxiv.org/abs/2402.14740
+---
+
+Part 3 ended with a reward that is only valid near where it was fitted. The
+objective has to say so.
+
+<Eq lead caption="eq. 1 — maximise reward, but not too far from home">
+
+$$
+\max_{\pi} \; \mathbb{E}_{y \sim \pi}\bigl[r(x, y)\bigr]
+\;-\; \beta\, \mathrm{KL}\bigl(\pi \,\|\, \pi_{\text{ref}}\bigr)
+$$
+
+</Eq>
+
+$\pi_{\text{ref}}$ is the [SFT model](/entries/supervised-fine-tuning) from part
+2, frozen. $\beta$ decides how far the policy may travel.
+
+I had read the KL term as a stabiliser — the kind of thing you add to stop
+training exploding. It is not. Given part 3, it is a *validity condition*: it
+keeps the policy inside the region where the reward model is still correlated
+with what the reward model is a proxy for. Remove it and the optimisation is
+maximising a function that is meaningless where it is heading.
+
+### The closed form
+
+Eq. 1 has an exact solution, and it is worth deriving because part 5 is entirely
+a consequence of it.
+
+<Eq caption="eq. 2 — the optimal policy, for any reward">
+
+$$
+\pi^{*}(y \mid x) = \frac{1}{Z(x)}\, \pi_{\text{ref}}(y \mid x)\,\exp\!\left(\frac{r(x,y)}{\beta}\right)
+$$
+
+</Eq>
+
+The reference distribution, reweighted by exponentiated reward. It is clean, it
+is exactly right, and it is useless — $Z(x)$ sums over every possible sequence,
+so the policy cannot be normalised, cannot be sampled from, and cannot be
+computed.
+
+So we approximate it by gradient ascent. That is the entire reason reinforcement
+learning is in the picture: not because language generation is naturally a
+control problem, but because the objective we want has a solution we cannot
+write down.
+
+<Note label="annotation">
+Notice also that it is <em>reverse</em> KL, not forward. Reverse KL is
+mode-seeking: it punishes the policy for putting mass where the reference has
+none, and tolerates dropping modes the reference had. Aligned models being less
+diverse than their base models is not a side effect anyone failed to prevent —
+the objective explicitly permits it.
+</Note>
+
+### What PPO adds, and why
+
+Gradient ascent on eq. 1 needs samples from $\pi$, and $\pi$ changes with every
+update. Naively that means generating fresh samples for every gradient step,
+which is prohibitively expensive when generation is the slow part.
+
+PPO reuses each batch of samples for several updates, which makes them
+*off-policy* — drawn from an older version of the policy than the one being
+updated. Correcting for that needs an importance ratio, and importance ratios
+have unbounded variance, so PPO clips.
+
+<Eq caption="eq. 3 — the clipped surrogate">
+
+$$
+\mathcal{L} = \mathbb{E}\Bigl[\min\bigl(\rho_t A_t,\; \mathrm{clip}(\rho_t, 1-\epsilon, 1+\epsilon)\,A_t\bigr)\Bigr],
+\qquad
+\rho_t = \frac{\pi_\theta(y_t)}{\pi_{\text{old}}(y_t)}
+$$
+
+</Eq>
+
+The clip removes the incentive to move any single token's probability very far in
+one update. Combined with the KL term there are now *two* constraints on how far
+things move, at different scales — the clip bounds per-update drift from the
+previous policy, the KL bounds total drift from the SFT model. Conflating them
+cost me an afternoon once; they are unrelated mechanisms that happen to look
+similar.
+
+### Four models
+
+This is the part that shapes practice more than any equation.
+
+| Model | Role | Trained |
+| --- | --- | --- |
+| policy | the thing being improved | yes |
+| reference | the KL anchor | frozen |
+| reward | scores completions | frozen |
+| value | estimates the baseline for advantages | yes |
+
+Four copies resident simultaneously, two of them receiving gradients. For a 70B
+policy that is a serious amount of hardware, before any of the usual difficulties
+of getting PPO to converge.
+
+<Note label="caveat">
+The value model is the piece most often glossed over and the one that causes the
+most trouble. It has to estimate the expected return from a partial sequence,
+starting from a random initialisation, while the policy it is estimating for is
+changing underneath it. Early training is the value model being wrong, which
+makes the advantages wrong, which makes the policy updates noise.
+</Note>
+
+### Estimating the KL badly
+
+One small thing that took me longer than it should have. The KL is estimated from
+samples, and the obvious estimator is bad.
+
+<Eq caption="eq. 4 — three estimators of the same quantity">
+
+$$
+k_1 = \log\frac{\pi}{\pi_{\text{ref}}}
+\qquad
+k_2 = \tfrac{1}{2}\log^2\frac{\pi}{\pi_{\text{ref}}}
+\qquad
+k_3 = \frac{\pi_{\text{ref}}}{\pi} - 1 - \log\frac{\pi_{\text{ref}}}{\pi}
+$$
+
+</Eq>
+
+$k_1$ is unbiased and enormously noisy, and is negative roughly half the time —
+an estimate of a provably non-negative quantity that keeps coming out negative
+makes for a useless diagnostic even when its expectation is right. $k_3$ is
+unbiased *and* non-negative, for one extra exponential. Use it. The reference for
+this is a blog post rather than a paper, which is a small lesson of its own about
+where the operational knowledge lives.
+
+### Is any of it necessary
+
+Ahmadian et al. asked the obvious question — PPO was designed for continuous
+control with long episodes and dense rewards, and RLHF has a single terminal
+reward on a full response. Much of PPO's machinery is for a setting that does not
+apply.
+
+They removed most of it and found a REINFORCE-style estimator with a simple
+baseline matches or beats PPO on RLHF, at a fraction of the complexity. The value
+model, the clipping, the advantage estimation — largely inherited rather than
+required.
+
+[GRPO](/entries/grpo) is the version of that argument that got adopted: sample
+$k$ responses per prompt, use their mean reward as the baseline, delete the value
+model. Three models instead of four, and it is what the reasoning models are
+trained with.
+
+<Rule label="Next" />
+
+The last part goes further and removes the reward model too — which is possible
+because of eq. 2, and which gives up something specific that is worth naming.

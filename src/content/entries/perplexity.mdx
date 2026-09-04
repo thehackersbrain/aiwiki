@@ -1,0 +1,92 @@
+---
+name: 'Perplexity'
+desc: 'Exponentiated mean negative log-likelihood over a held-out corpus.'
+category: 'evaluation'
+complexity: 'O(n)'
+path: 'evaluation/metrics'
+difficulty: 'introductory'
+described: '1977'
+status: 'common'
+statusNote: 'Indispensable for tracking a training run and close to useless for comparing models trained on different data or tokenisers.'
+revised: 2026-08-04
+added: 2025-02-26
+tags: ['metric']
+lede: 'The effective branching factor of a model’s predictions: the size of the uniform distribution that would be as hard to guess from.'
+implNote:
+  label: 'caveat'
+  html: 'Sliding-window evaluation must report its stride and window. Halving the stride reliably improves the number without improving the model.'
+related: [contamination-detection, elo-bradley-terry-scoring]
+refs:
+  - cite: 'Jelinek et al. — Perplexity: a measure of the difficulty of speech recognition tasks (1977)'
+    id: 'JASA 62'
+  - cite: 'Gao et al. — The Pile: An 800GB Dataset of Diverse Text (2020)'
+    id: 'arXiv:2101.00027'
+    href: https://arxiv.org/abs/2101.00027
+---
+
+Perplexity is the exponentiated cross-entropy per token. A perplexity of 12 means
+the model is, on average, as uncertain as if choosing uniformly among twelve
+options.
+
+<Eq caption="eq. 1" lead>
+
+$$
+\mathrm{PPL} = \exp\!\left( -\frac{1}{N} \sum_{i=1}^{N} \log p(x_i \mid x_{<i}) \right)
+$$
+
+</Eq>
+
+<Note label="caveat">
+Two models, two tokenisers, two perplexities, no comparison. The most common
+misreading of the number there is.
+</Note>
+
+It is not comparable across tokenisers. A model with a larger vocabulary spends
+fewer tokens on the same text, so its per-token perplexity falls without any
+improvement in modelling. Bits per byte normalises this away and is the only fair
+cross-model comparison.
+
+<Eq caption="eq. 2">
+
+$$
+\mathrm{BPB} = \frac{N_{\text{tokens}}}{N_{\text{bytes}}} \cdot \log_2 \mathrm{PPL}
+$$
+
+</Eq>
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor
+import torch.nn.functional as F
+
+
+@torch.no_grad()
+def perplexity(model, ids: Tensor, window: int = 2048, stride: int = 512):
+    nll, count = 0.0, 0
+    for start in range(0, ids.size(1) - 1, stride):
+        end = min(start + window, ids.size(1))
+        chunk = ids[:, start:end]
+        logits = model(chunk[:, :-1]).logits
+
+        # only score the tokens this stride is responsible for
+        scored = min(stride, chunk.size(1) - 1)
+        loss = F.cross_entropy(
+            logits[:, -scored:].flatten(0, 1),
+            chunk[:, -scored:].flatten(),
+            reduction="sum",
+        )
+        nll += loss.item()
+        count += scored
+    return torch.tensor(nll / count).exp().item()
+```
+
+</CodeFrame>
+
+Scoring only the last `stride` positions of each window is what makes the estimate
+a proper per-token average rather than a weighted one that double-counts the
+overlap. Sum the loss and divide once at the end; averaging per-chunk means and
+then averaging those weights short final chunks equally with full ones.

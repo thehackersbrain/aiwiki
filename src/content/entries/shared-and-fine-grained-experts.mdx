@@ -1,0 +1,148 @@
+---
+name: 'Shared and Fine-Grained Experts'
+desc: 'Many small experts, plus a few that every token uses.'
+category: 'architectures'
+complexity: 'O(k·d²/m)'
+path: 'architectures/sparse'
+difficulty: 'intermediate'
+described: '2024'
+status: 'standard'
+statusNote: 'The DeepSeekMoE arrangement, now the default. Qwen, Mixtral’s successors and most 2025 MoE models are some variant of it.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['sparse', 'scaling', 'core']
+lede: 'Two changes to the routed layer, both about what the experts are for. Split them finer so specialisation is possible, then hand the knowledge every token needs to a shared expert that is never routed.'
+metrics:
+  caption: 'DeepSeek-V3, per MoE layer'
+  rows:
+    - { label: 'Routed experts', value: '256' }
+    - { label: 'Active per token', value: '8' }
+    - { label: 'Shared experts', value: '1', accent: true }
+implNote:
+  label: 'annotation'
+  html: 'The shared expert is not a routing decision and must not be counted in the balancing loss. Including it is a common porting error and it skews the auxiliary term towards uniformity for no reason.'
+related: [mixture-of-experts-routing, expert-capacity-and-token-dropping, loss-free-load-balancing, product-key-memory, swiglu, sparse-upcycling]
+refs:
+  - cite: 'Dai et al. — DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models (2024)'
+    id: 'arXiv:2401.06066'
+    href: https://arxiv.org/abs/2401.06066
+  - cite: 'DeepSeek-AI — DeepSeek-V3 Technical Report (2024)'
+    id: 'arXiv:2412.19437'
+    href: https://arxiv.org/abs/2412.19437
+  - cite: 'Jiang et al. — Mixtral of Experts (2024)'
+    id: 'arXiv:2401.04088'
+    href: https://arxiv.org/abs/2401.04088
+---
+
+Mixtral has 8 experts and routes to 2. DeepSeek-V3 has 256 and routes to 8, plus
+one that is always on. The second arrangement is not a scaled-up version of the
+first; it is a different theory of what an expert is.
+
+### Fine granularity
+
+With 8 experts, each is a full-width feed-forward block and there are $\binom{8}{2} = 28$
+possible routings. With 64 experts each a quarter of the width, the same FLOPs
+buy $\binom{64}{8} \approx 4.4 \times 10^9$ combinations.
+
+<Eq lead caption="eq. 1 — split each expert m ways, route to m times as many">
+
+$$
+d_{ff} \to \frac{d_{ff}}{m}, \qquad k \to k\,m
+$$
+
+</Eq>
+
+FLOPs and parameters are both unchanged. What changes is the resolution of the
+routing decision — the model can compose a specialist combination per token
+instead of picking one of a handful of generalists.
+
+<Note label="annotation">
+The argument is about what an expert is forced to contain. At 8 experts, each has
+to handle a broad slice of the distribution and therefore ends up general; at
+256, an expert can afford to be about one thing, because the router can always
+add whatever else the token needs. Coarse granularity does not merely reduce
+choice, it actively prevents specialisation.
+</Note>
+
+The measured effect supports this. DeepSeekMoE reports that fine-grained experts
+show much lower activation overlap between unrelated inputs than coarse ones —
+that is, they genuinely specialise rather than all learning the same average
+function.
+
+### The shared expert
+
+Some knowledge is needed by every token: English syntax, the shape of the
+residual stream, the boilerplate of being a language model. With pure routing,
+every expert has to learn it separately, because any expert might be the one
+selected.
+
+That is a straightforward waste. The fix is to carve out one or two experts that
+are always active and never routed.
+
+<Eq caption="eq. 2 — always-on plus routed">
+
+$$
+y = x + \sum_{i \in \mathcal{S}} E_i(x) + \sum_{j \in \mathrm{top}_k} g_j \, E_j(x)
+$$
+
+</Eq>
+
+The shared expert absorbs the common knowledge; the routed ones are freed to hold
+what differs. It also has a useful side effect on stability — the layer is never
+a no-op for a token, so a [dropped
+routing](/entries/expert-capacity-and-token-dropping) degrades the contribution
+rather than removing it.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor, nn
+
+
+class DeepSeekMoE(nn.Module):
+    def __init__(self, dim: int, n_routed: int = 64, n_shared: int = 1, k: int = 6):
+        super().__init__()
+        # Fine-grained: each expert is a fraction of a normal FFN's width.
+        hidden = int(dim * 8 / 3 / (n_routed / 8))
+
+        self.shared = nn.ModuleList(FFN(dim, hidden) for _ in range(n_shared))
+        self.routed = nn.ModuleList(FFN(dim, hidden) for _ in range(n_routed))
+        self.gate = nn.Linear(dim, n_routed, bias=False)      # routed only
+        self.k = k
+
+    def forward(self, x: Tensor) -> Tensor:                   # [T, D]
+        y = sum(expert(x) for expert in self.shared)          # never gated
+
+        scores = self.gate(x).softmax(-1)
+        weight, idx = scores.topk(self.k, dim=-1)
+        weight = weight / weight.sum(-1, keepdim=True)        # renormalise the k
+
+        for slot in range(self.k):
+            for e, expert in enumerate(self.routed):
+                mask = idx[:, slot] == e
+                if mask.any():
+                    y[mask] += weight[mask, slot, None] * expert(x[mask])
+        return y
+```
+
+</CodeFrame>
+
+The renormalisation of the top-$k$ weights is the detail that differs between
+implementations. DeepSeek normalises after selection, so the routed contribution
+has consistent magnitude regardless of how confident the router was; Mixtral
+takes the softmax over the selected logits instead, which is nearly but not quite
+the same thing. Mismatching it against a checkpoint produces a model that is
+subtly and unfixably worse.
+
+<Rule label="What it costs" />
+
+Fine granularity is not free in practice, only in FLOPs. More experts means more
+tokens to sort, more all-to-all messages under [expert
+parallelism](/entries/expert-parallelism), and smaller matmuls that use the
+hardware less efficiently. Routing to 8 of 256 moves roughly four times the
+metadata of routing to 2 of 8, and the individual expert matmuls are a quarter
+the size — which is why implementations grouped by expert with a single batched
+matmul matter far more here than at coarse granularity.

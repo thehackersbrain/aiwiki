@@ -1,0 +1,120 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import Rail from '../../components/Rail.astro';
+import Breadcrumb from '../../components/Breadcrumb.astro';
+import Pager from '../../components/Pager.astro';
+import { allNotes, seriesGroups, relativeDate } from '../../lib/grimoire';
+import { breadcrumbs, siteNodes } from '../../lib/schema';
+
+const notes = await allNotes();
+const { groups, loose } = await seriesGroups();
+const unfinished = notes.filter((n) => n.data.unfinished).length;
+
+const DESCRIPTION =
+  'Explanatory notes: longer prose working through how a mechanism is arrived ' +
+  'at, rather than the reference statement of what it is.';
+---
+
+<BaseLayout
+  title="Notes"
+  tabTitle="Notes — AI Grimoire"
+  description={DESCRIPTION}
+  nav="notes"
+  schema={[
+    ...siteNodes(),
+    breadcrumbs([{ name: 'AI Grimoire', path: '/' }, { name: 'Notes' }]),
+  ]}
+>
+  <main class="mx-auto max-w-[1180px] animate-rise px-6 pb-20 sm:px-12">
+    <Breadcrumb trail={[{ label: 'AI Grimoire', href: '/' }, { label: 'Notes' }]} />
+
+    <Rail labelAs="h2" label="Working out" class="pt-12 pb-9">
+      <h1 class="mt-0 mb-4 text-[34px] font-normal tracking-[-0.022em] text-bone">Notes</h1>
+      <p class="mt-0 mb-4 max-w-[62ch] text-[18px] text-lede text-pretty">
+        The entries state what a thing is. These state how I got there — the
+        derivation taken slowly, the wrong turning that made the right one make
+        sense, the question I could not answer and left standing.
+      </p>
+      <p class="m-0 max-w-[62ch] text-[16px] text-dim italic">
+        {notes.length}{' '}
+        {notes.length === 1 ? 'note' : 'notes'}{
+          unfinished > 0 &&
+            `, ${unfinished} of them still open — marked at the top rather than quietly left`
+        }.
+      </p>
+    </Rail>
+
+    {
+      groups
+        .filter((g) => g.notes.length > 0)
+        .map(({ series, notes: parts }) => (
+          <Rail labelAs="h2" label={series.data.name} divider={false} class="pt-11">
+            <span slot="rail" class="block font-mono text-[11px] text-dim-3">
+              {parts.length} parts
+            </span>
+
+            <p class="mt-0 mb-1 max-w-[62ch] text-[15px] text-mute-3 text-pretty">
+              {series.data.blurb}
+            </p>
+
+            <div data-paged>
+              {parts.map((note) => (
+                <a
+                  href={`/notes/${note.id}`}
+                  data-row
+                  class="grid grid-cols-[30px_minmax(0,1fr)] items-baseline gap-x-5 gap-y-1 border-b border-rule-faint py-4.5 transition-colors hover:bg-raise sm:grid-cols-[30px_minmax(0,1fr)_90px]"
+                >
+                  <span class="font-mono text-[11px] text-dim-3">
+                    {String(note.data.part ?? 0).padStart(2, '0')}
+                  </span>
+                  <div>
+                    <div class="text-[20px] tracking-[-0.014em] text-bone">
+                      {note.data.title}
+                      {note.data.unfinished && (
+                        <span class="eyebrow ml-2.5 text-accent">open</span>
+                      )}
+                    </div>
+                    <div class="mt-1 text-[15px] text-mute-3 text-pretty">{note.data.desc}</div>
+                  </div>
+                  <span class="col-start-2 font-mono text-[11px] text-dim-2 sm:col-start-3 sm:text-right">
+                    {note.data.minutes} min
+                  </span>
+                </a>
+              ))}
+              <Pager label={`${series.data.name} pages`} />
+            </div>
+          </Rail>
+        ))
+    }
+
+    {
+      loose.length > 0 && (
+        <Rail labelAs="h2" label="Loose notes" divider={false} class="pt-11">
+          <div data-paged>
+            {loose.map((note) => (
+              <a
+                href={`/notes/${note.id}`}
+                data-row
+                class="grid grid-cols-[minmax(0,1fr)_90px] items-baseline gap-x-5 gap-y-1 border-b border-rule-faint py-4.5 transition-colors hover:bg-raise"
+              >
+                <div>
+                  <div class="text-[20px] tracking-[-0.014em] text-bone">
+                    {note.data.title}
+                    {note.data.unfinished && (
+                      <span class="eyebrow ml-2.5 text-accent">open</span>
+                    )}
+                  </div>
+                  <div class="mt-1 text-[15px] text-mute-3 text-pretty">{note.data.desc}</div>
+                </div>
+                <span class="font-mono text-[11px] text-dim-2 sm:text-right">
+                  {relativeDate(note.data.revised)}
+                </span>
+              </a>
+            ))}
+            <Pager label="Loose note pages" />
+          </div>
+        </Rail>
+      )
+    }
+  </main>
+</BaseLayout>

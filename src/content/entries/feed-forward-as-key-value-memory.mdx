@@ -1,0 +1,148 @@
+---
+name: 'Feed-Forward as Key-Value Memory'
+desc: 'Read the FFN as a lookup table: W₁ rows are patterns, W₂ columns are what gets written.'
+category: 'architectures'
+complexity: '—'
+path: 'architectures/ffn'
+difficulty: 'advanced'
+described: '2020'
+status: 'common'
+statusNote: 'The standard reading of what the block does. Well supported, load-bearing for model editing, and known to be incomplete — polysemantic neurons break the clean version of it.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['ffn', 'interpretability', 'core']
+lede: 'Write the feed-forward block as a weighted sum of W₂’s columns and it stops looking like a nonlinear map. It looks like a memory with d_ff entries, addressed by pattern match.'
+implNote:
+  label: 'annotation'
+  html: 'The reading is what makes model editing tractable: if a fact is a small set of entries in W₂, changing it is a rank-one update rather than a fine-tune. ROME and MEMIT are that idea carried out.'
+related: [feed-forward-networks, activation-sparsity, sparse-autoencoders, logit-lens, steering-vectors, squared-relu]
+refs:
+  - cite: 'Geva et al. — Transformer Feed-Forward Layers Are Key-Value Memories (2020)'
+    id: 'arXiv:2012.14913'
+    href: https://arxiv.org/abs/2012.14913
+  - cite: 'Meng et al. — Locating and Editing Factual Associations in GPT (2022)'
+    id: 'arXiv:2202.05262'
+    href: https://arxiv.org/abs/2202.05262
+  - cite: 'Geva et al. — Transformer Feed-Forward Layers Build Predictions by Promoting Concepts in the Vocabulary Space (2022)'
+    id: 'arXiv:2203.14680'
+    href: https://arxiv.org/abs/2203.14680
+---
+
+The feed-forward block is usually written as two matmuls with something in
+between. Expand the second one by column and a different object appears.
+
+<Eq lead caption="eq. 1 — a weighted sum over d_ff stored vectors">
+
+$$
+\mathrm{FFN}(x) = \sum_{i=1}^{d_{ff}} \underbrace{\phi\bigl(k_i^\top x\bigr)}_{\text{how well } x \text{ matches}} \cdot \underbrace{v_i}_{\text{what to write}}
+$$
+
+</Eq>
+
+where $k_i$ is the $i$-th row of $W_1$ and $v_i$ the $i$-th column of $W_2$. The
+block holds $d_{ff}$ key-value pairs. A token's activation is a soft address into
+them, and the output is whatever the matching entries say to write to the
+residual stream.
+
+This is not an analogy imposed from outside — it is the same arithmetic,
+regrouped. What makes it a claim rather than a rewrite is the empirical part:
+the keys correspond to human-recognisable input patterns, and the values
+correspond to recognisable output distributions.
+
+### What the keys match
+
+Geva et al. took each $k_i$, found the training examples that activate it most
+strongly, and had annotators describe them. Almost every neuron examined had a
+describable trigger, and the triggers were stratified by depth: shallow layers
+keyed on surface patterns — a specific suffix, a bigram, a formatting
+convention — and deep layers on semantic ones, such as "a sentence about a
+military rank" or "the object of a purchase".
+
+<Note label="caveat">
+"Almost every neuron had a describable trigger" is weaker than it sounds. Later
+work established that neurons are systematically polysemantic — one neuron
+participating in several unrelated features because the model has more features
+than dimensions. The clean one-neuron-one-concept reading is an approximation,
+and <a href="/entries/sparse-autoencoders">sparse autoencoders</a> exist to
+recover the features the neuron basis mixes together.
+</Note>
+
+### What the values write
+
+The second paper is the sharper result. Project $v_i$ through the unembedding
+matrix and read the top tokens — the same operation as the
+[logit lens](/entries/logit-lens), applied to a weight rather than an activation.
+The result is interpretable: a value vector's top tokens form a coherent
+category, and it is usually the category that plausibly follows the key's
+trigger.
+
+<Eq caption="eq. 2 — each entry is a vote in vocabulary space">
+
+$$
+\mathrm{logits} \;\approx\; W_U\Bigl(x + \sum_i \phi(k_i^\top x)\, v_i\Bigr)
+= W_U x + \sum_i \phi(k_i^\top x)\, \bigl(W_U v_i\bigr)
+$$
+
+</Eq>
+
+The block does not compute a distribution. It casts weighted votes over the
+vocabulary, and the residual stream accumulates them across layers — which is
+why the logit lens shows the prediction sharpening layer by layer rather than
+appearing at the end.
+
+### Editing
+
+If a fact is stored as a small set of entries, changing it should not require
+retraining. ROME formalises this: treat the block as a linear associative memory
+$W_2$ satisfying $W_2 K \approx V$, and solve for the minimal update that maps a
+chosen key to a chosen value while disturbing the others as little as possible.
+
+<Eq caption="eq. 3 — a rank-one edit with a least-squares constraint">
+
+$$
+\hat{W_2} = W_2 + \Lambda\bigl(C^{-1}k_*\bigr)^\top,
+\qquad C = \mathbb{E}\bigl[k k^\top\bigr]
+$$
+
+</Eq>
+
+It works, and the caveats are instructive. Causal tracing localises a fact to a
+specific layer range, and edits applied elsewhere do not take. Edits generalise
+to paraphrases but frequently not to the reversed relation. And at scale the edits
+interfere — MEMIT extends the method to thousands, and past that the model
+degrades.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch · read a block as a memory">
+
+```python
+import torch
+from torch import Tensor
+
+
+@torch.no_grad()
+def describe_entry(w1: Tensor, w2: Tensor, unembed: Tensor, i: int, k: int = 10):
+    """What entry i matches on, and what it writes to the vocabulary."""
+    key, value = w1[i], w2[:, i]                     # [D], [D]
+
+    # The value's vote, read directly in token space.
+    promoted = (unembed @ value).topk(k).indices     # [k] token ids
+    return key, promoted
+
+
+@torch.no_grad()
+def entry_contributions(w1: Tensor, w2: Tensor, x: Tensor, k: int = 10):
+    """Which entries actually fired for this token, ranked by contribution."""
+    h = torch.relu(w1 @ x)                           # [d_ff]
+    # Not just activation: an entry with a large activation and a small value
+    # vector contributes little.
+    strength = h * w2.norm(dim=0)
+    return strength.topk(k)
+```
+
+</CodeFrame>
+
+That second function is the one worth keeping. Ranking by activation alone is the
+common mistake and it is misleading — what reaches the residual stream is
+$h_i \|v_i\|$, and the two orderings differ substantially.

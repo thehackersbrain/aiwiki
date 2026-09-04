@@ -1,0 +1,185 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import Rail from '../components/Rail.astro';
+import {
+  relativeDate,
+  allCategories,
+  allEntries,
+  counts,
+  entriesIn,
+  recentlyRevised,
+  seriesGroups,
+} from '../lib/grimoire';
+import { collectionNode, siteNodes } from '../lib/schema';
+import { SITE_DESCRIPTION, SITE_META_DESCRIPTION, SITE_TITLE } from '../consts';
+
+const entries = await allEntries();
+const { total, stubs } = await counts();
+const featured = await recentlyRevised(4);
+
+const categories = await Promise.all(
+  (await allCategories()).map(async (cat) => ({
+    cat,
+    count: (await entriesIn(cat.id)).length,
+  }))
+);
+const categoryName = new Map(
+  (await allCategories()).map((c) => [c.id, c.data.name])
+);
+
+const randomTarget = entries[Math.floor(entries.length / 2)]!;
+
+const { groups: noteSeries } = await seriesGroups();
+const openSeries = noteSeries.filter((g) => g.notes.length > 0);
+---
+
+<BaseLayout
+  title={SITE_TITLE}
+  description={SITE_META_DESCRIPTION}
+  nav="home"
+  imageAlt={`${SITE_TITLE} — a field reference`}
+  schema={[
+    ...siteNodes(),
+    collectionNode({
+      path: '/',
+      name: SITE_TITLE,
+      description: SITE_DESCRIPTION,
+      entries: featured,
+    }),
+  ]}
+>
+  <main class="mx-auto max-w-[1180px] animate-rise px-6 sm:px-12">
+    <Rail class="pt-16 pb-16">
+      <div slot="rail" class="font-mono text-[11px] leading-[1.9] tracking-[0.04em] text-dim">
+        <div class="label mb-3 text-accent">Standing note</div>
+        <div>
+          Kept open, revised often.<br />
+          {total} entries, {stubs} stubs.<br />
+          No prose written by a model.
+        </div>
+      </div>
+
+      <h1
+        class="mt-0 mb-6 max-w-[26ch] text-[38px] leading-[1.1] font-normal tracking-[-0.028em] text-bone sm:text-[52px]"
+      >
+        The AI Engineer's Grimoire
+      </h1>
+      <p class="mt-0 mb-4 max-w-[62ch] text-[18px] text-lede text-pretty">
+        A field reference for how these systems actually work: attention and its cheaper
+        cousins, training dynamics that fail quietly, inference kernels, the
+        interpretability toolkit, and the attack surface that follows all of it.
+      </p>
+      <p class="mt-0 mb-8 max-w-[62ch] text-[16px] text-dim italic">
+        Each entry begins with the maths and ends with something you can run. Nothing is
+        explained twice.
+      </p>
+      <div
+        class="flex flex-wrap gap-x-6 gap-y-3 font-mono text-[11px] tracking-[0.14em] uppercase"
+      >
+        <a href="/entries" class="border-b border-accent pb-[3px] text-accent">
+          Browse the index →
+        </a>
+        <a
+          href={`/entries/${randomTarget.id}`}
+          data-random
+          class="border-b border-transparent pb-[3px] text-dim transition-colors hover:border-edge-hi hover:text-chalk"
+        >
+          Random entry
+        </a>
+      </div>
+    </Rail>
+
+    <Rail labelAs="h2" label="Categories">
+      {
+        categories.map(({ cat, count }) => (
+          <a
+            href={`/categories/${cat.id}`}
+            class="grid grid-cols-[26px_minmax(0,1fr)] items-baseline gap-x-5 gap-y-1 border-b border-rule-faint py-3.5 transition-colors hover:bg-raise sm:grid-cols-[26px_minmax(0,1fr)_70px]"
+          >
+            <span class="font-mono text-[11px] text-dim-3">{cat.data.num}</span>
+            <div>
+              <span class="text-[19px] tracking-[-0.012em] text-bone">{cat.data.name}</span>
+              <span class="text-[15px] text-mute-3"> — {cat.data.blurb}</span>
+            </div>
+            <span class="col-start-2 font-mono text-[11px] text-dim-2 sm:col-start-3 sm:text-right">
+              {count}
+            </span>
+          </a>
+        ))
+      }
+    </Rail>
+
+    {
+      openSeries.length > 0 && (
+        <Rail labelAs="h2" label="Notes">
+          <p class="mt-0 mb-5 max-w-[62ch] text-[16px] text-mute-3 text-pretty">
+            The entries state the result. The notes are the working out — read in
+            order, or not at all.
+          </p>
+          {openSeries.map(({ series, notes }) => (
+            <div class="border-b border-rule-faint py-5">
+              <a
+                href="/notes"
+                class="text-[22px] leading-[1.3] tracking-[-0.014em] text-bone hover:text-accent"
+              >
+                {series.data.name}
+              </a>
+              <div class="mt-1 max-w-[64ch] text-[15px] text-mute-3 text-pretty">
+                {series.data.blurb}
+              </div>
+              <div class="mt-3 flex flex-wrap gap-x-4 gap-y-1.5 font-mono text-[11px]">
+                {notes.map((note) => (
+                  <a href={`/notes/${note.id}`} class="text-dim-2 hover:text-chalk">
+                    <span class="text-dim-3">
+                      {String(note.data.part ?? 0).padStart(2, '0')}
+                    </span>{' '}
+                    {note.data.title}
+                  </a>
+                ))}
+              </div>
+            </div>
+          ))}
+        </Rail>
+      )
+    }
+
+    <Rail labelAs="h2" label="Recent revisions" divider={false} class="pt-11 pb-5">
+      {
+        featured.map((e) => (
+          <a
+            href={`/entries/${e.id}`}
+            class="grid grid-cols-1 items-baseline gap-x-7 gap-y-2 border-b border-rule-faint py-5 transition-colors hover:bg-raise sm:grid-cols-[minmax(0,1fr)_110px]"
+          >
+            <div>
+              <div class="text-[22px] leading-[1.3] tracking-[-0.014em] text-bone">
+                {e.data.name}
+              </div>
+              <div class="mt-1 text-[15px] text-mute-2 text-pretty">{e.data.desc}</div>
+              <div class="eyebrow mt-2.5 text-dim-2">
+                {categoryName.get(e.data.category.id)} · revised {relativeDate(e.data.revised)}
+              </div>
+            </div>
+            <div class="font-mono text-[12px] text-accent sm:text-right">
+              {e.data.complexity}
+            </div>
+          </a>
+        ))
+      }
+    </Rail>
+  </main>
+</BaseLayout>
+
+<script>
+  // ── Random entry ────────────────────────────────────────────────────────
+  const random = document.querySelector<HTMLAnchorElement>('[data-random]');
+  random?.addEventListener('click', (event) => {
+    const slugs = window.__GRIMOIRE_SLUGS__;
+    if (!slugs?.length) return;
+    event.preventDefault();
+    window.location.href = `/entries/${slugs[Math.floor(Math.random() * slugs.length)]}`;
+  });
+</script>
+
+<script is:inline define:vars={{ slugs: entries.map((e) => e.id) }}>
+  window.__GRIMOIRE_SLUGS__ = slugs;
+</script>

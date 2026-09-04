@@ -1,0 +1,140 @@
+---
+name: 'Attention Sinks'
+desc: 'Softmax must sum to one, so heads need somewhere to dump mass; evict it and generation collapses.'
+category: 'architectures'
+complexity: '—'
+path: 'architectures/attention'
+difficulty: 'intermediate'
+described: '2023'
+status: 'standard'
+statusNote: 'Not a technique to adopt so much as a property to account for. Any streaming or windowed cache that ignores it is broken.'
+revised: 2026-08-31
+added: 2025-05-19
+tags: ['attention', 'inference', 'long-context']
+lede: 'The first few tokens of a sequence receive enormous attention mass regardless of content. This is not a bug to be fixed but a consequence of normalisation — and dropping those tokens from a sliding window destroys the model.'
+metrics:
+  caption: 'Llama-2-7B, first four tokens, mean over heads'
+  rows:
+    - { label: 'Mass on token 0', value: '> 50%' }
+    - { label: 'Layers affected', value: '3 … 32' }
+    - { label: 'PPL without them', value: '5 → 10³', accent: true }
+implNote:
+  label: 'in practice'
+  html: 'Four sink tokens is the number that recovers full perplexity in the original experiments; one is not enough and sixteen is no better. Keep the <em>first</em> tokens, not the most-attended ones — position matters more than content here.'
+related: [sliding-window-attention, scaled-dot-product-attention, prefix-caching, paged-attention]
+refs:
+  - cite: 'Xiao et al. — Efficient Streaming Language Models with Attention Sinks (2023)'
+    id: 'arXiv:2309.17453'
+    href: https://arxiv.org/abs/2309.17453
+  - cite: 'Darcet et al. — Vision Transformers Need Registers (2023)'
+    id: 'arXiv:2309.16588'
+    href: https://arxiv.org/abs/2309.16588
+  - cite: 'Bondarenko et al. — Quantizable Transformers: Removing Outliers by Helping Attention Heads Do Nothing (2023)'
+    id: 'arXiv:2306.12929'
+    href: https://arxiv.org/abs/2306.12929
+---
+
+A softmax row sums to one. A head that has nothing to retrieve at a given
+position cannot simply attend to nothing — it has to put the mass somewhere. What
+it learns to do is put it on a position whose value vector is close to useless,
+and the earliest tokens are the natural candidates: every query in the sequence
+can see them, so they are the only positions available to *all* rows.
+
+<Note label="annotation">
+This is a structural argument, and it predicts the phenomenon should disappear
+under a normalisation that permits abstention. It does — see the softmax-plus-one
+variant below.
+</Note>
+
+The effect is large and it is not subtle. In a trained decoder, the first token
+routinely receives more than half the attention mass in most heads of most
+layers, and it does so whether that token is a `<bos>` marker, a full stop, or a
+word chosen at random.
+
+### Why sliding windows break
+
+<Eq caption="eq. 1 — the row that has to sum to one" lead>
+
+$$
+\sum_{j \in \mathcal{W}(i)} A_{ij} = 1
+\qquad \text{for every } i, \text{ whatever } \mathcal{W} \text{ contains}
+$$
+
+</Eq>
+
+A [sliding window](/entries/sliding-window-attention) evicts the oldest tokens as
+generation proceeds. Once the window has moved past position 0, the sink is gone,
+and the mass that used to land there is redistributed over the tokens that
+remain — tokens the head had no intention of reading. Perplexity does not degrade
+gracefully; it explodes, typically the moment the first token leaves the cache.
+
+The fix is almost embarrassingly cheap: keep the first four tokens pinned in the
+cache permanently and slide the window over everything after them. No retraining,
+no architectural change, and streaming generation over millions of tokens becomes
+stable.
+
+### The same thing under other names
+
+<Note label="aside">
+Vision transformers show it too. Darcet et al. found high-norm artefact tokens in
+background patches doing the same job, and fixed it by adding explicit register
+tokens with no image content attached.
+</Note>
+
+Read as "the softmax cannot express *no-op*", the phenomenon connects to two
+others. Quantisation researchers found the same heads produce extreme activation
+outliers, precisely because forcing mass onto a useless position requires a large
+value to be scaled down — which is what makes those layers hard to quantise. And
+the proposed remedy is the same in both literatures: give the softmax a
+denominator term that belongs to no position at all.
+
+<Eq caption="eq. 2 — softmax-plus-one, an escape valve with no key attached">
+
+$$
+A_{ij} = \frac{\exp(s_{ij})}{1 + \sum_{k} \exp(s_{ik})}
+$$
+
+</Eq>
+
+With that extra $1$, a row may sum to less than one, and a head that wants to do
+nothing can. Models trained this way show neither sinks nor the associated
+outliers — but it is a pre-training change, which is why the pinned-token
+workaround is what gets used on models that already exist.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · streaming KV cache">
+
+```python
+import torch
+from torch import Tensor
+
+
+class SinkCache:
+    """Sliding window that never evicts the first `n_sink` positions."""
+
+    def __init__(self, n_sink: int = 4, window: int = 4096) -> None:
+        self.n_sink, self.window = n_sink, window
+        self.k: Tensor | None = None
+        self.v: Tensor | None = None
+
+    def append(self, k: Tensor, v: Tensor) -> tuple[Tensor, Tensor]:  # [B, H, T, D]
+        self.k = k if self.k is None else torch.cat([self.k, k], dim=-2)
+        self.v = v if self.v is None else torch.cat([self.v, v], dim=-2)
+
+        if self.k.size(-2) > self.n_sink + self.window:
+            keep = self.k.size(-2) - self.window
+            # Sinks, then the tail. The gap in between is simply dropped.
+            self.k = torch.cat([self.k[..., : self.n_sink, :], self.k[..., keep:, :]], dim=-2)
+            self.v = torch.cat([self.v[..., : self.n_sink, :], self.v[..., keep:, :]], dim=-2)
+
+        return self.k, self.v
+```
+
+</CodeFrame>
+
+One detail decides whether this works: positions must be assigned by *index
+within the cache*, not by absolute position in the stream. With RoPE that means
+applying the rotation at attention time rather than when the key is first
+written, so the sinks stay adjacent to the window instead of drifting arbitrarily
+far from it. Cache the unrotated keys.

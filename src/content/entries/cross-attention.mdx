@@ -1,0 +1,134 @@
+---
+name: 'Cross-Attention'
+desc: 'Queries from one sequence, keys and values from another.'
+category: 'architectures'
+complexity: 'O(n·m·d)'
+memory: 'O(n·m)'
+path: 'architectures/attention'
+difficulty: 'introductory'
+described: '2017'
+status: 'common'
+statusNote: 'Displaced by putting the condition in the context for text, and still the right structure when the condition is large, fixed, or in another modality.'
+revised: 2026-08-20
+added: 2025-03-02
+tags: ['attention', 'conditioning', 'multimodal']
+lede: 'The same operation with its arguments drawn from two places: queries from the sequence being written, keys and values from the thing being conditioned on.'
+implNote:
+  label: 'annotation'
+  html: 'The keys and values depend only on the condition, so they are computed once and reused for every decoding step — a cross-attention cache never grows.'
+related: [scaled-dot-product-attention, causal-masking, multi-head-attention, prefix-caching]
+refs:
+  - cite: 'Vaswani et al. — Attention Is All You Need (2017)'
+    id: 'arXiv:1706.03762'
+    href: https://arxiv.org/abs/1706.03762
+  - cite: 'Bahdanau et al. — Neural Machine Translation by Jointly Learning to Align and Translate (2014)'
+    id: 'arXiv:1409.0473'
+    href: https://arxiv.org/abs/1409.0473
+  - cite: 'Alayrac et al. — Flamingo: a Visual Language Model for Few-Shot Learning (2022)'
+    id: 'arXiv:2204.14198'
+    href: https://arxiv.org/abs/2204.14198
+---
+
+Self-attention takes $Q$, $K$ and $V$ from one sequence. Cross-attention takes
+$Q$ from the sequence being generated and $K, V$ from a second sequence — an
+encoded source sentence, a set of image patches, a retrieved document.
+
+<Eq caption="eq. 1 — Y conditions X" lead>
+
+$$
+\mathrm{CrossAttn}(X, Y) = \softmax\!\left( \frac{(X W^Q)(Y W^K)^{\top}}{\sqrt{d_k}} \right) (Y W^V)
+$$
+
+</Eq>
+
+<Note label="aside">
+Historically this came first. Bahdanau attention was cross-attention between a
+decoder RNN and an encoder's hidden states; self-attention was the later
+generalisation.
+</Note>
+
+Nothing about the operation changes. The attention matrix is $n \times m$ rather
+than $n \times n$, and it is not square, so a causal mask does not apply to it —
+every generated position may see the whole condition. Causality is a property of
+the *self*-attention in the same block, not of the cross-attention.
+
+### The cache does not grow
+
+$K$ and $V$ are functions of $Y$ alone. During generation $Y$ is fixed, so both
+are computed once at the start and reused for every step. Where the self-attention
+cache grows by one row per token, the cross-attention cache is constant — which
+is why encoder–decoder models decode with a flatter memory profile than their
+decoder-only equivalents at the same total context.
+
+<Eq caption="eq. 2 — per-layer cache after t generated tokens">
+
+$$
+\underbrace{2 \, h \, d_h \, m}_{\text{cross, fixed}}
+\;+\;
+\underbrace{2 \, h \, d_h \, t}_{\text{self, growing}}
+$$
+
+</Eq>
+
+### Where it is still used
+
+<Note label="in practice">
+Decoder-only models condition by concatenation instead: put the condition in the
+prompt and let self-attention do the work. It is simpler and it scales, which is
+most of why it won.
+</Note>
+
+Translation and summarisation moved to decoder-only models with the condition in
+the context. Cross-attention survived in places where the condition is large,
+fixed, and in a different modality — Flamingo-style gated cross-attention layers
+that inject vision features into a frozen language model, diffusion U-Nets
+attending to text embeddings, and retrieval architectures where re-encoding the
+document into the prompt each step would be wasteful.
+
+The trade is the usual one. Concatenation is uniform and lets the condition and
+the generation interact at every layer; cross-attention keeps the two
+representations separate, which is cheaper when the condition is long and makes
+it possible to freeze one side.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor, nn
+
+
+class CrossAttention(nn.Module):
+    def __init__(self, d_model: int, n_heads: int) -> None:
+        super().__init__()
+        self.h = n_heads
+        self.d_head = d_model // n_heads
+        self.q = nn.Linear(d_model, d_model, bias=False)
+        self.kv = nn.Linear(d_model, 2 * d_model, bias=False)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+
+    def encode(self, y: Tensor) -> tuple[Tensor, Tensor]:
+        """Run once per condition; the result is the whole cross-attention cache."""
+        b, m, _ = y.shape
+        k, v = (
+            t.view(b, m, self.h, self.d_head).transpose(1, 2)
+            for t in self.kv(y).chunk(2, dim=-1)
+        )
+        return k, v
+
+    def forward(self, x: Tensor, kv: tuple[Tensor, Tensor]) -> Tensor:
+        b, n, _ = x.shape
+        q = self.q(x).view(b, n, self.h, self.d_head).transpose(1, 2)
+        # No causal mask: the condition is fully visible from every position.
+        out = torch.nn.functional.scaled_dot_product_attention(q, *kv)
+        out = out.transpose(1, 2).reshape(b, n, self.h * self.d_head)
+        return self.proj(out)
+```
+
+</CodeFrame>
+
+Separating `encode` from `forward` is not a stylistic choice — calling the KV
+projection inside the decoding loop is the single most common way to make an
+encoder–decoder model slow, because it recomputes an $m$-length projection for
+every generated token.

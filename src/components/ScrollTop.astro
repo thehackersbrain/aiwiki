@@ -1,0 +1,95 @@
+---
+/**
+ * Back to top.
+ *
+ * Rendered at the end of the body rather than in the header, for the same
+ * reason the search panel is: the header carries a backdrop-filter, which makes
+ * it the containing block for any `position: fixed` descendant, so a button
+ * nested inside it would be positioned against the header instead of the
+ * viewport.
+ *
+ * Hidden until there is enough page behind you to want it — a control that
+ * appears on a page you cannot scroll is clutter. It fades rather than popping,
+ * and it stays in the tab order only while it is visible.
+ */
+---
+
+<button
+  type="button"
+  data-scroll-top
+  hidden
+  aria-label="Back to top"
+  class="fixed right-6 bottom-6 z-40 flex size-10 items-center justify-center border border-edge bg-ink/80 text-mute-2 opacity-0 backdrop-blur-[6px] transition-[opacity,color,border-color] duration-200 hover:border-accent hover:text-chalk sm:right-9 sm:bottom-9 data-[visible]:opacity-100"
+>
+  <svg
+    viewBox="0 0 14 14"
+    width="13"
+    height="13"
+    fill="none"
+    stroke="currentColor"
+    stroke-width="1.4"
+    aria-hidden="true"
+  >
+    <path d="M7 11.5V2.8" stroke-linecap="round"></path>
+    <path d="M3.2 6.4 7 2.6l3.8 3.8" stroke-linecap="round" stroke-linejoin="round"></path>
+  </svg>
+</button>
+
+<script>
+  const button = document.querySelector<HTMLButtonElement>('[data-scroll-top]');
+
+  if (button) {
+    /** Roughly one screen of scrolling before the control is worth offering. */
+    const THRESHOLD = 600;
+
+    // `hidden` takes it out of the layout and the tab order; the data attribute
+    // drives the fade. Both are needed: opacity alone leaves an invisible
+    // button that can still be focused and clicked.
+    // The search overlay sits above this button and locks page scroll, so
+    // while it is open the button is both useless and reachable by Tab
+    // underneath the dialog. Suppress it for the duration.
+    const search = document.querySelector<HTMLElement>('[data-search-panel]');
+
+    let shown = false;
+    const sync = () => {
+      const want = window.scrollY > THRESHOLD && !(search && !search.hidden);
+      if (want === shown) return;
+      shown = want;
+
+      if (want) {
+        button.hidden = false;
+        // A frame between unhiding and the attribute, or the transition has
+        // nothing to animate from.
+        requestAnimationFrame(() => button.toggleAttribute('data-visible', true));
+      } else {
+        button.removeAttribute('data-visible');
+        button.addEventListener('transitionend', () => {
+          if (!shown) button.hidden = true;
+        }, { once: true });
+      }
+    };
+
+    button.addEventListener('click', () => {
+      const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+      window.scrollTo({ top: 0, behavior: reduced ? 'auto' : 'smooth' });
+      // Send the caret back with the view, so the next Tab continues from the
+      // top of the document rather than from the button in the corner. main is
+      // not focusable by default, so it is made programmatically focusable
+      // first — without tabindex the focus() call silently does nothing.
+      const top = document.querySelector<HTMLElement>('main');
+      if (top) {
+        top.tabIndex = -1;
+        top.focus({ preventScroll: true });
+      }
+    });
+
+    addEventListener('scroll', sync, { passive: true });
+    if (search) {
+      new MutationObserver(sync).observe(search, {
+        attributes: true,
+        attributeFilter: ['hidden'],
+      });
+    }
+    sync();
+  }
+</script>

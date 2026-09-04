@@ -1,0 +1,43 @@
+---
+/**
+ * The book's one structural idea: a narrow marginal column of mono labels
+ * beside a wide column of prose. Every section on every page is one of these.
+ */
+interface Props {
+  /** Accent label in the margin. Omit and supply the `rail` slot instead. */
+  label?: string;
+  /**
+   * Render the label as a heading. A label that names the section it sits
+   * beside is one; a label like "Sheet" that annotates the page title is not,
+   * and would land before the h1 in the outline.
+   */
+  labelAs?: 'div' | 'h2';
+  divider?: boolean;
+  /** Keep the margin column in view while the body scrolls. */
+  sticky?: boolean;
+  class?: string;
+}
+
+const {
+  label,
+  labelAs: LabelTag = 'div',
+  divider = true,
+  sticky = false,
+  class: className = 'py-11',
+} = Astro.props;
+const hasRail = Astro.slots.has('rail');
+---
+
+<section
+  class:list={[
+    'grid grid-cols-1 gap-6 md:grid-cols-[210px_minmax(0,1fr)] md:gap-12',
+    divider && 'border-b border-rule',
+    className,
+  ]}
+>
+  <div class:list={[sticky && 'md:sticky md:top-[90px] md:self-start']}>
+    {label && <LabelTag class="label m-0 font-normal text-accent">{label}</LabelTag>}
+    {hasRail && <slot name="rail" />}
+  </div>
+  <div><slot /></div>
+</section>

@@ -1,0 +1,129 @@
+---
+name: 'NoPE'
+desc: 'No positional encoding at all: the causal mask already carries the information.'
+category: 'architectures'
+complexity: 'O(n²·d)'
+path: 'architectures/position'
+difficulty: 'intermediate'
+described: '2022'
+status: 'emerging'
+statusNote: 'A real result that nobody ships alone. It appears in production as interleaved layers — a few attention layers with no rotation among many that have it.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['position', 'attention', 'long-context']
+lede: 'Remove the position encoding from a decoder and it still works. The causal mask makes every position see a different number of tokens, and that is enough for the network to reconstruct where it is.'
+implNote:
+  label: 'annotation'
+  html: 'The result is specific to <em>causal</em> attention. A bidirectional encoder with no position encoding is genuinely permutation-invariant and cannot recover order by any means.'
+related: [causal-masking, rotary-position-embedding, sinusoidal-position-encoding, scaled-dot-product-attention, alibi]
+refs:
+  - cite: 'Haviv et al. — Transformer Language Models without Positional Encodings Still Learn Positional Information (2022)'
+    id: 'arXiv:2203.16634'
+    href: https://arxiv.org/abs/2203.16634
+  - cite: 'Kazemnejad et al. — The Impact of Positional Encoding on Length Generalization in Transformers (2023)'
+    id: 'arXiv:2305.19466'
+    href: https://arxiv.org/abs/2305.19466
+  - cite: 'Chi et al. — Latent Positional Information is in the Self-Attention Variance (2023)'
+    id: 'arXiv:2305.13571'
+    href: https://arxiv.org/abs/2305.13571
+---
+
+Every other entry in this branch starts from the premise that attention is
+permutation-invariant and position must be added. For a decoder, the premise is
+false.
+
+[Causal masking](/entries/causal-masking) is not symmetric. Position 0 attends to
+one token; position 500 attends to 501. The *number of visible positions is
+itself a positional signal*, and it is present in the architecture before any
+encoding is added.
+
+### The construction
+
+A single head can extract the index. Set every query–key score to a constant, so
+the softmax is uniform over the $i+1$ visible positions, and let the value
+projection be the constant vector $\mathbf{1}$.
+
+<Eq lead caption="eq. 1 — attention counts">
+
+$$
+z_i = \sum_{j \le i} \frac{1}{i+1} \cdot \mathbf{1} = \mathbf{1}
+\qquad\text{but}\qquad
+z_i = \sum_{j \le i} \frac{1}{i+1} \, \delta_{j0} = \frac{1}{i+1}
+$$
+
+</Eq>
+
+The right-hand form — uniform attention over a value that is nonzero only at
+position 0 — returns exactly $1/(i+1)$. One head, no parameters beyond a
+projection, and the absolute position is now a scalar feature that every
+subsequent layer can read. Kazemnejad et al. give the full construction; the
+sketch above is the load-bearing part of it.
+
+<Note label="aside">
+Chi et al. arrive at the same conclusion from a different direction: the variance
+of the attention output falls with position, because averaging over more terms
+concentrates it. Position is recoverable from second-order statistics even when
+the mean carries nothing.
+</Note>
+
+### What it buys
+
+Haviv et al. trained decoder LMs with no encoding at all and found perplexity
+within noise of the sinusoidal baseline, and probes that recovered absolute
+position from hidden states with high accuracy. So the mechanism is not merely
+available — the model actually builds it.
+
+Kazemnejad et al. then found something less expected. On the small algorithmic
+tasks where length generalisation can be measured cleanly — addition, copying,
+sorting on sequences longer than trained — NoPE *beat* RoPE, ALiBi and T5's bias.
+An explicit encoding turns out to be something the model can overfit to, and
+removing it removes the thing that fails out of distribution.
+
+### Why it is not the default
+
+Two reasons, and neither is subtle.
+
+The learned position is implicit and shallow: it lives in the early layers'
+statistics, and it does not survive well at scale or at long context, where the
+$1/(i+1)$ signal flattens to nothing. The difference between positions 100 000
+and 100 001 in that feature is below fp16 resolution.
+
+And it interacts badly with everything built around explicit position — you
+cannot interpolate frequencies you do not have, so [context
+extension](/entries/rope-scaling) has no handle to grip.
+
+<Rule label="Where it actually appears" />
+
+The practical descendant is not NoPE but partial NoPE: keep rotation on most
+attention layers and remove it from a few, so the model has both an explicit
+relative signal and a set of layers whose attention is unconstrained by distance.
+Cohere's Command models and several long-context designs interleave this way,
+typically one unrotated layer in four, on the finding that global retrieval heads
+work better when nothing is telling them that far away means less relevant.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch · interleaved rotation">
+
+```python
+from torch import Tensor, nn
+
+
+class Block(nn.Module):
+    """A transformer block that may or may not rotate, chosen by depth."""
+
+    def __init__(self, layer: int, every: int = 4, **kw):
+        super().__init__()
+        # Every `every`-th layer sees raw positions — no rotation, global reach.
+        self.rotate = (layer + 1) % every != 0
+        self.attn = Attention(**kw)
+
+    def forward(self, x: Tensor, freqs: Tensor | None) -> Tensor:
+        return self.attn(x, freqs if self.rotate else None)
+```
+
+</CodeFrame>
+
+The ablation worth running is the ratio. One unrotated layer in four is common;
+one in two degrades short-context quality, and one in eight is indistinguishable
+from full rotation on retrieval benchmarks.

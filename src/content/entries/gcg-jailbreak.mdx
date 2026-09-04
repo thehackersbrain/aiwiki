@@ -1,0 +1,137 @@
+---
+name: 'Greedy Coordinate Gradient'
+desc: 'Discrete optimisation of an adversarial suffix against a refusal-trained model.'
+category: 'adversarial-ml'
+complexity: 'O(k·B·d)'
+path: 'adversarial-ml/evasion'
+difficulty: 'advanced'
+described: '2023'
+status: 'standard'
+statusNote: 'The reference discrete attack. New defences are expected to report against it.'
+revised: 2026-08-09
+added: 2025-04-06
+tags: ['attack', 'robustness', 'alignment']
+lede: 'Optimise a token suffix so the model begins its reply with an affirmative phrase. Gradients propose substitutions; an exact forward pass picks between them.'
+implNote:
+  label: 'annotation'
+  html: 'Suffixes optimised against two open models transfer to models the attacker never touched. That transfer is the finding, not the attack on any one model.'
+related: [projected-gradient-descent-attack, prompt-injection-taxonomy, model-extraction]
+refs:
+  - cite: 'Zou et al. — Universal and Transferable Adversarial Attacks on Aligned Language Models (2023)'
+    id: 'arXiv:2307.15043'
+    href: https://arxiv.org/abs/2307.15043
+  - cite: 'Shin et al. — AutoPrompt: Eliciting Knowledge from Language Models (2020)'
+    id: 'arXiv:2010.15980'
+    href: https://arxiv.org/abs/2010.15980
+  - cite: 'Chao et al. — Jailbreaking Black Box Large Language Models in Twenty Queries (2023)'
+    id: 'arXiv:2310.08419'
+    href: https://arxiv.org/abs/2310.08419
+---
+
+Text is discrete, so [PGD](/entries/projected-gradient-descent-attack) does not
+apply directly — there is no small step in token space. GCG works around this by
+using the gradient only to *rank candidates*, then evaluating the shortlist
+exactly.
+
+### The objective
+
+Rather than maximising a harmfulness score, which needs a classifier, the attack
+maximises the likelihood of a fixed affirmative opening. Once the model has
+emitted "Sure, here is how to", the refusal has already been passed.
+
+<Eq caption="eq. 1 — target is a short affirmative prefix" source="Zou et al. §3.1" lead>
+
+$$
+\min_{s \in \mathcal{V}^{k}} \;
+-\log p_\theta\bigl( y_{\text{affirm}} \mid x_{\text{request}} \,\|\, s \bigr)
+$$
+
+</Eq>
+
+<Note label="annotation">
+Attacking the first few tokens is the insight. Refusal is a decision made early,
+and the rest of the response follows the opening it has already committed to.
+</Note>
+
+### The search
+
+Take the gradient of the loss with respect to the *one-hot* vector at suffix
+position $i$. Its negative entries indicate tokens that would reduce the loss
+under a linear approximation — unreliable, but good enough to shortlist.
+
+<Eq caption="eq. 2 — top-k candidate substitutions at position i">
+
+$$
+\mathcal{C}_i = \operatorname{Top-}k\Bigl( -\nabla_{e_{s_i}} \mathcal{L} \Bigr)
+$$
+
+</Eq>
+
+Then sample $B$ single-token substitutions from across all positions, evaluate
+each with a real forward pass, and keep the best. The gradient never decides;
+it only proposes.
+
+<Eq caption="eq. 3 — exact selection over the batch">
+
+$$
+s^{\star} = \arg\min_{s \in \mathcal{B}} \mathcal{L}(s)
+$$
+
+</Eq>
+
+Universality comes from optimising one suffix against many prompts and several
+models at once, summing the losses. The resulting string is unreadable and works
+on models that were never in the sum.
+
+> The defensive reading: alignment trained as a behaviour over natural prompts
+> is not a constraint over the whole input space, and gradient access — or a
+> transferable proxy — is enough to find the gap. Perplexity filters catch the
+> classic suffixes and are themselves evadable with a fluency term.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor
+
+
+def gcg_step(
+    model, embeddings: Tensor, ids: Tensor, suffix_slice: slice,
+    target_slice: slice, top_k: int = 256, batch: int = 512,
+) -> Tensor:
+    # one-hot the suffix so the gradient is defined over the vocabulary
+    vocab = embeddings.size(0)
+    one_hot = torch.zeros(
+        ids[suffix_slice].size(0), vocab, device=ids.device, dtype=embeddings.dtype
+    )
+    one_hot.scatter_(1, ids[suffix_slice].unsqueeze(1), 1.0)
+    one_hot.requires_grad_(True)
+
+    inputs = embeddings[ids].clone()
+    inputs[suffix_slice] = one_hot @ embeddings
+    logits = model(inputs_embeds=inputs.unsqueeze(0)).logits
+
+    loss = torch.nn.functional.cross_entropy(
+        logits[0, target_slice.start - 1 : target_slice.stop - 1],
+        ids[target_slice],
+    )
+    grad, = torch.autograd.grad(loss, one_hot)
+
+    # gradient proposes; the forward pass disposes
+    candidates = (-grad).topk(top_k, dim=1).indices
+    trials = ids.repeat(batch, 1)
+    positions = torch.randint(0, len(candidates), (batch,))
+    picks = torch.randint(0, top_k, (batch,))
+    trials[torch.arange(batch), suffix_slice.start + positions] = \
+        candidates[positions, picks]
+    return trials
+```
+
+</CodeFrame>
+
+The `target_slice.start - 1` offset is the usual next-token shift: the logits at
+position $t$ predict the token at $t+1$. Candidate tokens that do not survive a
+detokenise–retokenise round trip must be filtered out, or the attack optimises a
+string that cannot actually be sent.

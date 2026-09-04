@@ -1,0 +1,31 @@
+---
+name: 'Second-Order Preconditioning'
+desc: 'Shampoo, Muon and the orthogonalised-update family.'
+category: 'training'
+complexity: 'O(d^1.5)'
+path: 'training/optimisers'
+difficulty: 'advanced'
+described: '2018'
+status: 'emerging'
+statusNote: 'Real wall-clock wins reported at meaningful scale, and not yet the default. This is the most likely entry on this list to be relabelled within a year.'
+revised: 2026-07-28
+added: 2025-08-26
+tags: ['optimiser', 'training']
+stub: true
+lede: 'Update rules that precondition by a factored second-moment matrix rather than a diagonal, and the cheaper orthogonalisation approximations that have displaced them in practice.'
+related: [adamw, stochastic-gradient-descent, maximal-update-parameterisation, memory-efficient-optimisers, zero-sharding]
+refs:
+  - cite: 'Gupta et al. — Shampoo: Preconditioned Stochastic Tensor Optimization (2018)'
+    id: 'arXiv:1802.09568'
+    href: https://arxiv.org/abs/1802.09568
+---
+
+Adam preconditions by a diagonal — one scalar per parameter, no knowledge of how
+parameters interact. Shampoo instead maintains a Kronecker-factored approximation
+to the full second-moment matrix, one factor per tensor axis, and the
+orthogonalised-update family approximates the resulting inverse root with a few
+Newton–Schulz iterations rather than an eigendecomposition.
+
+The maths here has not been rederived by hand, and in particular the relationship
+between the Newton–Schulz coefficient choice and the conditioning of the update is
+recorded from the sources rather than checked. Treat this entry as a pointer.

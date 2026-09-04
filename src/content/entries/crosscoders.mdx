@@ -1,0 +1,31 @@
+---
+name: 'Crosscoders'
+desc: 'Shared dictionaries fitted across layers or across model checkpoints.'
+category: 'interpretability'
+complexity: 'O(L·d·m)'
+path: 'interpretability/features'
+difficulty: 'advanced'
+described: '2024'
+status: 'emerging'
+revised: 2026-08-11
+added: 2026-02-28
+tags: ['features', 'sparse']
+stub: true
+lede: 'One dictionary, many read and write sites. Fitting across layers exposes features that persist through depth; fitting across two checkpoints exposes what fine-tuning added.'
+related: [sparse-autoencoders, feature-absorption]
+refs:
+  - cite: 'Lindsey et al. — Sparse Crosscoders for Cross-Layer Features and Model Diffing (2024)'
+    id: 'transformer-circuits'
+    href: https://transformer-circuits.pub/2024/crosscoders/index.html
+---
+
+An ordinary SAE reads one layer and writes back to it. A crosscoder reads a set of
+layers at once and reconstructs all of them from a shared dictionary, so a feature
+that persists across depth is represented once rather than refitted per layer.
+
+Point the same machinery at two checkpoints instead of two layers and it becomes
+model diffing: latents that reconstruct only the fine-tuned model's activations
+are, in principle, what the fine-tune added.
+
+Stub. The claim that a shared dictionary identifies "the same" feature across
+sites is doing real work and has not been checked here.

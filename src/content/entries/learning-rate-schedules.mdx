@@ -1,0 +1,135 @@
+---
+name: 'Learning-Rate Schedules'
+desc: 'Warmup, cosine decay, and the warmup–stable–decay alternative.'
+category: 'training'
+complexity: 'O(1)'
+path: 'training/optimisers'
+difficulty: 'introductory'
+described: '2016'
+status: 'standard'
+statusNote: 'Warmup plus decay is universal; the shape of the decay is where the disagreement is.'
+revised: 2026-08-07
+added: 2025-02-18
+tags: ['optimiser', 'training']
+lede: 'The learning rate is the one hyperparameter that must move during training. Warmup exists because the optimiser starts blind; decay exists because the loss surface narrows.'
+implNote:
+  label: 'in practice'
+  html: 'Warmup for 1–2% of total steps, or roughly 2/(1−β₂) steps — whichever is larger. Both estimates land near 2000 steps for a typical run.'
+related: [adamw, schedule-free-optimisation, maximal-update-parameterisation, gradient-clipping, chinchilla-scaling-laws]
+refs:
+  - cite: 'Loshchilov & Hutter — SGDR: Stochastic Gradient Descent with Warm Restarts (2016)'
+    id: 'arXiv:1608.03983'
+    href: https://arxiv.org/abs/1608.03983
+  - cite: 'Hu et al. — MiniCPM: Unveiling the Potential of Small Language Models (2024)'
+    id: 'arXiv:2404.06395'
+    href: https://arxiv.org/abs/2404.06395
+  - cite: 'Hägele et al. — Scaling Laws and Compute-Optimal Training Beyond Fixed Durations (2024)'
+    id: 'arXiv:2405.18392'
+    href: https://arxiv.org/abs/2405.18392
+---
+
+### Warmup
+
+<Note label="annotation">
+Warmup is not about the weights being random. It is about $v$ being empty:
+Adam's denominator is an estimate, and at step 5 it is an estimate from five
+samples.
+</Note>
+
+Adam's second moment is a running average with an effective window of
+$1/(1-\beta_2)$ steps. Before that many steps have passed, $\sqrt{\hat v}$ is
+noisy, and a noisy denominator on a full-size learning rate produces steps in
+arbitrary directions. Linear warmup holds the rate small until the estimate
+settles.
+
+<Eq caption="eq. 1 — linear warmup over W steps" lead>
+
+$$
+\eta_t = \eta_{\max} \cdot \min\!\left( 1, \frac{t}{W} \right)
+$$
+
+</Eq>
+
+### Cosine decay
+
+<Eq caption="eq. 2 — decayed to a floor, over the remaining T − W steps" source="Loshchilov &amp; Hutter">
+
+$$
+\eta_t = \eta_{\min} + \tfrac{1}{2}(\eta_{\max} - \eta_{\min})
+\left( 1 + \cos\frac{\pi (t - W)}{T - W} \right)
+$$
+
+</Eq>
+
+Cosine has one serious drawback, and it is structural rather than empirical:
+$T$ appears in the formula. The schedule must know the total step count in
+advance, and a run stopped early sits at a high learning rate with a
+correspondingly poor loss. Every intermediate checkpoint is off the
+compute-optimal frontier.
+
+### Warmup–stable–decay
+
+WSD holds $\eta_{\max}$ constant for most of the run and decays sharply over
+the last 10–20%. Because the stable phase does not depend on $T$, a run can be
+extended indefinitely, and any point on it can be turned into a finished model
+by decaying from there.
+
+<Eq caption="eq. 3 — decay over the final fraction f">
+
+$$
+\eta_t =
+\begin{cases}
+\eta_{\max} \cdot t/W & t < W \\
+\eta_{\max} & W \le t < (1-f)T \\
+\eta_{\max} \cdot \left( \dfrac{T-t}{fT} \right) & t \ge (1-f)T
+\end{cases}
+$$
+
+</Eq>
+
+> The loss curve under WSD looks worse than cosine for most of training and
+> then drops abruptly during the decay, ending in the same place. Judging a WSD
+> run by its mid-training loss is judging it before it has been asked the
+> question.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import math
+from torch.optim.lr_scheduler import LambdaLR
+
+
+def cosine_with_warmup(optimizer, warmup: int, total: int, floor: float = 0.1):
+    def factor(step: int) -> float:
+        if step < warmup:
+            return step / max(1, warmup)
+        progress = (step - warmup) / max(1, total - warmup)
+        cosine = 0.5 * (1 + math.cos(math.pi * min(1.0, progress)))
+        return floor + (1 - floor) * cosine
+
+    return LambdaLR(optimizer, factor)
+
+
+def wsd(optimizer, warmup: int, total: int, decay_frac: float = 0.1):
+    """Stable until the final decay_frac, so the run can be extended."""
+    decay_start = int(total * (1 - decay_frac))
+
+    def factor(step: int) -> float:
+        if step < warmup:
+            return step / max(1, warmup)
+        if step < decay_start:
+            return 1.0
+        return max(0.0, (total - step) / (total - decay_start))
+
+    return LambdaLR(optimizer, factor)
+```
+
+</CodeFrame>
+
+Decaying to zero rather than a floor is common and mostly harmless, but a floor
+of $0.1\,\eta_{\max}$ leaves the model able to keep moving if the run is
+continued. Note that both schedules step per optimiser step, not per epoch —
+stepping per epoch on a single-epoch pretraining run means never stepping at
+all.

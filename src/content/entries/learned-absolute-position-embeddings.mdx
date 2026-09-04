@@ -1,0 +1,121 @@
+---
+name: 'Learned Absolute Position Embeddings'
+desc: 'A lookup table indexed by position, trained like any other embedding.'
+category: 'architectures'
+complexity: 'O(n·d)'
+memory: 'O(L·d) parameters'
+path: 'architectures/position'
+difficulty: 'introductory'
+described: '2018'
+status: 'superseded'
+statusNote: 'Gone from language models, where the hard context ceiling is disqualifying. Still routine in vision transformers, which know their input size in advance.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['position', 'attention', 'core']
+lede: 'Stop deriving the encoding and simply learn it: one trainable vector per position, added to the token embedding. Trivial to implement, and it stops dead at the end of the table.'
+metrics:
+  caption: 'Parameter cost of the table alone'
+  rows:
+    - { label: 'BERT-base, 512×768', value: '0.39 M' }
+    - { label: 'GPT-2, 1024×1600', value: '1.6 M' }
+    - { label: 'Beyond L', value: 'undefined', accent: true }
+implNote:
+  label: 'in practice'
+  html: 'Vision transformers change input resolution by bicubically interpolating the table on the 2-D patch grid. It works because image position is a smooth spatial coordinate; the same trick on a text model has nothing sensible to interpolate <em>between</em>.'
+related: [sinusoidal-position-encoding, rotary-position-embedding, relative-position-embeddings, scaled-dot-product-attention]
+refs:
+  - cite: 'Devlin et al. — BERT: Pre-training of Deep Bidirectional Transformers (2018)'
+    id: 'arXiv:1810.04805'
+    href: https://arxiv.org/abs/1810.04805
+  - cite: 'Radford et al. — Language Models are Unsupervised Multitask Learners (2019)'
+    id: 'GPT-2'
+    href: https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
+  - cite: 'Dosovitskiy et al. — An Image is Worth 16x16 Words (2020)'
+    id: 'arXiv:2010.11929'
+    href: https://arxiv.org/abs/2010.11929
+---
+
+If the sinusoidal table is a guess at what position should look like, the
+learned table is a refusal to guess. Allocate $L \times d$ parameters, index by
+position, add to the token embedding, and let gradient descent decide.
+
+<Eq lead caption="eq. 1 — the whole method">
+
+$$
+h^{(0)}_p = \mathrm{Emb}(x_p) + P_p, \qquad P \in \mathbb{R}^{L \times d}
+$$
+
+</Eq>
+
+BERT did this, GPT-2 did this, and ViT still does. It performs no worse than
+sinusoids on any benchmark where both were tried — [Vaswani et
+al.](/entries/sinusoidal-position-encoding) reported the same, and chose
+sinusoids anyway on the untested hope that they would extrapolate.
+
+### The ceiling is structural
+
+$P$ has $L$ rows. Position $L$ has no row. There is no natural value to fall back
+on, no continuation of a formula, no reasonable default — the model simply cannot
+be evaluated there. This is why GPT-2 is a 1024-token model in a way that is not
+a matter of degree: the failure at 1025 is a missing parameter, not a degraded
+one.
+
+<Note label="annotation">
+Worse, the tail of the table is undertrained. Every training sequence covers
+position 0; only full-length sequences cover position $L-1$. If the corpus is
+mostly short documents, the last rows receive a small fraction of the gradient
+the first rows do, and quality sags near the limit even inside the supported
+range.
+</Note>
+
+### What the table learns
+
+Probing trained tables finds less structure than the parameter count suggests.
+The dominant component is smooth and low-frequency — neighbouring positions get
+neighbouring vectors — with the first few positions sitting well apart from
+everything else, which is the same [sink](/entries/attention-sinks) phenomenon
+seen from the embedding side. Beyond that the table is largely a monotone curve
+through a handful of dimensions, which is a costly way to encode a scalar.
+
+That observation is the case for the relative schemes. If what the model needs is
+mostly offset, and the absolute index is a means to it, then encoding the offset
+directly is both cheaper and unbounded.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor, nn
+
+
+class LearnedPositions(nn.Module):
+    def __init__(self, max_len: int, dim: int):
+        super().__init__()
+        self.table = nn.Embedding(max_len, dim)
+        # Small init: position must not dominate content at step zero.
+        nn.init.normal_(self.table.weight, std=0.02)
+
+    def forward(self, x: Tensor) -> Tensor:                   # [B, T, D]
+        t = x.size(1)
+        if t > self.table.num_embeddings:
+            raise ValueError(f"{t} tokens exceeds the {self.table.num_embeddings}-row table")
+        pos = torch.arange(t, device=x.device)
+        return x + self.table(pos)
+```
+
+</CodeFrame>
+
+The explicit raise matters more than it looks. Indexing past the table in PyTorch
+is a device-side assert that surfaces as an opaque CUDA error several operations
+later, usually attributed to whatever kernel happened to run next.
+
+<Rule label="Where it survives" />
+
+Vision keeps it because the objection does not apply: a ViT knows its patch grid
+at configuration time, and changing resolution is a deliberate act during which
+the table can be interpolated on the grid. Text has no such structure — token 900
+is not spatially between token 899 and 901 in any sense that survives
+interpolation — so language models moved to [rotary
+embeddings](/entries/rotary-position-embedding) and never came back.

@@ -1,0 +1,100 @@
+---
+name: 'Activation Patching'
+desc: 'Causal intervention swapping activations between clean and corrupt runs.'
+category: 'interpretability'
+complexity: 'O(L·n)'
+path: 'interpretability/causal'
+difficulty: 'intermediate'
+described: '2020'
+status: 'standard'
+statusNote: 'The basic causal tool of the field. Nothing has replaced it as the way a mechanistic claim gets tested.'
+revised: 2026-08-18
+added: 2025-06-23
+tags: ['causal', 'circuits']
+lede: 'Run the model twice on a minimal pair, then splice one activation from one run into the other and measure how far the output moves. The only interpretability primitive that establishes causation rather than correlation.'
+implNote:
+  label: 'caveat'
+  html: 'Use a logit difference between two candidate answers as the metric, never a probability. Probabilities saturate, and a saturated metric reports zero effect for a component doing a great deal of work.'
+related: [path-patching, attribution-patching, sparse-autoencoders, logit-lens]
+refs:
+  - cite: 'Vig et al. — Investigating Gender Bias in Language Models Using Causal Mediation Analysis (2020)'
+    id: 'arXiv:2004.12265'
+    href: https://arxiv.org/abs/2004.12265
+  - cite: 'Meng et al. — Locating and Editing Factual Associations in GPT (2022)'
+    id: 'arXiv:2202.05262'
+    href: https://arxiv.org/abs/2202.05262
+  - cite: 'Zhang & Nanda — Towards Best Practices of Activation Patching (2023)'
+    id: 'arXiv:2309.16042'
+    href: https://arxiv.org/abs/2309.16042
+---
+
+Construct a clean prompt and a corrupted prompt differing in one respect. Cache the
+activations of both. Then run the corrupted prompt while overwriting a chosen
+component with its clean value, and measure recovery of the metric of interest.
+
+<Eq caption="eq. 1 — normalised so 0 is no effect, 1 is full recovery" lead>
+
+$$
+\mathrm{effect}(c) =
+\frac{M\bigl(\mathrm{do}(c \leftarrow a_{\text{clean}})\bigr) - M_{\text{corrupt}}}
+{M_{\text{clean}} - M_{\text{corrupt}}}
+$$
+
+</Eq>
+
+<Note label="caveat">
+Necessary and sufficient are different questions. Write-ups routinely measure one
+and claim the other.
+</Note>
+
+Direction matters. Denoising (clean → corrupt, as above) finds components
+*sufficient* to restore the behaviour; noising (corrupt → clean) finds components
+*necessary* for it. The two disagree whenever the circuit has redundant paths, and
+the disagreement is informative rather than a bug.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch hooks">
+
+```python
+import torch
+from contextlib import contextmanager
+
+
+@contextmanager
+def patch(module, cache, position):
+    """Overwrite module output at one sequence position."""
+    def hook(_mod, _inp, out):
+        out = out.clone()
+        out[:, position] = cache[:, position]
+        return out
+
+    handle = module.register_forward_hook(hook)
+    try:
+        yield
+    finally:
+        handle.remove()
+
+
+def patching_effect(model, clean, corrupt, module, position, metric):
+    with torch.no_grad():
+        clean_acts = {}
+        h = module.register_forward_hook(
+            lambda _m, _i, o: clean_acts.setdefault("a", o.detach())
+        )
+        base_clean = metric(model(clean))
+        h.remove()
+
+        base_corrupt = metric(model(corrupt))
+        with patch(module, clean_acts["a"], position):
+            patched = metric(model(corrupt))
+
+    return (patched - base_corrupt) / (base_clean - base_corrupt)
+```
+
+</CodeFrame>
+
+The hook must clone before writing. Mutating the output tensor in place corrupts
+the residual stream for every later reader in ways that do not raise an error and
+do not look wrong in the metric. Always remove handles in a `finally` — a leaked
+hook survives into the next experiment and quietly patches everything after it.

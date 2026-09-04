@@ -1,0 +1,154 @@
+---
+name: 'Product-Key Memory'
+desc: 'A million-entry lookup layer searched in √N time by factorising the key space.'
+category: 'architectures'
+complexity: 'O(√N·d)'
+memory: 'O(N·d)'
+path: 'architectures/ffn'
+difficulty: 'advanced'
+described: '2019'
+status: 'emerging'
+statusNote: 'A 2019 idea that Meta revived in 2024 with better engineering. Genuine wins on factual recall; not yet part of anyone’s default architecture.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['ffn', 'sparse', 'scaling']
+lede: 'If the feed-forward block is a memory, make it a much bigger one. Factorising the keys into two halves turns a search over a million entries into two searches over a thousand.'
+metrics:
+  caption: 'Lample et al., 2019'
+  rows:
+    - { label: 'Memory slots', value: '1 M' }
+    - { label: 'Keys compared', value: '2 × 1024' }
+    - { label: 'Slots read', value: '32', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Untouched slots receive no gradient, so a layer that starts unbalanced stays unbalanced. Batch normalisation on the query — the one place it is genuinely the right tool — is what the original paper uses to keep the key space in use.'
+related: [feed-forward-as-key-value-memory, mixture-of-experts-routing, feed-forward-networks, activation-sparsity, shared-and-fine-grained-experts]
+refs:
+  - cite: 'Lample et al. — Large Memory Layers with Product Keys (2019)'
+    id: 'arXiv:1907.05242'
+    href: https://arxiv.org/abs/1907.05242
+  - cite: 'Berges et al. — Memory Layers at Scale (2024)'
+    id: 'arXiv:2412.09764'
+    href: https://arxiv.org/abs/2412.09764
+  - cite: 'Geva et al. — Transformer Feed-Forward Layers Are Key-Value Memories (2020)'
+    id: 'arXiv:2012.14913'
+    href: https://arxiv.org/abs/2012.14913
+---
+
+Take the [key-value memory reading](/entries/feed-forward-as-key-value-memory)
+literally and the obvious question follows: why $d_{ff}$ entries? If the block is
+a memory, the useful size is however many facts the model should hold, and $4d$
+is an accident of the architecture.
+
+The obstacle is search. Finding the top-$k$ of $N$ entries costs $O(Nd)$ — which
+for $N = 10^6$ is worse than the dense block it replaces.
+
+### Factorising the key space
+
+Split the query in half, and give each half its own small set of subkeys. The
+full key set is the Cartesian product of the two.
+
+<Eq lead caption="eq. 1 — N keys from 2√N subkeys">
+
+$$
+\mathcal{K} = \mathcal{C}_1 \times \mathcal{C}_2,
+\qquad
+|\mathcal{C}_1| = |\mathcal{C}_2| = \sqrt{N}
+$$
+
+</Eq>
+
+A key is a concatenation $(c^{(1)}_a, c^{(2)}_b)$, so its score against a query
+$q = (q_1, q_2)$ is $q_1^\top c^{(1)}_a + q_2^\top c^{(2)}_b$ — separable. And a
+separable score means the global top-$k$ can be found from the two halves'
+top-$k$ lists without ever scoring all $N$ pairs.
+
+<Eq caption="eq. 2 — the guarantee that makes it exact">
+
+$$
+\mathrm{top}_k(\mathcal{K}) \subseteq
+\mathrm{top}_k(\mathcal{C}_1) \times \mathrm{top}_k(\mathcal{C}_2)
+$$
+
+</Eq>
+
+The proof is one line: if $a \notin \mathrm{top}_k(\mathcal{C}_1)$ then $k$
+subkeys beat it in the first half, and each pairs with $b$ to give a better full
+key. So the search is $2\sqrt{N}$ comparisons, then $k^2$ candidates, then a
+top-$k$ over those. At $N = 10^6$ and $k = 32$: 2048 comparisons instead of a
+million, and the answer is exact, not approximate.
+
+<Note label="annotation">
+This is the same trick as product quantisation in nearest-neighbour search, run
+forwards. There the factorisation compresses a database; here it makes a
+learnable one addressable. The constraint in both cases is that the score must
+decompose over the halves.
+</Note>
+
+### Keeping the memory in use
+
+The failure mode is usage collapse. Slots that are never selected receive no
+gradient, so they never improve, so they are never selected — and a layer can
+end up with a few thousand live entries out of a million.
+
+Lample et al. use batch normalisation on the query, which is one of the few
+places where batch statistics are exactly the right tool: it is a *global*
+constraint, forcing the query distribution to spread over the key space rather
+than concentrating, and the coupling across the batch is the mechanism rather
+than a side effect. Multiple heads help too, for the same reason they help in
+attention — several independent queries cover more of the space than one.
+
+### The 2024 revival
+
+Berges et al. scaled the idea to models up to 8B and found the result that makes
+it interesting: memory layers improve *factual* benchmarks substantially while
+leaving reasoning benchmarks roughly unchanged, and a model with memory layers
+matches a dense model with about twice the compute on the factual tasks.
+
+That split is a claim about what the parameters are for. Facts are lookup and
+scale with capacity; reasoning is computation and scales with FLOPs. A memory
+layer buys the first cheaply and the second not at all.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor, nn
+
+
+class ProductKeyMemory(nn.Module):
+    def __init__(self, dim: int, n_keys: int = 1024, k: int = 32, heads: int = 4):
+        super().__init__()
+        self.k, self.heads, self.n_keys = k, heads, n_keys
+
+        # Two subkey sets; the full key space is their product, n_keys².
+        self.subkeys = nn.Parameter(torch.randn(2, n_keys, dim // 2))
+        self.values = nn.EmbeddingBag(n_keys**2, dim, mode="sum")
+        self.query = nn.Linear(dim, dim, bias=False)
+        # Global constraint on the query distribution: see the note above.
+        self.qnorm = nn.BatchNorm1d(dim)
+
+    def forward(self, x: Tensor) -> Tensor:                   # [B, D]
+        q = self.qnorm(self.query(x))
+        q1, q2 = q.chunk(2, dim=-1)
+
+        s1, i1 = (q1 @ self.subkeys[0].T).topk(self.k)        # [B, k]
+        s2, i2 = (q2 @ self.subkeys[1].T).topk(self.k)
+
+        # k² candidates, then the true top-k over them.
+        scores = (s1[:, :, None] + s2[:, None, :]).flatten(1)
+        flat = (i1[:, :, None] * self.n_keys + i2[:, None, :]).flatten(1)
+        top, pos = scores.topk(self.k)
+
+        return self.values(flat.gather(1, pos), per_sample_weights=top.softmax(-1))
+```
+
+</CodeFrame>
+
+`EmbeddingBag` is doing real work there: it gathers and weight-sums in one kernel,
+so the million-row value table is never materialised as a dense matmul. The table
+is also the entire memory cost of the layer — $N \times d$, which at $10^6$ and
+1024 is a billion parameters in a single layer, and a good candidate for keeping
+in a lower precision than the rest of the model.

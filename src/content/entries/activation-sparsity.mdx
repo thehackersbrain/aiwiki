@@ -1,0 +1,147 @@
+---
+name: 'Activation Sparsity'
+desc: 'Most FFN neurons are zero for any given token; skip the rows they own.'
+category: 'architectures'
+complexity: 'O(n·d·s)'
+path: 'architectures/ffn'
+difficulty: 'intermediate'
+described: '2023'
+status: 'emerging'
+statusNote: 'Real speed-ups, reproduced by several groups, and dependent on a ReLU-family activation that most current models do not use.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['ffn', 'inference', 'sparse']
+lede: 'A trained feed-forward block fires perhaps a tenth of its neurons per token, and which tenth is predictable from the input. That makes the largest matrix in the block mostly unread.'
+metrics:
+  caption: 'Deja Vu, OPT-175B, batch size 1'
+  rows:
+    - { label: 'FFN neurons used', value: '≈ 5%' }
+    - { label: 'Attention heads used', value: '≈ 20%' }
+    - { label: 'Latency', value: '−50%', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'All of this is a batch-size-one story. Two tokens in a batch light up different neurons, and the union grows quickly — past a batch of about 32 the sparsity has usually washed out entirely.'
+related: [squared-relu, gelu, feed-forward-networks, mixture-of-experts-routing, speculative-decoding, feed-forward-as-key-value-memory]
+refs:
+  - cite: 'Liu et al. — Deja Vu: Contextual Sparsity for Efficient LLMs at Inference Time (2023)'
+    id: 'arXiv:2310.17157'
+    href: https://arxiv.org/abs/2310.17157
+  - cite: 'Mirzadeh et al. — ReLU Strikes Back: Exploiting Activation Sparsity in LLMs (2023)'
+    id: 'arXiv:2310.04564'
+    href: https://arxiv.org/abs/2310.04564
+  - cite: 'Alizadeh et al. — LLM in a Flash: Efficient Large Language Model Inference with Limited Memory (2023)'
+    id: 'arXiv:2312.11514'
+    href: https://arxiv.org/abs/2312.11514
+---
+
+Instrument a trained ReLU feed-forward block and count how many of its $d_{ff}$
+neurons are nonzero for a given token. The answer is around ten percent, and
+nothing in training asked for that — it is what the block converges to on its
+own.
+
+The consequence is arithmetic. If $h_i = 0$, then $h_i W_2^{(:,i)}$ contributes
+nothing, and the $i$-th column of the down-projection did not need to be read
+from memory. At decode time, when the block is bandwidth-bound and the weights
+are the traffic, not reading ninety percent of the largest matrix is close to a
+tenfold reduction in the cost of the block.
+
+<Eq lead caption="eq. 1 — the sum is over the live set, not over d_ff">
+
+$$
+y = \sum_{i \in \mathcal{A}(x)} h_i\, W_2^{(:,i)},
+\qquad
+\mathcal{A}(x) = \{\, i : h_i \neq 0 \,\}
+$$
+
+</Eq>
+
+### The problem is knowing which
+
+$\mathcal{A}(x)$ is only known after computing $h$, which requires reading all of
+$W_1$. Skipping work you have already done is not a saving.
+
+Deja Vu's answer is to predict the set. A small learned classifier — a two-layer
+network reading the block's input — guesses which neurons will fire, and only
+those rows of $W_1$ and columns of $W_2$ are fetched. The classifier is cheap,
+runs a layer ahead so its latency hides behind the previous block, and achieves
+recall high enough that the tokens produced are near-identical to the dense
+model's.
+
+<Note label="annotation">
+Recall is the metric, not accuracy. A false negative drops a neuron that should
+have fired and changes the output; a false positive costs a wasted row read.
+The operating point is therefore set well towards over-prediction, which is why
+the realised speed-up is roughly half rather than the tenfold the raw sparsity
+suggests.
+</Note>
+
+Deja Vu found the same structure in attention — around 20% of heads carry the
+output for a given token — so the technique applies to both halves of the block,
+though the FFN is where the memory is.
+
+### The activation function decides whether any of this is possible
+
+This is the catch, and it is fatal for most current models. GELU and SiLU produce
+*small* values, not zeros. A value of $10^{-4}$ still has to be multiplied, and
+its row still has to be read.
+
+| Activation | Exact zeros | Exploitable |
+| --- | --- | --- |
+| ReLU | ≈ 90% | yes |
+| ReLU² | > 95% | yes |
+| GELU / SiLU | ≈ 0% | no |
+
+Llama, Mistral, Qwen and the rest use SwiGLU, so none of them is sparse in the
+sense required. Two responses exist. Mirzadeh et al. show that *relufication* —
+swapping the activation and fine-tuning briefly — recovers the sparsity at
+little quality cost. Others thresholding the small values, treating anything
+below $\epsilon$ as zero, which works but converts an exact optimisation into an
+approximation with an error budget to defend.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch · gather the live rows only">
+
+```python
+import torch
+from torch import Tensor, nn
+
+
+class SparseFFN(nn.Module):
+    """Predict the live set, then touch only those rows and columns."""
+
+    def __init__(self, dim: int, hidden: int, predictor: nn.Module):
+        super().__init__()
+        self.w1 = nn.Parameter(torch.empty(hidden, dim))
+        self.w2 = nn.Parameter(torch.empty(dim, hidden))
+        self.predictor = predictor                    # cheap; run one layer early
+
+    def forward(self, x: Tensor, top_k: int) -> Tensor:               # x: [D]
+        idx = self.predictor(x).topk(top_k).indices                   # [k]
+
+        # The gather is the whole point: these are the only weights read.
+        h = torch.relu(self.w1[idx] @ x)                              # [k]
+        return self.w2[:, idx] @ h                                    # [D]
+```
+
+</CodeFrame>
+
+The gather is also the reason the win is smaller than the sparsity. Scattered row
+reads do not coalesce the way a contiguous matmul does, so the effective
+bandwidth is well below peak — the tenfold reduction in bytes becomes perhaps a
+twofold reduction in time.
+
+Where it pays unambiguously is when the weights do not fit in memory at all.
+LLM in a Flash keeps the model on SSD and streams the predicted rows into RAM,
+which turns a model that could not run on the device into one that runs slowly.
+Against that baseline the comparison is not a speed-up, it is feasibility.
+
+<Rule label="Relation to mixture of experts" />
+
+[MoE](/entries/mixture-of-experts-routing) is the same observation made
+structural. Rather than discovering after the fact that a tenth of the block
+fired, partition the block into experts and train a router to choose explicitly.
+The sparsity is then designed rather than emergent, the memory access is
+contiguous per expert rather than scattered, and no predictor is needed because
+the router *is* the predictor. Activation sparsity is the retrofit for models
+that were not built that way.

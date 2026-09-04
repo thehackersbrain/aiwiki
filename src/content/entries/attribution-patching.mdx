@@ -1,0 +1,46 @@
+---
+name: 'Attribution Patching'
+desc: 'First-order approximation to patching via a single backward pass.'
+category: 'interpretability'
+complexity: 'O(L·n)'
+path: 'interpretability/causal'
+difficulty: 'advanced'
+described: '2023'
+status: 'common'
+revised: 2026-07-28
+added: 2025-03-21
+tags: ['causal', 'circuits']
+lede: 'Patching every component costs one forward pass each. A first-order Taylor expansion estimates all of them from two forward passes and one backward pass.'
+related: [activation-patching, path-patching, sparse-autoencoders]
+refs:
+  - cite: 'Nanda — Attribution Patching: Activation Patching At Industrial Scale (2023)'
+    id: 'neelnanda.io'
+    href: https://www.neelnanda.io/mechanistic-interpretability/attribution-patching
+  - cite: 'Syed et al. — Attribution Patching Outperforms Automated Circuit Discovery (2023)'
+    id: 'arXiv:2310.10348'
+    href: https://arxiv.org/abs/2310.10348
+---
+
+Linearise the metric around the corrupted activation. The estimated effect of
+replacing $a$ with $a'$ is then the inner product of the gradient at $a$ with the
+difference — and the gradient for every component comes from a single backward
+pass.
+
+<Eq caption="eq. 1" lead>
+
+$$
+\mathrm{effect}(a \rightarrow a') \approx (a' - a)^{\top} \frac{\partial M}{\partial a}
+$$
+
+</Eq>
+
+<Note label="in practice">
+Use it as a filter, not an answer: rank thousands of candidates, then run exact
+patching on the survivors.
+</Note>
+
+The approximation is poor precisely where the model is most interesting: at
+saturated softmaxes, at layer-norm scale changes, and anywhere the true effect is
+large. Integrated gradients along the path from $a$ to $a'$ recovers most of the
+lost fidelity for a handful of extra passes, and is the right default when the
+shortlist matters more than the sweep.

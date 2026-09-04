@@ -1,0 +1,276 @@
+---
+import { allCategories, allEntries, allNotes, allSeries, allSubcategories } from '../lib/grimoire';
+
+/**
+ * The search overlay and its index. Rendered at the end of the body, clear of
+ * the header's backdrop-filter — see SearchButton for why that matters.
+ *
+ * The corpus is small enough — fifty-odd entries — that the index ships inline
+ * and the match runs in the page; there is no request to make, nothing to keep
+ * warm, and no query leaves the reader's browser.
+ */
+const [entries, categories, subcategories, notes, series] = await Promise.all([
+  allEntries(),
+  allCategories(),
+  allSubcategories(),
+  allNotes(),
+  allSeries(),
+]);
+
+const categoryName = new Map(categories.map((c) => [c.id, c.data.name]));
+const subName = new Map(subcategories.map((s) => [s.id, s.data.name]));
+const seriesName = new Map(series.map((s) => [s.id, s.data.name]));
+
+const index = [
+  ...entries.map((e) => ({
+  href: `/entries/${e.id}`,
+  name: e.data.name,
+  desc: e.data.desc,
+  shelf: `${categoryName.get(e.data.category.id)} › ${subName.get(e.data.path.id)}`,
+  meta: e.data.complexity,
+  stub: e.data.stub,
+  // Everything a query is matched against, lowercased once at build time.
+  hay: [
+    e.data.name,
+    e.data.desc,
+    e.data.path.id,
+    categoryName.get(e.data.category.id),
+    subName.get(e.data.path.id),
+    ...e.data.tags,
+  ]
+    .join(' ')
+    .toLowerCase(),
+  key: e.data.name.toLowerCase(),
+  })),
+  ...notes.map((n) => ({
+    href: `/notes/${n.id}`,
+    name: n.data.title,
+    desc: n.data.desc,
+    shelf: n.data.series
+      ? `Note › ${seriesName.get(n.data.series) ?? 'series'}`
+      : 'Note',
+    meta: `${n.data.minutes} min`,
+    stub: n.data.unfinished,
+    hay: [n.data.title, n.data.desc, 'note', seriesName.get(n.data.series ?? ''), ...n.data.tags]
+      .filter(Boolean)
+      .join(' ')
+      .toLowerCase(),
+    key: n.data.title.toLowerCase(),
+  })),
+];
+---
+
+<div
+  data-search-panel
+  hidden
+  class="fixed inset-0 z-50 flex justify-center bg-ink/80 px-4 pt-[12vh] backdrop-blur-[3px]"
+>
+  <div
+    role="dialog"
+    aria-modal="true"
+    aria-label="Search the grimoire"
+    class="flex max-h-[70vh] w-full max-w-[620px] animate-fade flex-col border border-rule-strong bg-panel"
+  >
+    <div class="flex items-center gap-3 border-b border-rule px-4 py-3.5">
+      <span class="font-mono text-[13px] text-accent">$</span>
+      <input
+        data-search-input
+        type="text"
+        autocomplete="off"
+        spellcheck="false"
+        placeholder="search entries, tags, shelves…"
+        class="min-w-0 flex-1 bg-transparent font-mono text-[13px] text-chalk outline-none placeholder:text-dim-3"
+      />
+      <button
+        type="button"
+        data-search-close
+        aria-label="Close search"
+        class="font-mono text-[10px] tracking-[0.14em] text-dim-3 uppercase hover:text-chalk"
+      >
+        esc
+      </button>
+    </div>
+
+    <div data-search-results class="min-h-0 flex-1 overflow-y-auto"></div>
+
+    <div
+      class="border-t border-rule px-4 py-2.5 font-mono text-[10px] tracking-[0.1em] text-dim-3 uppercase"
+    >
+      <span data-search-count></span> · ↑↓ to move · ↵ to open
+    </div>
+  </div>
+</div>
+
+<script is:inline define:vars={{ index }}>
+  window.__GRIMOIRE_INDEX__ = index;
+</script>
+
+<script>
+  interface Row {
+    href: string;
+    name: string;
+    desc: string;
+    shelf: string;
+    meta: string;
+    stub: boolean;
+    hay: string;
+    key: string;
+  }
+
+  declare global {
+    interface Window {
+      __GRIMOIRE_INDEX__?: Row[];
+    }
+  }
+
+  const panel = document.querySelector<HTMLElement>('[data-search-panel]');
+  const input = document.querySelector<HTMLInputElement>('[data-search-input]');
+  const list = document.querySelector<HTMLElement>('[data-search-results]');
+  const count = document.querySelector<HTMLElement>('[data-search-count]');
+
+  if (panel && input && list && count) {
+    const index = window.__GRIMOIRE_INDEX__ ?? [];
+    let hits: Row[] = [];
+    let cursor = 0;
+
+    /**
+     * Rank by where the query lands, not just whether it does: a title that
+     * starts with the query beats one that merely contains it, which beats a
+     * match anywhere in the description, tags or shelf path.
+     */
+    const rank = (row: Row, q: string) => {
+      if (row.key.startsWith(q)) return 0;
+      if (row.key.includes(q)) return 1;
+      if (row.hay.includes(q)) return 2;
+      return -1;
+    };
+
+    const escape = (s: string) =>
+      s.replace(
+        /[&<>"]/g,
+        (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c]!
+      );
+
+    /** The matched run, marked in the title so the reason for a hit is visible. */
+    const highlight = (name: string, q: string) => {
+      const at = name.toLowerCase().indexOf(q);
+      if (at < 0) return escape(name);
+      return (
+        escape(name.slice(0, at)) +
+        '<mark class="bg-transparent text-accent">' +
+        escape(name.slice(at, at + q.length)) +
+        '</mark>' +
+        escape(name.slice(at + q.length))
+      );
+    };
+
+    const render = () => {
+      if (!hits.length) {
+        list.innerHTML =
+          '<p class="m-0 px-4 py-6 font-mono text-[12px] text-dim">' +
+          (input.value.trim() ? 'No entry matches that.' : 'Type to search.') +
+          '</p>';
+        count.textContent = input.value.trim() ? '0 matches' : `${index.length} entries`;
+        return;
+      }
+
+      const q = input.value.trim().toLowerCase();
+      list.innerHTML = hits
+        .map(
+          (row, i) =>
+            `<a href="${row.href}" data-hit="${i}" class="block border-b border-rule-faint border-l-2 px-4 py-3 ${
+              i === cursor ? 'border-l-accent bg-raise' : 'border-l-transparent'
+            }">` +
+            `<div class="flex items-baseline justify-between gap-3">` +
+            `<span class="text-[16px] text-bone">${highlight(row.name, q)}${
+              row.stub ? '<span class="eyebrow ml-2 text-accent">open</span>' : ''
+            }</span>` +
+            `<span class="shrink-0 font-mono text-[11px] text-accent">${escape(row.meta)}</span>` +
+            `</div>` +
+            `<div class="mt-0.5 font-mono text-[10px] tracking-[0.08em] text-dim-3 uppercase">${escape(row.shelf)}</div>` +
+            `</a>`
+        )
+        .join('');
+      count.textContent = `${hits.length} match${hits.length === 1 ? '' : 'es'}`;
+    };
+
+    const search = () => {
+      const q = input.value.trim().toLowerCase();
+      hits = q
+        ? index
+            .map((row) => ({ row, score: rank(row, q) }))
+            .filter((r) => r.score >= 0)
+            .sort((a, b) => a.score - b.score || a.row.name.localeCompare(b.row.name))
+            .slice(0, 12)
+            .map((r) => r.row)
+        : [];
+      cursor = 0;
+      render();
+    };
+
+    const open = () => {
+      panel.hidden = false;
+      document.body.style.overflow = 'hidden';
+      input.focus();
+      input.select();
+      render();
+    };
+
+    const close = () => {
+      panel.hidden = true;
+      document.body.style.overflow = '';
+    };
+
+    const move = (delta: number) => {
+      if (!hits.length) return;
+      cursor = (cursor + delta + hits.length) % hits.length;
+      render();
+      list.querySelector(`[data-hit="${cursor}"]`)?.scrollIntoView({ block: 'nearest' });
+    };
+
+    document
+      .querySelectorAll<HTMLButtonElement>('[data-search-open]')
+      .forEach((b) => b.addEventListener('click', open));
+    document
+      .querySelectorAll<HTMLButtonElement>('[data-search-close]')
+      .forEach((b) => b.addEventListener('click', close));
+
+    // A click on the backdrop, but not one that started inside the dialog.
+    panel.addEventListener('click', (event) => {
+      if (event.target === panel) close();
+    });
+
+    input.addEventListener('input', search);
+
+    input.addEventListener('keydown', (event) => {
+      if (event.key === 'ArrowDown') {
+        event.preventDefault();
+        move(1);
+      } else if (event.key === 'ArrowUp') {
+        event.preventDefault();
+        move(-1);
+      } else if (event.key === 'Enter' && hits[cursor]) {
+        event.preventDefault();
+        window.location.href = hits[cursor]!.href;
+      } else if (event.key === 'Escape') {
+        close();
+      }
+    });
+
+    document.addEventListener('keydown', (event) => {
+      const typing =
+        document.activeElement instanceof HTMLInputElement ||
+        document.activeElement instanceof HTMLTextAreaElement;
+
+      if ((event.key === 'k' || event.key === 'K') && (event.metaKey || event.ctrlKey)) {
+        event.preventDefault();
+        panel.hidden ? open() : close();
+      } else if (event.key === '/' && panel.hidden && !typing) {
+        event.preventDefault();
+        open();
+      } else if (event.key === 'Escape' && !panel.hidden) {
+        close();
+      }
+    });
+  }
+</script>

@@ -1,0 +1,62 @@
+---
+/**
+ * Client-side pagination for a run of rows.
+ *
+ * Two modes, because two callers want different things. Left to itself
+ * (`auto`, the default) the pager finds the nearest enclosing `[data-paged]`
+ * and takes charge of every `[data-row]` inside it — drop it after a list and
+ * it works. Given `auto={false}` it renders the controls and nothing else, for
+ * the index page, whose own script has to interleave paging with filtering and
+ * sorting and cannot have a second script fighting it for the same rows.
+ *
+ * Either way every row stays in the document and is merely hidden, so grep,
+ * in-page find and a crawler all still see the whole list.
+ */
+interface Props {
+  /** Rows per page. The controls hide themselves below this many rows. */
+  per?: number;
+  /** Drive the rows in the enclosing `[data-paged]`. Off for hand-driven lists. */
+  auto?: boolean;
+  label?: string;
+  class?: string;
+}
+
+const { per = 10, auto = true, label = 'Pages', class: className } = Astro.props;
+---
+
+<nav
+  data-pager
+  data-per={per}
+  data-auto={auto ? '' : undefined}
+  hidden
+  aria-label={label}
+  class:list={[
+    'mt-7 flex flex-wrap items-center justify-between gap-x-6 gap-y-3 border-t border-rule pt-5 font-mono text-[11px]',
+    className,
+  ]}
+>
+  <span data-range class="text-dim-2"></span>
+  <div class="flex flex-wrap items-center gap-1.5">
+    <button
+      type="button"
+      data-page-prev
+      class="border border-edge px-2.5 py-1 text-mute-2 transition-colors hover:border-accent hover:text-chalk disabled:pointer-events-none disabled:text-dim-3 disabled:opacity-40"
+    >
+      ← prev
+    </button>
+    <div data-page-numbers class="flex flex-wrap items-center gap-1.5"></div>
+    <button
+      type="button"
+      data-page-next
+      class="border border-edge px-2.5 py-1 text-mute-2 transition-colors hover:border-accent hover:text-chalk disabled:pointer-events-none disabled:text-dim-3 disabled:opacity-40"
+    >
+      next →
+    </button>
+  </div>
+</nav>
+
+<script>
+  import { autoPager } from '../lib/pager';
+
+  autoPager();
+</script>

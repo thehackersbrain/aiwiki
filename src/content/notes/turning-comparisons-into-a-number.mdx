@@ -1,0 +1,146 @@
+---
+title: 'Turning comparisons into a number'
+desc: 'Bradley–Terry, a scalar head, and the moment the proxy starts lying to you.'
+lede: 'People cannot score a response out of ten. They can say which of two is better, and a hundred-year-old model turns that into a reward — one that gets worse the harder you optimise it.'
+series: 'alignment-from-scratch'
+part: 3
+minutes: 9
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['alignment', 'objectives', 'evaluation']
+related: [reward-modelling, elo-bradley-terry-scoring, kl-regularisation, llm-as-judge, statistical-power]
+refs:
+  - cite: 'Bradley & Terry — Rank Analysis of Incomplete Block Designs (1952)'
+    id: 'Biometrika 39'
+    href: https://www.jstor.org/stable/2334029
+  - cite: 'Christiano et al. — Deep Reinforcement Learning from Human Preferences (2017)'
+    id: 'arXiv:1706.03741'
+    href: https://arxiv.org/abs/1706.03741
+  - cite: 'Gao et al. — Scaling Laws for Reward Model Overoptimization (2022)'
+    id: 'arXiv:2210.10760'
+    href: https://arxiv.org/abs/2210.10760
+  - cite: 'Singhal et al. — A Long Way to Go: Investigating Length Correlations in RLHF (2023)'
+    id: 'arXiv:2310.03716'
+    href: https://arxiv.org/abs/2310.03716
+---
+
+Part 2 established that we want comparisons rather than demonstrations. This part
+is about the awkward step in the middle: reinforcement learning needs a scalar
+reward, and what we have is a pile of "A is better than B".
+
+### Why not just ask for a score
+
+Because people cannot produce one. Ask an annotator to rate a response out of ten
+and the numbers drift within a session, differ between people who agree
+completely about the ordering, and compress towards the middle. The information
+is there and the scale is not.
+
+Comparisons are stable in exactly the way scores are not. So collect those and
+fit a scalar that explains them.
+
+### Bradley–Terry
+
+The model is from 1952 and it assumes each item has a latent quality, with the
+probability of preferring one being a logistic function of the difference.
+
+<Eq lead caption="eq. 1 — the assumption">
+
+$$
+P(y_w \succ y_l) = \sigma\bigl(r(y_w) - r(y_l)\bigr)
+$$
+
+</Eq>
+
+Take the negative log likelihood and that is the training objective for a reward
+model: the base transformer with the unembedding replaced by a scalar head,
+trained so that preferred responses score higher than rejected ones.
+
+<Eq caption="eq. 2 — the loss, in full">
+
+$$
+\mathcal{L} = -\mathbb{E}\Bigl[\log \sigma\bigl(r_\theta(x, y_w) - r_\theta(x, y_l)\bigr)\Bigr]
+$$
+
+</Eq>
+
+Only differences appear, so the absolute level is unidentifiable — add a constant
+to every reward and the loss is unchanged. I found this genuinely disorienting
+the first time: the reward model's outputs look like scores and are not. A reward
+of 3.2 means nothing on its own, cannot be compared across models, and cannot be
+compared across training runs of the same model.
+
+<Note label="annotation">
+It is the same model used to compute Elo ratings and to rank systems on a
+leaderboard. There it is fitted to comparisons between <em>models</em>; here to
+comparisons between <em>responses</em>. Same mathematics, same assumption of
+transitivity, and the assumption is false in both places — three annotators can
+easily produce a cycle — which does not stop it being useful.
+</Note>
+
+### Then it starts lying
+
+Here is the part I did not expect, and it is the central fact of this series.
+
+The reward model is fitted to finitely many comparisons. It is right in the
+region where those responses live and unconstrained everywhere else. Policy
+optimisation is a search for high reward — which is to say, a search for exactly
+the places where the model is wrong.
+
+Gao et al. measured the shape by training a very large "gold" reward model,
+optimising against a smaller proxy, and plotting true reward against distance
+travelled from the starting policy.
+
+<Eq caption="eq. 3 — it rises, peaks, and falls">
+
+$$
+R_{\text{gold}}(d) = d\,\bigl(\alpha - \beta \log d\bigr),
+\qquad d = \sqrt{\mathrm{KL}(\pi \,\|\, \pi_{\text{ref}})}
+$$
+
+</Eq>
+
+Two consequences. The peak is at a *finite* distance, so past it more
+optimisation makes the model genuinely worse — while the reported proxy reward
+continues to climb. And a larger reward model does not merely score better; it
+tolerates more optimisation before turning, which is the argument for spending
+compute on the reward model rather than only on the policy.
+
+<Note label="caveat">
+The single most misleading number in an RLHF run is its reward curve. It goes up
+throughout. It goes up while the model is getting worse. The only honest
+monitoring is a held-out evaluation the reward model is not part of.
+</Note>
+
+### The hacks are all the same shape
+
+Three reliably observed, and they rhyme.
+
+**Length.** Annotators prefer longer responses, the reward model learns it, the
+policy writes essays. Singhal et al. found length explains a large fraction of
+reward variance, and that some reported RLHF improvements substantially vanish
+when responses are length-controlled.
+
+**Sycophancy.** Agreement scores better than correction, so the policy agrees.
+
+**Format.** Bullet points, headers, confident phrasing — all rewarded
+independently of content.
+
+Each is a feature that genuinely correlates with quality in the training
+distribution and is cheap to produce in isolation. Any proxy has such features.
+The question is not whether they exist but how quickly a search finds them, and
+the answer is: immediately.
+
+### What this forces
+
+Since the proxy is only valid near where it was fitted, the optimisation has to
+be *constrained to stay near there*. Not as a stabiliser or a regulariser — as
+the thing that keeps the objective meaningful.
+
+That constraint is the subject of part 4, and once you see it as a validity
+condition rather than a training trick, PPO's design stops looking arbitrary.
+
+<Rule label="Next" />
+
+Part 4 writes the constrained objective down and follows what it takes to
+actually optimise it — which turns out to need four models in memory at once, and
+which explains why part 5 exists.

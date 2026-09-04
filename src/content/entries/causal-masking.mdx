@@ -1,0 +1,128 @@
+---
+name: 'Causal Masking'
+desc: 'The triangular mask that turns one forward pass into n training examples.'
+category: 'architectures'
+complexity: 'O(n²)'
+path: 'architectures/attention'
+difficulty: 'introductory'
+described: '2017'
+status: 'standard'
+revised: 2026-08-24
+added: 2025-02-08
+tags: ['attention', 'training', 'core']
+lede: 'Attention is unordered and sees everything. A lower-triangular mask is what makes a decoder autoregressive, and what lets a single sequence supply <i>n</i> next-token predictions at once.'
+implNote:
+  label: 'caveat'
+  html: 'Mask with a large negative constant, not <code>-inf</code>. A fully masked row of <code>-inf</code> softmaxes to <code>NaN</code>, and padding plus causality produces fully masked rows more often than you would expect.'
+related: [scaled-dot-product-attention, multi-head-attention, cross-attention, supervised-fine-tuning]
+refs:
+  - cite: 'Vaswani et al. — Attention Is All You Need (2017)'
+    id: 'arXiv:1706.03762'
+    href: https://arxiv.org/abs/1706.03762
+  - cite: 'Radford et al. — Improving Language Understanding by Generative Pre-Training (2018)'
+    id: 'openai-gpt'
+    href: https://cdn.openai.com/research-covers/language-unsupervised/language_understanding_paper.pdf
+  - cite: 'Raffel et al. — Exploring the Limits of Transfer Learning with T5 (2019)'
+    id: 'arXiv:1910.10683'
+    href: https://arxiv.org/abs/1910.10683
+---
+
+Attention as written attends to everything. To model $p(x_t \mid x_{<t})$ the
+operation has to be prevented from reading forward, and the cheapest way to do
+that is to add $-\infty$ to the logits it must not use.
+
+<Eq caption="eq. 1 — additive mask, applied before the softmax" lead>
+
+$$
+M_{ij} = \begin{cases} 0 & j \le i \\ -\infty & j > i \end{cases}
+\qquad
+A = \softmax\!\left( \frac{QK^{\top}}{\sqrt{d_k}} + M \right)
+$$
+
+</Eq>
+
+<Note label="in numbers">
+At $n = 4096$ the mask discards just under half the attention matrix — 8.4 M of
+16.8 M entries per head. Dense kernels compute all of it anyway.
+</Note>
+
+The mask is additive rather than multiplicative because it has to act *before*
+normalisation. Zeroing entries of $A$ afterwards would leave the rows summing to
+less than one; adding $-\infty$ to the logits removes the terms from the
+denominator as well.
+
+### What it buys
+
+Every row of the masked attention matrix is a valid prediction context. A
+sequence of length $n$ therefore yields $n$ training examples from one forward
+pass, at the cost of one — this is the reason decoder-only pre-training is as
+sample-efficient as it is, and it is a property of the mask, not of the
+architecture.
+
+<Eq caption="eq. 2 — the loss every position contributes to">
+
+$$
+L = -\frac{1}{n} \sum_{t=1}^{n} \log p_\theta(x_t \mid x_{<t})
+$$
+
+</Eq>
+
+### Variants worth knowing
+
+<Note label="aside">
+A prefix-LM mask is causal on the suffix and bidirectional on the prefix, which
+lets the instruction be read in both directions while the answer stays
+autoregressive.
+</Note>
+
+The strictly triangular mask is the common case, not the only one. Document
+packing wants a block-diagonal mask so that concatenated documents cannot attend
+across the join. Prefix-LM wants a rectangular bidirectional region.
+[Sliding-window attention](/entries/sliding-window-attention) is a band mask.
+All of them are the same mechanism with a different boolean array, which is why
+a kernel that takes an arbitrary mask is more useful than one with `is_causal`
+hard-coded — though the hard-coded one is faster, because it can skip whole tiles.
+
+### The off-by-one that will bite you
+
+The mask allows $j \le i$, not $j < i$: a position attends to itself. Getting
+this wrong shifts the model by one token and produces a loss curve that looks
+plausible, converges, and generates nonsense. Check it by feeding the model a
+sequence and confirming that the logits at position $t$ are unchanged when
+position $t+1$ is altered.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor
+
+
+def causal_mask(n: int, device: torch.device) -> Tensor:
+    """True where attention is forbidden. Note `diagonal=1`: self is allowed."""
+    return torch.ones(n, n, dtype=torch.bool, device=device).triu(diagonal=1)
+
+
+def document_mask(doc_ids: Tensor) -> Tensor:
+    """Causal *and* within-document, for packed training batches. [B, N] -> [B, 1, N, N]."""
+    n = doc_ids.size(-1)
+    causal = torch.ones(n, n, dtype=torch.bool, device=doc_ids.device).triu(1)
+    cross = doc_ids[:, :, None] != doc_ids[:, None, :]
+    return (causal | cross)[:, None]
+
+
+def apply(logits: Tensor, mask: Tensor) -> Tensor:
+    # A finite floor, so a fully masked row degrades to uniform rather than NaN.
+    floor = torch.finfo(logits.dtype).min / 2
+    return logits.masked_fill(mask, floor)
+```
+
+</CodeFrame>
+
+Build the mask once and cache it by length; regenerating a $4096 \times 4096$
+boolean tensor per step is a measurable fraction of a small model's step time.
+Better still, pass `is_causal=True` to a fused kernel and never materialise it —
+the tiles above the diagonal are then skipped rather than computed and discarded,
+which is most of the point.

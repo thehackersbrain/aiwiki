@@ -1,0 +1,127 @@
+---
+name: 'Gradient Clipping'
+desc: 'Bound the update norm so one bad batch cannot destroy a run.'
+category: 'training'
+complexity: 'O(P)'
+path: 'training/optimisers'
+difficulty: 'introductory'
+described: '2013'
+status: 'standard'
+statusNote: 'In every large training run without exception. One line, one hyperparameter, and the difference between a loss spike and a restart from checkpoint.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['optimisers', 'training', 'core']
+lede: 'Gradients are usually well-behaved and occasionally are not. Rescaling the whole gradient when its norm exceeds a threshold preserves the direction, discards the magnitude, and costs one reduction.'
+metrics:
+  caption: 'Standard configuration'
+  rows:
+    - { label: 'Threshold', value: '1.0' }
+    - { label: 'Norm type', value: 'global ℓ₂' }
+    - { label: 'Batches clipped', value: '< 1% healthy', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Global, not per-parameter. Clipping each tensor separately changes the <em>direction</em> of the update, which is the one property clipping is supposed to preserve.'
+related: [adamw, stochastic-gradient-descent, learning-rate-schedules, recurrent-neural-networks, floating-point-formats, qk-normalisation]
+refs:
+  - cite: 'Pascanu et al. — On the difficulty of training Recurrent Neural Networks (2013)'
+    id: 'arXiv:1211.5063'
+    href: https://arxiv.org/abs/1211.5063
+  - cite: 'Zhang et al. — Why Gradient Clipping Accelerates Training: A Theoretical Justification for Adaptivity (2019)'
+    id: 'arXiv:1905.11881'
+    href: https://arxiv.org/abs/1905.11881
+  - cite: 'Chowdhery et al. — PaLM: Scaling Language Modeling with Pathways (2022)'
+    id: 'arXiv:2204.02311'
+    href: https://arxiv.org/abs/2204.02311
+---
+
+<Eq lead caption="eq. 1 — rescale if too long, otherwise leave alone">
+
+$$
+g \leftarrow g \cdot \min\!\left(1, \frac{c}{\|g\|_2}\right)
+$$
+
+</Eq>
+
+Direction preserved exactly, magnitude capped at $c$. That is the entire method,
+and it is in every large training run.
+
+### What it protects against
+
+A loss landscape is not uniformly smooth. Most of it is gentle and some of it is
+a cliff, and a gradient evaluated near a cliff is enormous — large enough that a
+normally-sized learning rate carries the parameters somewhere arbitrary. From
+there the model may recover over thousands of steps, or may not recover at all.
+
+<Note label="annotation">
+Clipping is not a substitute for a correct learning rate. It bounds the damage
+from the tail of the gradient distribution; if the <em>typical</em> gradient is
+being clipped, the learning rate is wrong and clipping is quietly turning the
+optimiser into normalised steepest descent.
+</Note>
+
+Zhang et al. give the theory. Standard convergence analysis assumes a global
+Lipschitz constant on the gradient, which deep networks do not have — but they do
+satisfy a local condition where smoothness grows with gradient norm. Under that
+condition, clipped descent converges strictly faster than unclipped, and the
+speed-up is not a safety margin but a genuinely better rate.
+
+### The diagnostic
+
+The gradient norm is the single most useful scalar to log during training. In a
+healthy run it is roughly stationary with occasional excursions.
+
+| Pattern | Reading |
+| --- | --- |
+| flat, below threshold | healthy |
+| occasional spikes, clipped | working as intended |
+| clipped every step | learning rate too high |
+| trending up over training | instability building |
+| NaN | already too late — check for overflow |
+
+PaLM's authors report loss spikes that clipping did not prevent, and their
+mitigation is worth knowing: restart from a checkpoint a few hundred steps back
+and skip the batches around the spike. The spikes were not reproducible from the
+same checkpoint on different data, which points at specific batches rather than
+at the optimiser.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor
+
+
+@torch.no_grad()
+def clip_grad_norm(params: list[Tensor], max_norm: float = 1.0) -> Tensor:
+    """Global ℓ₂ clip. Returns the pre-clip norm — log it."""
+    grads = [p.grad for p in params if p.grad is not None]
+
+    # One norm over every parameter, not one per tensor: the direction of the
+    # whole update is what must be preserved.
+    total = torch.linalg.vector_norm(
+        torch.stack([torch.linalg.vector_norm(g) for g in grads])
+    )
+
+    # 1e-6 guards a genuinely zero gradient; clamp caps the scale at 1 so a
+    # small gradient is never scaled up.
+    scale = (max_norm / (total + 1e-6)).clamp(max=1.0)
+    torch._foreach_mul_(grads, scale)
+    return total
+```
+
+</CodeFrame>
+
+Two details that bite. Under gradient accumulation, clip once after the last
+micro-batch — clipping each one caps a partial gradient and changes the
+accumulated direction. And under data parallelism, clip after the all-reduce:
+each rank holds a partial gradient whose norm is not the global norm, and
+clipping first gives every rank a different, wrong scale.
+
+<Rule label="Value clipping, which is not the same thing" />
+
+`clip_grad_value_` clamps each component independently. That changes the update
+direction — it is closer to a crude sign method than to norm clipping — and it is
+almost never what is wanted. It appears in old RL code and should not be copied
+from there.

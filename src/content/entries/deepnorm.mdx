@@ -1,0 +1,143 @@
+---
+name: 'DeepNorm'
+desc: 'Post-norm with a scaled residual and depth-aware initialisation, to a thousand layers.'
+category: 'architectures'
+complexity: '—'
+path: 'architectures/normalisation'
+difficulty: 'advanced'
+described: '2022'
+status: 'emerging'
+statusNote: 'Demonstrated at 1000 layers and then largely bypassed — the field went wider rather than deeper. Correct, well-motivated, and waiting for a reason to be needed.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['normalisation', 'training']
+lede: 'Post-norm trains to better loss and diverges past a few dozen layers. DeepNorm keeps the arrangement and bounds the per-layer update by construction, with two constants that depend on depth.'
+metrics:
+  caption: 'DeepNet, Wang et al. 2022'
+  rows:
+    - { label: 'Depth reached', value: '1 000 layers' }
+    - { label: 'Encoder α', value: '(2N)^(1/4)' }
+    - { label: 'Update bound', value: 'O(1/√N)', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'The two constants are not independent. α scales up the residual and β scales down the initialisation, and getting one right with the other wrong is worse than plain post-norm — the bound is a product.'
+related: [pre-norm-and-post-norm, layer-normalisation, rmsnorm, gradient-checkpointing, learning-rate-schedules]
+refs:
+  - cite: 'Wang et al. — DeepNet: Scaling Transformers to 1,000 Layers (2022)'
+    id: 'arXiv:2203.00555'
+    href: https://arxiv.org/abs/2203.00555
+  - cite: 'Xiong et al. — On Layer Normalization in the Transformer Architecture (2020)'
+    id: 'arXiv:2002.04745'
+    href: https://arxiv.org/abs/2002.04745
+  - cite: 'Zhang et al. — Improving Deep Transformer with Depth-Scaled Initialization (2019)'
+    id: 'arXiv:1908.11365'
+    href: https://arxiv.org/abs/1908.11365
+---
+
+[Post-norm](/entries/pre-norm-and-post-norm) reaches lower loss than pre-norm at
+equal size, and cannot be trained past a few dozen layers. Both facts are well
+established, and the usual response is to accept the second and give up the
+first. DeepNorm asks whether the instability can be removed without changing the
+arrangement.
+
+<Eq lead caption="eq. 1 — post-norm, with the residual weighted">
+
+$$
+x_{\ell+1} = \mathrm{LN}\bigl(\alpha\, x_\ell + F(x_\ell)\bigr)
+$$
+
+</Eq>
+
+$\alpha > 1$ makes the residual term dominant inside the norm, so the block's own
+output is a controlled fraction of what comes out. Paired with an initialisation
+scaled down by $\beta$, the size of the update that each step applies to the
+model output can be bounded independently of depth.
+
+### The bound
+
+The paper's argument is about $\|\Delta F\|$ — how much the model's output moves
+after one optimiser step. For plain post-norm this grows with $N$: deeper means a
+larger jump per step, and past some depth the first few steps leave the region
+where the loss is well-behaved and the run never recovers.
+
+<Eq caption="eq. 2 — what the constants are chosen to achieve">
+
+$$
+\|\Delta F\| \le \sum_{\ell} \frac{c_\ell}{\alpha^2}\,\|\theta_\ell\|
+\;=\; O\!\left(\frac{1}{\sqrt{N}}\right)
+\qquad\text{with}\quad
+\alpha = (2N)^{1/4},\;\; \beta = (8N)^{-1/4}
+$$
+
+</Eq>
+
+For a decoder-only stack of $N$ layers those are the encoder constants; the
+decoder side of an encoder–decoder model uses $\alpha = (3M)^{1/4}$ and
+$\beta = (12M)^{-1/4}$, where $M$ is the decoder depth. The quarter powers come
+out of the second-order expansion and are not adjustable — this is a derivation,
+not a hyperparameter search.
+
+<Note label="annotation">
+Note which parameters $\beta$ applies to: the value and output projections in
+attention, and both feed-forward matrices. Not the query and key projections,
+whose scale cancels in the softmax anyway, and not the embeddings.
+</Note>
+
+### The result
+
+DeepNet trains a 1000-layer, 200-block encoder–decoder to convergence with no
+warmup and no learning-rate babysitting, and beats a 48-layer baseline on
+multilingual translation by a wide margin. The comparison worth noting is not
+depth for its own sake: at *matched parameter count*, the deep-and-thin
+configuration wins, which is a claim about the value of depth that the field has
+not really followed up.
+
+It has not been widely adopted, and the reason is prosaic. Depth costs
+sequential dependency, which costs pipeline bubbles and inter-device latency;
+width parallelises and depth does not. So models went wide, and the case for
+1000 layers never became pressing enough for anyone to work through two
+depth-dependent constants.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import math
+
+from torch import Tensor, nn
+
+
+def deepnorm_constants(encoder_layers: int, decoder_layers: int = 0) -> dict:
+    """Wang et al. 2022, table 2. Decoder-only stacks use the encoder pair."""
+    n, m = encoder_layers, decoder_layers
+    if m == 0:
+        return {"alpha": (2 * n) ** 0.25, "beta": (8 * n) ** -0.25}
+    return {
+        "encoder": {"alpha": 0.81 * (n**4 * m) ** 0.0625, "beta": 0.87 * (n**4 * m) ** -0.0625},
+        "decoder": {"alpha": (3 * m) ** 0.25, "beta": (12 * m) ** -0.25},
+    }
+
+
+class DeepNormBlock(nn.Module):
+    def __init__(self, dim: int, alpha: float, beta: float, **kw):
+        super().__init__()
+        self.alpha = alpha
+        self.n1, self.n2 = nn.LayerNorm(dim), nn.LayerNorm(dim)
+        self.attn, self.ffn = Attention(dim, **kw), FeedForward(dim)
+
+        # β scales only v_proj, out_proj and both FFN matrices — not q or k.
+        for module in (self.attn.v, self.attn.out, self.ffn.up, self.ffn.down):
+            nn.init.xavier_normal_(module.weight, gain=beta)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.n1(self.alpha * x + self.attn(x))
+        return self.n2(self.alpha * x + self.ffn(x))
+```
+
+</CodeFrame>
+
+The constants are functions of the *final* depth, so a curriculum that grows the
+network during training invalidates them — either fix the depth up front or
+recompute $\alpha$ and $\beta$ and accept that the weights below were initialised
+against different ones.

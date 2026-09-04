@@ -1,0 +1,169 @@
+---
+title: 'What attention cannot do'
+desc: 'Four limits that are structural rather than incidental, and the behaviours each one explains.'
+lede: 'The softmax must sum to one, the operation has no idea what order anything is in, and a head cannot loop. Several things that look like bugs are these three facts showing through.'
+series: 'attention-from-scratch'
+part: 6
+minutes: 10
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['attention', 'foundations', 'limits']
+related: [attention-sinks, sinusoidal-position-encoding, causal-masking, scaled-dot-product-attention, induction-heads, test-time-compute-scaling]
+refs:
+  - cite: 'Hahn — Theoretical Limitations of Self-Attention in Neural Sequence Models (2019)'
+    id: 'arXiv:1906.06755'
+    href: https://arxiv.org/abs/1906.06755
+  - cite: 'Merrill & Sabharwal — The Parallelism Tradeoff: Limitations of Log-Precision Transformers (2022)'
+    id: 'arXiv:2207.00729'
+    href: https://arxiv.org/abs/2207.00729
+  - cite: 'Xiao et al. — Efficient Streaming Language Models with Attention Sinks (2023)'
+    id: 'arXiv:2309.17453'
+    href: https://arxiv.org/abs/2309.17453
+  - cite: 'Bondarenko et al. — Quantizable Transformers: Removing Outliers by Helping Attention Heads Do Nothing (2023)'
+    id: 'arXiv:2306.12929'
+    href: https://arxiv.org/abs/2306.12929
+---
+
+Five parts building the operation up. This one is about its ceiling — not
+efficiency, which part 4 dealt with, but things the arithmetic cannot express at
+all. Each of the four below explains a behaviour I had previously filed as a
+quirk.
+
+### 1. The softmax cannot abstain
+
+<Eq lead caption="eq. 1 — the constraint, and it is not negotiable">
+
+$$
+\sum_{j} A_{ij} = 1 \qquad \text{for every } i
+$$
+
+</Eq>
+
+A row sums to one whether or not the head has anything to retrieve. There is no
+"nothing relevant here" output; the mass has to land somewhere.
+
+What models do about it is put the mass on a position whose value vector is close
+to useless, and the earliest tokens are the natural candidates because every
+query can see them. That is an [attention sink](/entries/attention-sinks), and
+once you read it as *the operation has no abstain option*, three separate
+observations collapse into one:
+
+- The first token receives over half the attention mass in most heads of most
+  layers, regardless of what that token is.
+- Evicting it with a sliding window destroys generation — not gradually, but
+  immediately.
+- The same heads produce the extreme activation outliers that make those layers
+  hard to quantise, because forcing large mass onto a useless position requires a
+  large value to scale it away.
+
+The proposed fix in both the streaming and the quantisation literature is the
+same, which is a good sign the diagnosis is right: add a $1$ to the softmax
+denominator, belonging to no position, so a row may sum to less than one.
+
+<Note label="annotation">
+I had read all three of those results separately and treated them as unrelated
+curiosities. They are one constraint with three symptoms, and the constraint is
+in eq. 1 — visible from the first day I saw the formula, if I had asked what
+happens when a head has nothing to do.
+</Note>
+
+### 2. It has no idea what order anything is in
+
+Attention is a sum over a set. Permute the inputs and every score, weight and
+output permutes with them — the operation is exactly equivariant, and the notion
+of "before" is absent from it.
+
+This is not a deficiency to be apologised for; it is what makes attention
+parallel, and part 1's whole argument was that parallelism is why it beat
+recurrence. But it means position is bolted on from outside, and every scheme for
+doing so is a compromise the operation itself does not constrain.
+
+The consequence I did not expect is how much downstream difficulty this creates.
+A model's context length is a property of its *position encoding*, not of
+attention — which is why extending it is
+[frequency arithmetic](/entries/rope-scaling) rather than retraining, and why
+models fail past their training length in the specific way they do: the attention
+still computes, and the positions it computes over are meaningless.
+
+<Note label="aside">
+A decoder is the partial exception. <a href="/entries/causal-masking">Causal
+masking</a> is not symmetric, so position <em>i</em> sees a different number of
+tokens than position <em>j</em>, and a model can recover its index from that
+alone. Attention is permutation-invariant; masked attention is not, and that is
+the whole content of the <a href="/entries/nope">NoPE</a> result.
+</Note>
+
+### 3. One layer is one step, and there is no loop
+
+A transformer applies $L$ layers and stops. There is no `while`, no recursion, no
+way to spend more steps on a harder input. Whatever the answer is, it must be
+reachable in a fixed number of parallel steps.
+
+Merrill and Sabharwal make this precise: a transformer with log-precision
+arithmetic can only compute functions in the complexity class $\mathsf{TC}^0$ —
+constant-depth threshold circuits. That excludes problems believed to require
+sequential computation, and it excludes them *for any number of parameters*.
+Making the model bigger does not help, because the bound is about depth.
+
+<Eq caption="eq. 2 — what the bound says, informally">
+
+$$
+\text{one forward pass} \;\subseteq\; \mathsf{TC}^0
+\qquad \not\ni \qquad
+\text{problems needing } \omega(1) \text{ sequential steps}
+$$
+
+</Eq>
+
+The practical escape is the one the field actually took, and reading it this way
+made it much less surprising to me. Chain of thought converts depth into
+*length*: each generated token is a fresh forward pass conditioned on everything
+written so far, so the scratchpad is the loop the architecture does not have.
+[Test-time compute](/entries/test-time-compute-scaling) is not a prompting trick
+that happens to help — it is the only available way to exceed a structural bound.
+
+### 4. Bounded precision blurs long sequences
+
+Hahn's earlier result is narrower and more concrete. Attention weights are
+softmax outputs, and as the sequence grows, a fixed number of mantissa bits
+cannot keep an unbounded number of distinct weights apart. Beyond some length,
+the contribution of any single position to the average becomes indistinguishable
+from zero.
+
+<Eq caption="eq. 3 — one position’s share, as n grows">
+
+$$
+\alpha_{ij} \sim \frac{1}{n} \;\longrightarrow\; \text{below representable resolution}
+$$
+
+</Eq>
+
+Which is the underlying reason for a failure everyone has seen: retrieval from
+very long context degrades in the middle. The usual explanation is training
+distribution, and that is part of it — but there is also an arithmetic floor, and
+a single token's weight competing against a hundred thousand others is near it.
+
+### What this changed for me
+
+I had been treating attention as a general-purpose mechanism with some
+engineering rough edges. It is better understood as a specific operation with
+four hard edges, and most of the interesting work of the last few years is
+someone routing around one of them:
+
+| Limit | The response |
+| --- | --- |
+| cannot abstain | pinned sinks, softmax-plus-one |
+| no order | position encodings, and extending them |
+| no loop | chain of thought, test-time compute |
+| bounded precision | hybrid recall, retrieval |
+
+That table is the most useful thing this series produced for me. When a new
+method appears, asking which row it belongs to usually explains what it is for
+faster than reading the abstract.
+
+<Rule label="End of series" />
+
+Six parts: why the operation exists, how its weights are built, what its output
+contains, where its cost comes from, why there are many of it, and what it cannot
+do. The reference entries state each of these results properly; this was the
+route I took to them, including the two places I had it wrong.

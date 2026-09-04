@@ -1,0 +1,84 @@
+---
+name: 'Multi-Head Latent Attention'
+desc: 'Cache a shared low-rank latent instead of per-head keys and values.'
+category: 'architectures'
+complexity: 'O(n²·d)'
+memory: 'O(n·d_c)'
+path: 'architectures/attention'
+difficulty: 'advanced'
+described: '2024'
+status: 'emerging'
+statusNote: 'Convincing within one model family. The RoPE-compatibility workaround it needs is a real cost, and it has not been reproduced widely.'
+revised: 2026-08-27
+added: 2025-06-30
+tags: ['attention', 'kv-cache', 'inference']
+stub: true
+lede: 'Project the residual stream down to a small latent, cache <i>that</i>, and reconstruct each head’s keys and values from it — a KV cache an order of magnitude smaller than grouped-query attention, at the cost of a compatibility problem with RoPE.'
+metrics:
+  caption: 'DeepSeek-V2 scale, cache per token per layer'
+  rows:
+    - { label: 'MHA', value: '≈ 1.00×' }
+    - { label: 'GQA, g = 8', value: '≈ 0.25×' }
+    - { label: 'MLA', value: '≈ 0.03×', accent: true }
+related: [grouped-query-attention, multi-query-attention, rotary-position-embedding, paged-attention]
+refs:
+  - cite: 'DeepSeek-AI — DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model (2024)'
+    id: 'arXiv:2405.04434'
+    href: https://arxiv.org/abs/2405.04434
+  - cite: 'Ainslie et al. — GQA: Training Generalized Multi-Query Transformer Checkpoints (2023)'
+    id: 'arXiv:2305.13245'
+    href: https://arxiv.org/abs/2305.13245
+---
+
+[Grouped-query attention](/entries/grouped-query-attention) shrinks the KV cache
+by sharing heads. Multi-head latent attention shrinks it by not caching keys and
+values at all: it caches a single low-rank vector $c_t \in \R^{d_c}$ per token,
+with $d_c \ll h \cdot d_h$, and reconstructs every head's keys and values from it
+on demand.
+
+<Eq caption="eq. 1 — one latent down, per-head up" lead>
+
+$$
+c_t = x_t W^{DKV}, \qquad
+k_t^{(i)} = c_t W^{UK}_i, \qquad
+v_t^{(i)} = c_t W^{UV}_i
+$$
+
+</Eq>
+
+<Note label="annotation">
+The up-projections are weights, not activations, so they never enter the cache.
+Only $c_t$ is stored.
+</Note>
+
+The reconstruction looks like it should cost something at every step, and this is
+where the trick is: it does not have to happen. Because
+$q^{\top} k^{(i)} = q^{\top} {W^{UK}_i}^{\top} c$, the up-projection can be
+absorbed into the query projection ahead of time, and the attention scores are
+computed against the latent directly. The same absorption works on the output
+side for $W^{UV}$.
+
+### The RoPE problem
+
+Absorption requires the score to be bilinear in $q$ and $c$.
+[Rotary embeddings](/entries/rotary-position-embedding) insert a
+position-dependent rotation between them, $q^{\top} R_{t-s} k$, and $R$ does not
+commute with the up-projection — so the moment RoPE is applied, $W^{UK}$ can no
+longer be folded away.
+
+DeepSeek's answer is to split the head: most dimensions carry no position and stay
+absorbable, while a small number of *decoupled* dimensions carry RoPE and are
+cached separately, shared across all heads in the manner of multi-query
+attention. The score is the sum of the two parts.
+
+<Rule label="Where this stops" />
+
+This entry is a stub. The mechanism above is accurate, but what is not yet
+written down here is the part that would make it useful: the actual arithmetic of
+the absorbed form, the rank at which quality starts to degrade, and an honest
+comparison against GQA at matched parameters rather than matched cache size. The
+published numbers are from one model family, and I have not reproduced them.
+
+The open question I would want answered first: how much of MLA's reported quality
+comes from the low-rank structure acting as a regulariser, and how much is simply
+that DeepSeek-V2 was a good model for unrelated reasons.

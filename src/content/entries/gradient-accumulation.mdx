@@ -1,0 +1,146 @@
+---
+name: 'Gradient Accumulation'
+desc: 'Simulate a large batch with several small ones, and the normalisation bug that follows.'
+category: 'training'
+complexity: 'O(1)'
+memory: 'O(P)'
+path: 'training/memory'
+difficulty: 'introductory'
+described: '2017'
+status: 'standard'
+statusNote: 'In every training stack. Also the source of a normalisation bug that went unnoticed in several major libraries until late 2024.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['memory', 'training', 'core']
+lede: 'Activation memory scales with batch size and the optimiser only sees the summed gradient. Split the batch, accumulate, step once — mathematically identical, and only if you are careful about the denominator.'
+metrics:
+  caption: 'Effective batch, unchanged'
+  rows:
+    - { label: 'Micro-batch', value: '4' }
+    - { label: 'Accumulation steps', value: '16' }
+    - { label: 'Activation memory', value: '1/16', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Divide by the total number of <em>tokens</em> across all micro-batches, not by the number of micro-batches. When they contain unequal token counts — any variable-length batch — the two differ, and the second silently overweights short sequences.'
+related: [activation-memory-accounting, gradient-clipping, zero-sharding, adamw, gradient-checkpointing, next-token-prediction]
+refs:
+  - cite: 'Goyal et al. — Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour (2017)'
+    id: 'arXiv:1706.02677'
+    href: https://arxiv.org/abs/1706.02677
+  - cite: 'Ott et al. — Scaling Neural Machine Translation (2018)'
+    id: 'arXiv:1806.00187'
+    href: https://arxiv.org/abs/1806.00187
+  - cite: 'Unsloth — Bugs in LLM Training: Gradient Accumulation Fix (2024)'
+    id: 'unsloth.ai'
+    href: https://unsloth.ai/blog/gradient
+---
+
+Large batches are wanted for stable gradients and good hardware utilisation. They
+are limited by [activation memory](/entries/activation-memory-accounting), which
+scales linearly with batch size.
+
+The gradient of a sum is the sum of gradients, so the batch can be split.
+
+<Eq lead caption="eq. 1 — the identity the technique rests on">
+
+$$
+\nabla_\theta \frac{1}{|\mathcal{B}|}\sum_{i \in \mathcal{B}} \ell_i
+= \frac{1}{|\mathcal{B}|} \sum_{k} \sum_{i \in \mathcal{B}_k} \nabla_\theta \ell_i
+$$
+
+</Eq>
+
+Run each micro-batch forward and backward, let the gradients accumulate in
+`.grad`, and step after the last one. Activations for one micro-batch at a time,
+optimiser behaviour of the full batch.
+
+<Note label="annotation">
+Note what is <em>not</em> saved: parameters, gradients and optimiser state are
+all still resident, and they do not depend on batch size. Accumulation addresses
+one of the four occupants of training memory, and it happens to be the one that
+scales with the thing you control.
+</Note>
+
+### The normalisation bug
+
+Eq. 1 divides by $|\mathcal{B}|$ — the total number of examples, or for a
+language model the total number of *tokens*. The natural implementation divides
+each micro-batch's loss by the number of accumulation steps instead.
+
+Those agree only when every micro-batch has the same token count.
+
+<Eq caption="eq. 2 — the two denominators, and when they differ">
+
+$$
+\underbrace{\frac{1}{\sum_k n_k}\sum_k \sum_i \ell_i}_{\text{correct}}
+\qquad\ne\qquad
+\underbrace{\frac{1}{K}\sum_k \frac{1}{n_k}\sum_i \ell_i}_{\text{common}}
+$$
+
+</Eq>
+
+The second is a mean of means. A micro-batch of 100 tokens and one of 1000
+contribute equally, so short sequences are weighted ten times too heavily.
+
+This was found in late 2024 to affect several widely used fine-tuning libraries.
+The symptom was that runs with accumulation reached measurably worse loss than
+the equivalent large batch — attributed for some time to accumulation being
+"approximate", which it is not. It is exact, and the implementations were wrong.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import nn
+
+
+def train_step(model: nn.Module, opt, batches: list, clip: float = 1.0) -> float:
+    """One optimiser step over several micro-batches."""
+    opt.zero_grad(set_to_none=True)
+
+    # Count the tokens first: the denominator is the total, not the batch count.
+    total_tokens = sum(int(b["labels"].ne(-100).sum()) for b in batches)
+    running = 0.0
+
+    for i, b in enumerate(batches):
+        # Sum reduction, scaled once by the global denominator.
+        out = model(**b, reduction="sum")
+        loss = out.loss / total_tokens
+
+        # Skip the all-reduce on every micro-batch but the last.
+        sync = i == len(batches) - 1
+        with model.no_sync() if not sync and hasattr(model, "no_sync") else nullcontext():
+            loss.backward()
+
+        running += loss.item()
+
+    # Clip after accumulation, on the complete gradient.
+    torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+    opt.step()
+    return running
+```
+
+</CodeFrame>
+
+Two details beyond the denominator.
+
+`no_sync` matters under data parallelism. Without it, DDP all-reduces the
+gradient after every micro-batch — sixteen collectives per step where one is
+needed, which on a slow interconnect is most of the step time.
+
+And [clipping](/entries/gradient-clipping) belongs after the loop. Clipping each
+micro-batch bounds a partial gradient and changes the direction of the
+accumulated one, which is the property clipping exists to preserve.
+
+<Rule label="What it cannot fix" />
+
+Batch normalisation, if any survives in the model, computes statistics per
+forward pass — so a micro-batch of 4 gives statistics of 4, not of 64.
+Accumulation is exact for everything else and not for that, which is one more
+entry on [BatchNorm's](/entries/batch-normalisation) list of incompatibilities.
+
+The hardware limit also remains. Micro-batches below about 8 leave the GPU
+underutilised, so accumulation trades memory for wall-clock beyond that point
+rather than getting it free.

@@ -1,0 +1,171 @@
+---
+name: 'Memory-Efficient Optimisers'
+desc: 'Adam’s state is twice the model; factorise it, quantise it, or project it.'
+category: 'training'
+complexity: 'O(P)'
+memory: 'O(√P) … O(P)'
+path: 'training/optimisers'
+difficulty: 'intermediate'
+described: '2018'
+status: 'common'
+statusNote: 'Adafactor and 8-bit Adam are both in wide production use. The low-rank projection methods are newer and their quality claims are still being argued over.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['optimisers', 'training', 'memory']
+lede: 'A 7B model in bf16 is 14 GB. Its AdamW state in fp32 is 56 GB. The optimiser, not the model, is what does not fit — and it compresses far better than the weights do.'
+metrics:
+  caption: 'State bytes per parameter'
+  rows:
+    - { label: 'AdamW, fp32', value: '8' }
+    - { label: '8-bit Adam', value: '2' }
+    - { label: 'Adafactor', value: '≈ 0', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'These compose with ZeRO rather than competing with it. Sharding divides the state across devices; these shrink it on each. Doing both is normal and the savings multiply.'
+related: [adamw, zero-sharding, gradient-checkpointing, lora, floating-point-formats, stochastic-gradient-descent]
+refs:
+  - cite: 'Shazeer & Stern — Adafactor: Adaptive Learning Rates with Sublinear Memory Cost (2018)'
+    id: 'arXiv:1804.04235'
+    href: https://arxiv.org/abs/1804.04235
+  - cite: 'Dettmers et al. — 8-bit Optimizers via Block-wise Quantization (2021)'
+    id: 'arXiv:2110.02861'
+    href: https://arxiv.org/abs/2110.02861
+  - cite: 'Zhao et al. — GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection (2024)'
+    id: 'arXiv:2403.03507'
+    href: https://arxiv.org/abs/2403.03507
+---
+
+Training memory is four things: parameters, gradients, optimiser state, and
+activations. [Checkpointing](/entries/gradient-checkpointing) addresses the last.
+This entry is about the third, which is usually the largest.
+
+<Eq lead caption="eq. 1 — the arithmetic, for mixed-precision AdamW">
+
+$$
+\underbrace{2P}_{\text{bf16 weights}} + \underbrace{2P}_{\text{grads}} +
+\underbrace{4P}_{\text{fp32 master}} + \underbrace{4P + 4P}_{m,\, v}
+= 16P \;\text{bytes}
+$$
+
+</Eq>
+
+For a 7B model that is 112 GB before a single activation. Two thirds of it is
+optimiser state.
+
+### Adafactor: factorise the second moment
+
+Adam's $v$ is a full-shape tensor of squared-gradient averages. For a matrix
+parameter, Shazeer and Stern approximate it by a rank-one outer product of a row
+vector and a column vector.
+
+<Eq caption="eq. 2 — n + m numbers instead of n·m">
+
+$$
+V_{ij} \approx \frac{R_i\, C_j}{\sum_k R_k},
+\qquad
+R_i = \sum_j V_{ij},\;\; C_j = \sum_i V_{ij}
+$$
+
+</Eq>
+
+This is not an arbitrary approximation. Among all rank-one non-negative
+approximations it is the one minimising the generalised KL divergence to $V$, and
+the row and column sums are exactly the sufficient statistics — the derivation is
+the paper's contribution, not the idea of factorising.
+
+Memory for a $4096 \times 4096$ matrix falls from 16.7 M numbers to 8192. Momentum
+is usually dropped as well, at which point the state is effectively free.
+
+<Note label="caveat">
+Adafactor is not a drop-in. It replaces the fixed learning rate with an update
+scaled relative to the parameter's own norm, so a schedule tuned for AdamW will
+not transfer. T5 was trained with it; most people who try it on a Llama recipe
+without adjusting conclude it does not work.
+</Note>
+
+### 8-bit Adam: quantise the state
+
+Keep both moments in full shape and store them in one byte each.
+
+The difficulty is dynamic range. Optimiser state spans many orders of magnitude,
+and a naïve 8-bit linear quantisation of a tensor with one large outlier
+destroys everything else in it. Dettmers et al. use two ideas together:
+*block-wise* quantisation, with an independent scale per 2048 elements so one
+outlier contaminates only its block, and a *dynamic* non-linear codebook that
+spends its 256 values logarithmically rather than uniformly.
+
+The result matches 32-bit Adam's final loss across models up to 1.5B — not
+approximately, but within run-to-run variance — at a quarter of the memory. It is
+what `bitsandbytes` provides and what most consumer-GPU fine-tuning uses.
+
+### Low-rank projection
+
+GaLore observes that the gradient of a large weight matrix is empirically close
+to low-rank, and keeps the optimiser state in a projected subspace.
+
+<Eq caption="eq. 3 — optimise in the subspace, apply in full">
+
+$$
+\tilde{g} = P^\top g,
+\qquad
+\Delta\theta = P \cdot \mathrm{Adam}(\tilde{g})
+$$
+
+</Eq>
+
+$P$ comes from an SVD of the gradient, recomputed every few hundred steps. State
+memory falls by the rank ratio, and unlike [LoRA](/entries/lora) the *weights*
+are still updated at full rank — the constraint is on the optimiser, not on the
+parameterisation, so nothing is permanently confined to a subspace.
+
+The claim is 7B pre-training on a 24 GB card. The caveats are that the periodic
+SVD is not free and that the quality comparisons are at smaller scale than the
+headline.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch · the Adafactor second moment">
+
+```python
+import torch
+from torch import Tensor
+
+
+class FactoredSecondMoment:
+    """Row and column sums in place of the full V. Matrices only —
+    vectors and 1-D parameters keep an ordinary full-shape state."""
+
+    def __init__(self, shape: tuple[int, int], device):
+        n, m = shape
+        self.row = torch.zeros(n, device=device)
+        self.col = torch.zeros(m, device=device)
+
+    def update(self, g: Tensor, beta2: float) -> Tensor:
+        sq = g.float().square() + 1e-30
+        self.row.mul_(beta2).add_(sq.mean(dim=1), alpha=1 - beta2)
+        self.col.mul_(beta2).add_(sq.mean(dim=0), alpha=1 - beta2)
+
+        # Reconstruct: the rank-one approximation, normalised by the row mean.
+        return torch.outer(self.row / self.row.mean(), self.col)
+```
+
+</CodeFrame>
+
+The `1e-30` is load-bearing. A zero row sum makes the reconstruction divide by
+zero, and a parameter whose gradient is exactly zero for a whole batch is common
+enough — an unused expert, a padded position — that it happens on real runs
+rather than in theory.
+
+<Rule label="Choosing between them" />
+
+| Situation | Reasonable choice |
+| --- | --- |
+| plenty of memory | AdamW, fp32 state |
+| fine-tuning on one GPU | 8-bit Adam, or LoRA |
+| very large vocabulary or embeddings | Adafactor on those tensors only |
+| pre-training under a hard memory cap | GaLore, with the caveats above |
+
+The last row of that table is the one to be careful with. The others are
+established; the projection methods are recent, and the gap between "matches
+AdamW at 1B" and "matches AdamW at frontier scale" has swallowed several
+optimisers already.

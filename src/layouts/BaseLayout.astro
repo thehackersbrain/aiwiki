@@ -1,0 +1,126 @@
+---
+import "../styles/global.css";
+import Search from "../components/Search.astro";
+import ScrollTop from "../components/ScrollTop.astro";
+import SearchButton from "../components/SearchButton.astro";
+import Seo from "../components/Seo.astro";
+import { copyrightYears, counts } from "../lib/grimoire";
+import { AUTHOR, AUTHOR_URL, SITE_LANG, SITE_NAME } from "../consts";
+import type { ComponentProps } from "astro/types";
+
+type SeoProps = ComponentProps<typeof Seo>;
+
+interface Props extends Omit<SeoProps, "title"> {
+  title: string;
+  /** Shown in the browser tab; the full title is used for sharing. */
+  tabTitle?: string;
+  /** Highlighted nav item. */
+  nav?: "home" | "index" | "categories" | "notes" | "colophon" | null;
+}
+
+const { title, tabTitle, nav = null, ...seo } = Astro.props;
+const { total } = await counts();
+
+const links = [
+  { key: "home", label: "Home", href: "/" },
+  { key: "index", label: "Index", href: "/entries" },
+  { key: "categories", label: "Categories", href: "/categories" },
+  { key: "notes", label: "Notes", href: "/notes" },
+  { key: "colophon", label: "Colophon", href: "/colophon" },
+] as const;
+
+// Derived from the content: the year of the most recent revision anywhere in
+// the book. A footer maintained by hand is a footer that is wrong by January.
+const YEAR = (await copyrightYears()).to;
+---
+
+<html lang={SITE_LANG}>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <link rel="mask-icon" href="/favicon.svg" color="#e0a86a" />
+    <title>{tabTitle ?? title}</title>
+    <meta name="color-scheme" content="dark" />
+    <Seo title={title} {...seo} />
+    {
+      /* The two faces every page paints text with, ahead of the CSS that asks
+        for them. The rest of the subsets load only if the glyphs are used. */
+    }
+    <link
+      rel="preload"
+      href="/fonts/literata-normal-300-500-latin.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
+    <link
+      rel="preload"
+      href="/fonts/space-mono-normal-400-latin.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    />
+  </head>
+  <body>
+    <header
+      class="sticky top-0 z-20 border-b border-rule bg-ink/95 backdrop-blur-[6px]"
+    >
+      <div
+        class="mx-auto flex max-w-[1180px] items-baseline justify-between gap-6 px-6 py-5 font-mono text-[11px] tracking-[0.16em] uppercase sm:px-12"
+      >
+        <a
+          href="/"
+          class="text-chalk font-bold transition-opacity hover:opacity-70 hover:text-chalk"
+        >
+          AI Grimoire
+        </a>
+        <nav
+          class="flex flex-wrap items-baseline gap-x-6 gap-y-2 text-dim"
+          aria-label="Primary"
+        >
+          {
+            links.map((l) => (
+              <a
+                href={l.href}
+                class:list={[
+                  "transition-colors hover:text-chalk",
+                  nav === l.key ? "text-chalk" : "text-dim",
+                ]}
+              >
+                {l.label}
+              </a>
+            ))
+          }
+          <span class="text-accent" title={`${total} entries`}>{total}</span>
+          <SearchButton />
+        </nav>
+      </div>
+    </header>
+
+    <slot />
+
+    <footer class="border-t border-rule">
+      <div
+        class="mx-auto flex max-w-[1180px] flex-col gap-x-10 gap-y-3 px-6 pt-6 pb-11 font-mono text-[11px] text-dim-2 sm:flex-row sm:items-baseline sm:justify-between sm:px-12"
+      >
+        <p class="m-0 shrink-0">
+          <span aria-hidden="true">©</span>
+          <span class="sr-only">Copyright</span>
+          {YEAR}{" "}
+          <a
+            href={AUTHOR_URL}
+            rel="me noreferrer"
+            target="_blank"
+            class="text-mute-2 hover:text-accent">{AUTHOR}</a
+          >. All rights reserved.
+        </p>
+        <p class="m-0 max-w-[64ch] text-dim-3 sm:text-right">
+          {SITE_NAME} is a working notebook, not a textbook.
+        </p>
+      </div>
+    </footer>
+    <Search />
+    <ScrollTop />
+  </body>
+</html>

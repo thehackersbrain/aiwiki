@@ -1,0 +1,151 @@
+---
+name: 'Maximal Update Parameterisation'
+desc: 'Scale the initialisation and learning rates so the optimum transfers across width.'
+category: 'training'
+complexity: '—'
+path: 'training/optimisers'
+difficulty: 'advanced'
+described: '2022'
+status: 'common'
+statusNote: 'Used by several frontier labs and absent from most open recipes. The theory is sound and the implementation is fiddly enough that people skip it.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['optimisers', 'training', 'scaling']
+lede: 'Under standard parameterisation the best learning rate shifts as a model gets wider, so it must be re-tuned at every scale. Under μP it does not — tune on a small model and transfer the setting unchanged.'
+metrics:
+  caption: 'Cerebras-GPT, tuning cost'
+  rows:
+    - { label: 'Proxy model', value: '40 M params' }
+    - { label: 'Target', value: '13 B' }
+    - { label: 'Sweep cost', value: '≈ 1% of one run', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'μP is a set of three coordinated changes — initialisation variance, per-tensor learning rate, and an output-logit multiplier. Applying two of the three is worse than applying none, because the interactions are what make the widths cancel.'
+related: [adamw, learning-rate-schedules, chinchilla-scaling-laws, stochastic-gradient-descent, layer-normalisation, muon-and-second-order-preconditioning]
+refs:
+  - cite: 'Yang et al. — Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer (2022)'
+    id: 'arXiv:2203.03466'
+    href: https://arxiv.org/abs/2203.03466
+  - cite: 'Dey et al. — Cerebras-GPT: Open Compute-Optimal Language Models Trained on the Cerebras Wafer-Scale Cluster (2023)'
+    id: 'arXiv:2304.03208'
+    href: https://arxiv.org/abs/2304.03208
+  - cite: 'Everett et al. — Scaling Exponents Across Parameterizations and Optimizers (2024)'
+    id: 'arXiv:2407.05872'
+    href: https://arxiv.org/abs/2407.05872
+---
+
+Hyperparameter tuning at scale is a problem of arithmetic. The learning rate
+matters enormously, the optimum moves with model size, and a sweep at the target
+size costs more than the run it is meant to inform. Standard practice is to guess
+from smaller models and hope, which is why published learning rates cluster
+around a few round numbers with no derivation behind them.
+
+μP asks why the optimum moves at all.
+
+### What goes wrong under standard parameterisation
+
+Consider a hidden layer of width $n$. Its pre-activation is a sum of $n$ terms,
+so under standard initialisation its scale is $O(1)$ — this is what
+$1/\sqrt{n}$ initialisation is for, and it is correct at step zero.
+
+It is not preserved by *training*. After an update, the weight change is
+correlated with the activations it will multiply, so the contributions no longer
+cancel like independent random terms and the layer's output grows like $O(n)$
+rather than $O(\sqrt{n})$. As width increases, the same learning rate produces a
+progressively larger change in the function, and the largest stable learning rate
+falls.
+
+<Eq lead caption="eq. 1 — the condition μP imposes at every width">
+
+$$
+\Delta h_\ell = \Theta(1) \quad\text{as } n \to \infty, \text{ for every layer}
+$$
+
+</Eq>
+
+Every layer's activations should change by an amount independent of width. Solve
+for the scalings that make that true and the answer is a table.
+
+### The table
+
+| Tensor | Init variance | Adam LR | Output multiplier |
+| --- | --- | --- | --- |
+| embedding | $\sigma^2$ | $\eta$ | $1$ |
+| hidden | $\sigma^2 / n$ | $\eta / n$ | $1$ |
+| unembedding | $\sigma^2 / n$ | $\eta / n$ | $1 / n$ |
+
+Only the hidden and output layers are scaled, and under Adam the learning-rate
+factor is $1/n$ rather than the $1/\sqrt{n}$ that SGD would want — because Adam's
+update is scale-invariant in the gradient, so the width dependence enters
+differently.
+
+<Note label="annotation">
+The output multiplier is the part most often omitted, and it is not decorative.
+Without it the logits grow with width, the softmax sharpens, and the effective
+loss surface changes — which reintroduces exactly the width dependence the rest
+of the table removed.
+</Note>
+
+### What it buys
+
+Tune on a 40M-parameter proxy — learning rate, initialisation scale, warmup — and
+apply the same values at 13B. The transfer holds across width reliably and
+across depth approximately, the depth case being weaker and needing the residual
+branches scaled by $1/\sqrt{L}$ as well.
+
+Cerebras-GPT is the cleanest public demonstration: a full family trained with
+hyperparameters transferred from a small proxy, at a sweep cost of about one
+percent of a single target run, with a smoother scaling curve than the
+comparison models tuned by hand.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import math
+
+from torch import nn
+
+
+def apply_mup(model: nn.Module, width: int, base_width: int = 256, lr: float = 1e-3):
+    """Returns optimiser param groups. `width` is this model's d_model."""
+    ratio = width / base_width
+    groups = []
+
+    for name, p in model.named_parameters():
+        if "embed" in name and "unembed" not in name:
+            # Embeddings are indexed, not summed over width: no scaling.
+            nn.init.normal_(p, std=0.02)
+            groups.append({"params": [p], "lr": lr})
+        else:
+            nn.init.normal_(p, std=0.02 / math.sqrt(ratio))
+            groups.append({"params": [p], "lr": lr / ratio})
+
+    # The output multiplier, applied in the forward pass rather than the weights.
+    model.logit_scale = 1.0 / ratio
+    return groups
+```
+
+</CodeFrame>
+
+`base_width` is a convention, not a constant of nature — every scaling is
+relative to it, so the proxy model must be trained at that width for the transfer
+to mean anything. Changing it later silently invalidates every tuned value.
+
+<Rule label="Why it is not universal" />
+
+Three reasons, and none of them is that the theory is wrong.
+
+It is invasive: three coordinated changes touching initialisation, the optimiser
+configuration and the forward pass, in a codebase where each of those usually
+lives somewhere different. Partial application is worse than none.
+
+The transfer is across *width*. Depth needs additional care and the guarantees
+are weaker, and real scaling changes both at once.
+
+And Everett et al. found that several parameterisations — μP among them — achieve
+width-independent optima once the per-layer learning rates are set correctly, so
+μP is one route to the property rather than the only one. That is a
+clarification rather than a refutation, and it is the reason the argument now is
+about which parameterisation, not whether to have one.

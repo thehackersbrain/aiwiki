@@ -1,0 +1,80 @@
+---
+name: 'Logit Lens'
+desc: 'Project intermediate residual states through the unembedding matrix.'
+category: 'interpretability'
+complexity: 'O(d·V)'
+path: 'interpretability/probing'
+difficulty: 'introductory'
+described: '2020'
+status: 'common'
+revised: 2026-08-11
+added: 2025-10-06
+tags: ['probing']
+lede: 'Apply the final layer norm and unembedding to the residual stream at every layer, and read off the model’s prediction as it forms.'
+implNote:
+  label: 'annotation'
+  html: 'Layer norm is affine but not linear in the residual, so the lens is not a decomposition of the stream into per-block contributions, however much it looks like one.'
+related: [activation-patching, sparse-autoencoders]
+refs:
+  - cite: 'nostalgebraist — interpreting GPT: the logit lens (2020)'
+    id: 'LessWrong'
+    href: https://www.lesswrong.com/posts/AcKRB8wDpdaN6v6ru/interpreting-gpt-the-logit-lens
+  - cite: 'Belrose et al. — Eliciting Latent Predictions with the Tuned Lens (2023)'
+    id: 'arXiv:2303.08112'
+    href: https://arxiv.org/abs/2303.08112
+---
+
+A pre-norm transformer's residual stream is a running sum: every block writes an
+additive contribution and nothing overwrites. The unembedding is therefore
+meaningful at any depth, not only the last, and applying it early gives a legible
+trajectory of the developing prediction.
+
+<Eq caption="eq. 1 — final layer norm, applied early" lead>
+
+$$
+p^{(\ell)} = \softmax\bigl( W_U \cdot \mathrm{LN}_f(h^{(\ell)}) \bigr)
+$$
+
+</Eq>
+
+<Note label="aside">
+A tool that fails legibly is worth more than one that fails quietly. This one
+fails legibly.
+</Note>
+
+The technique is unreliable in exactly one predictable way: it assumes intermediate
+states live in the same basis as the final one. Where they do not — commonly in the
+early layers, and in models without a pre-norm residual path — the lens reports
+noise. A learned affine probe per layer (the tuned lens) fixes the basis mismatch
+and little else.
+
+> A negative result from the logit lens is not evidence of absence. It is evidence
+> that the information, if present, is not yet written in the unembedding's basis.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor
+
+
+@torch.no_grad()
+def logit_lens(model, hidden_states: list[Tensor], top: int = 5):
+    """hidden_states: per-layer residual stream [B, N, D]."""
+    ln_f, unembed = model.ln_f, model.lm_head
+    trajectory = []
+    for layer, h in enumerate(hidden_states):
+        logits = unembed(ln_f(h[:, -1]))        # last position only
+        probs = logits.softmax(-1)
+        vals, idx = probs.topk(top, dim=-1)
+        trajectory.append((layer, idx[0].tolist(), vals[0].tolist()))
+    return trajectory
+```
+
+</CodeFrame>
+
+The final layer norm must be applied even to early states — skipping it produces
+logits whose scale drifts by orders of magnitude across depth and makes the
+probabilities meaningless.

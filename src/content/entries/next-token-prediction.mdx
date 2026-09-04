@@ -1,0 +1,138 @@
+---
+name: 'Next-Token Prediction'
+desc: 'Cross-entropy over the next token, and everything that follows from teacher forcing.'
+category: 'training'
+complexity: 'O(n·V)'
+path: 'training/objectives'
+difficulty: 'introductory'
+described: '2018'
+status: 'standard'
+statusNote: 'The only pre-training objective in current use for generative models. Every alternative on this branch is applied afterwards, on top of a model made this way.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['objectives', 'training', 'core']
+lede: 'Predict the next token, average the log loss, and that is the whole objective. Its properties — the ones that make it work and the one that makes generation drift — all follow from the fact that the model is never shown its own output.'
+metrics:
+  caption: 'Per-step cost, d = 4096, V = 128k'
+  rows:
+    - { label: 'Unembedding matmul', value: '≈ 0.5 GFLOP' }
+    - { label: 'Logits, fp32, T = 4096', value: '2.1 GB' }
+    - { label: 'Loss in fp32', value: 'required', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'The logits tensor is often the largest single allocation in training — <code>[B, T, V]</code> dwarfs the activations. Fused cross-entropy kernels compute the loss in chunks and never materialise it, which is why they are worth the dependency.'
+related: [perplexity, masked-language-modelling, knowledge-distillation, sampling-strategies, chinchilla-scaling-laws, supervised-fine-tuning]
+refs:
+  - cite: 'Radford et al. — Improving Language Understanding by Generative Pre-Training (2018)'
+    id: 'GPT-1'
+    href: https://cdn.openai.com/research-covers/language-unsupervised/language_understanding_paper.pdf
+  - cite: 'Bengio et al. — Scheduled Sampling for Sequence Prediction with Recurrent Neural Networks (2015)'
+    id: 'arXiv:1506.03099'
+    href: https://arxiv.org/abs/1506.03099
+  - cite: 'Gloeckle et al. — Better & Faster Large Language Models via Multi-token Prediction (2024)'
+    id: 'arXiv:2404.19737'
+    href: https://arxiv.org/abs/2404.19737
+---
+
+<Eq lead caption="eq. 1 — the objective, in full">
+
+$$
+\mathcal{L} = -\frac{1}{T}\sum_{t=1}^{T} \log p_\theta\bigl(x_t \mid x_{<t}\bigr)
+$$
+
+</Eq>
+
+That is not a simplification. Everything a base model knows was obtained by
+minimising that quantity over a large corpus, and the exponential of it is
+[perplexity](/entries/perplexity).
+
+Two properties make it the objective that scaled. It needs no labels — the text
+is its own supervision, so the training set is as large as the internet. And with
+[causal masking](/entries/causal-masking) every position is a training example
+computed in parallel, so one forward pass over a 4096-token document yields 4096
+predictions rather than one.
+
+### Teacher forcing
+
+During training the model conditions on the *true* prefix at every position. It
+never sees its own output.
+
+<Note label="annotation">
+This is what makes the parallelism possible — if position 500 conditioned on the
+model's own token 499, the sequence would have to be generated serially and
+training would be as slow as decoding. The entire efficiency of the objective
+rests on this substitution, and so does its main defect.
+</Note>
+
+At generation time the model conditions on what it produced, which is drawn from
+a distribution it was never trained to handle. Once a token appears that no
+plausible human prefix would contain, the model is off the manifold it learned,
+and errors compound. The classical name is *exposure bias*.
+
+Scheduled sampling — mixing in the model's own predictions during training — was
+the obvious fix and is not used. It biases the gradient, because the mixed prefix
+is not drawn from the data distribution, and at scale the problem it addresses
+largely recedes: a model good enough to stay near the data manifold does not
+accumulate the error. What remains of it is visible as degeneration under greedy
+decoding, which is handled at the [sampler](/entries/sampling-strategies)
+instead.
+
+### What the loss weights
+
+Averaging over tokens means every token counts equally: the closing bracket of a
+code block, the second half of a common word, and the one word in a paragraph
+that carries its meaning. Most of the loss, by mass, is on tokens that are nearly
+free to predict.
+
+<Eq caption="eq. 2 — the gradient, which is why it is so well-behaved">
+
+$$
+\frac{\partial \mathcal{L}}{\partial z} = \mathrm{softmax}(z) - e_{x_t}
+$$
+
+</Eq>
+
+The gradient with respect to the logits is the predicted distribution minus a
+one-hot vector — bounded, cheap, and never saturating. A great deal of the
+transformer's trainability comes from this pairing of softmax with cross-entropy
+rather than from the architecture.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor
+from torch.nn import functional as F
+
+
+def loss(logits: Tensor, tokens: Tensor, ignore: int = -100) -> Tensor:
+    """logits: [B, T, V] over positions 0..T-1. tokens: [B, T]."""
+    # The shift is the objective: position t predicts token t+1.
+    pred = logits[:, :-1].reshape(-1, logits.size(-1))
+    target = tokens[:, 1:].reshape(-1)
+
+    # fp32 for the softmax denominator: in bf16 the log-sum-exp over 128k
+    # vocabulary entries loses enough mantissa to bias the loss.
+    return F.cross_entropy(pred.float(), target, ignore_index=ignore)
+```
+
+</CodeFrame>
+
+The off-by-one in that shift is the most common bug in a from-scratch
+implementation, and it does not crash. A model trained to predict the *current*
+token learns the identity and reaches a suspiciously low loss, which is the tell.
+
+<Rule label="Multi-token prediction" />
+
+The one active line of work on the objective itself. Gloeckle et al. add
+$n$ output heads predicting tokens $t{+}1$ through $t{+}n$ from the same trunk,
+at negligible extra cost since the trunk dominates.
+
+Two results follow. Larger models improve on generation benchmarks — the extra
+heads act as a denser training signal, forcing the representation at position $t$
+to carry more than the immediate next token. And the auxiliary heads give
+[speculative decoding](/entries/speculative-decoding) a draft model for free,
+which is a straightforward two- to three-fold inference speed-up. DeepSeek-V3
+ships an MTP objective for that reason.

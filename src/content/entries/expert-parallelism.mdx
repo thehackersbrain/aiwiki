@@ -1,0 +1,148 @@
+---
+name: 'Expert Parallelism'
+desc: 'Experts on separate devices, and the two all-to-alls that connect them.'
+category: 'architectures'
+complexity: 'O(k·d²)'
+memory: 'O(N/D)'
+path: 'architectures/sparse'
+difficulty: 'advanced'
+described: '2020'
+status: 'standard'
+statusNote: 'The only way a large MoE fits anywhere. Every frontier sparse model is sharded this way, and the all-to-all is the thing their infrastructure work is mostly about.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['sparse', 'scaling', 'training']
+lede: 'A sparse layer has more parameters than a device holds, and only a fraction are needed per token. Put each expert somewhere and send the tokens to it — which turns a matmul into a network problem.'
+metrics:
+  caption: 'Communication per MoE layer'
+  rows:
+    - { label: 'All-to-all rounds', value: '2' }
+    - { label: 'Bytes moved', value: '2·k·T·d' }
+    - { label: 'Slowest rank sets pace', value: 'always', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Both all-to-alls are synchronising. Every device waits for the most loaded one, so the cost of imbalance is not wasted FLOPs on one device — it is idle time on all the others.'
+related: [mixture-of-experts-routing, expert-capacity-and-token-dropping, loss-free-load-balancing, zero-sharding, shared-and-fine-grained-experts]
+refs:
+  - cite: 'Lepikhin et al. — GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding (2020)'
+    id: 'arXiv:2006.16668'
+    href: https://arxiv.org/abs/2006.16668
+  - cite: 'Rajbhandari et al. — DeepSpeed-MoE: Advancing Mixture-of-Experts Inference and Training (2022)'
+    id: 'arXiv:2201.05596'
+    href: https://arxiv.org/abs/2201.05596
+  - cite: 'DeepSeek-AI — DeepSeek-V3 Technical Report (2024)'
+    id: 'arXiv:2412.19437'
+    href: https://arxiv.org/abs/2412.19437
+---
+
+DeepSeek-V3 has 671 billion parameters and activates 37 billion per token. The
+activated part fits on a device; the whole thing does not, by two orders of
+magnitude. So the experts are distributed, and the tokens travel.
+
+### The two all-to-alls
+
+<Eq lead caption="eq. 1 — what a routed layer becomes when sharded">
+
+$$
+x \xrightarrow{\text{route}} \text{permute}
+\xrightarrow{\text{all-to-all}} \text{expert FFN}
+\xrightarrow{\text{all-to-all}} \text{unpermute} \xrightarrow{\text{combine}} y
+$$
+
+</Eq>
+
+The router runs on every device against its own tokens. Each device then sorts
+its tokens by destination expert and exchanges them — the *dispatch* all-to-all —
+so every device receives the tokens routed to the experts it holds. It computes
+those, then sends the results back the way they came: the *combine* all-to-all.
+
+This is not a reduction. Every device sends a different payload to every other
+device, and the collective completes only when the last message lands.
+
+<Note label="annotation">
+Which is why imbalance is expensive in a way the FLOP count does not show. An
+expert with twice its share does not merely spend twice the compute — every other
+device sits idle waiting for it. A layer's latency is the maximum over devices,
+never the mean, and this is the real reason <a href="/entries/loss-free-load-balancing">balancing</a>
+matters.
+</Note>
+
+### Hiding the latency
+
+The bytes are unavoidable, so the work goes into overlapping them with compute.
+
+**Communication–computation overlap.** Split the tokens into chunks and pipeline:
+while chunk 1 is being computed by the experts, chunk 2 is in flight. DeepSeek's
+DualPipe schedules a forward and a backward micro-batch against each other so
+that one's communication hides inside the other's compute — reported as almost
+complete overlap of the all-to-all.
+
+**Topology-aware routing.** Intra-node NVLink is roughly an order of magnitude
+faster than inter-node InfiniBand. DeepSeek-V3's router is constrained to send
+each token to at most 4 nodes, so the inter-node fan-out is bounded and the
+remaining traffic stays on the fast link.
+
+**Hierarchical exchange.** Aggregate within a node first, then do one inter-node
+exchange per node rather than per device. Fewer, larger messages, which is what
+the network prefers.
+
+### Against the alternatives
+
+| Strategy | Splits | Communication |
+| --- | --- | --- |
+| data parallel | the batch | gradient all-reduce |
+| tensor parallel | each matrix | two all-reduces per layer |
+| pipeline parallel | the layers | activations at boundaries |
+| expert parallel | the experts | two all-to-alls per MoE layer |
+
+They compose, and at scale all four run at once — experts sharded across a group,
+that group replicated for data parallelism, dense layers tensor-parallel within a
+node. The mapping of that product onto the physical topology is most of what a
+frontier training stack does.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch.distributed">
+
+```python
+import torch
+import torch.distributed as dist
+from torch import Tensor
+
+
+def moe_forward(x: Tensor, idx: Tensor, expert, n_experts: int, group) -> Tensor:
+    """x: [T, D] local tokens. idx: [T] destination expert per token."""
+    world = dist.get_world_size(group)
+    per_rank = n_experts // world
+
+    # Sort locally so each destination's tokens are contiguous — the
+    # all-to-all wants one slab per peer, not a scatter.
+    order = idx.argsort()
+    sent = x[order]
+    counts = torch.bincount(idx // per_rank, minlength=world)
+
+    # Peers must know how much is coming before they can allocate.
+    recv_counts = torch.empty_like(counts)
+    dist.all_to_all_single(recv_counts, counts, group=group)
+
+    got = torch.empty(int(recv_counts.sum()), x.size(-1), dtype=x.dtype, device=x.device)
+    dist.all_to_all_single(got, sent, recv_counts.tolist(), counts.tolist(), group=group)
+
+    out = expert(got)                                   # local experts only
+
+    back = torch.empty_like(sent)
+    dist.all_to_all_single(back, out, counts.tolist(), recv_counts.tolist(), group=group)
+
+    y = torch.empty_like(back)
+    y[order] = back                                     # undo the sort
+    return y
+```
+
+</CodeFrame>
+
+Note the count exchange before the payload exchange: `all_to_all_single` needs
+the sizes in advance to allocate. That extra round-trip is precisely what a fixed
+[capacity](/entries/expert-capacity-and-token-dropping) buys you out of — with
+fixed buffers, every rank already knows every size, and the dispatch is one
+collective instead of two. The tokens dropped are the price of the round-trip
+saved.

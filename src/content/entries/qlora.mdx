@@ -1,0 +1,97 @@
+---
+name: 'QLoRA'
+desc: '4-bit NF4 base weights with paged optimiser state and LoRA adapters.'
+category: 'fine-tuning'
+complexity: 'O(r·d)'
+path: 'fine-tuning/peft'
+difficulty: 'advanced'
+described: '2023'
+status: 'standard'
+statusNote: 'How fine-tuning happens on one GPU. The quantised base plus low-rank update combination is now routine.'
+revised: 2026-08-18
+added: 2025-10-04
+tags: ['fine-tuning', 'quantisation']
+lede: 'Quantise the frozen base to 4 bits, keep the adapters in bf16, and backpropagate through the dequantisation. Three tricks make the accuracy loss negligible.'
+implNote:
+  label: 'in practice'
+  html: 'Adapting every linear layer rather than only the attention projections is what makes 4-bit adaptation match 16-bit. It is not an optional flourish.'
+related: [lora, gptq, gradient-checkpointing]
+refs:
+  - cite: 'Dettmers et al. — QLoRA: Efficient Finetuning of Quantized LLMs (2023)'
+    id: 'arXiv:2305.14314'
+    href: https://arxiv.org/abs/2305.14314
+  - cite: 'Dettmers et al. — 8-bit Optimizers via Block-wise Quantization (2021)'
+    id: 'arXiv:2110.02861'
+    href: https://arxiv.org/abs/2110.02861
+---
+
+<Note label="annotation">
+Optimal under the Gaussian assumption, which holds per block of 64 and not
+globally. That block size is doing quiet work.
+</Note>
+
+NF4 is an information-theoretically optimal code for zero-centred normal data: its
+sixteen levels are the quantiles of a standard normal, so each level receives
+equal probability mass under the assumption that pretrained weights are
+approximately Gaussian per block.
+
+<Eq caption="eq. 1 — NF4 levels, normalised to [−1, 1]" lead>
+
+$$
+q_i = \frac{1}{2}\left[
+\Phi^{-1}\!\left(\frac{i}{17}\right) + \Phi^{-1}\!\left(\frac{i+1}{17}\right)
+\right] \Big/ \Phi^{-1}\!\left(\frac{16}{17}\right)
+$$
+
+</Eq>
+
+Double quantisation then quantises the per-block scale factors themselves, which
+at block size 64 costs 0.5 bits per parameter before compression and 0.127 after.
+Paged optimiser state moves Adam moments to host memory on gradient-checkpointing
+spikes rather than failing the allocation.
+
+<Eq caption="eq. 2 — before and after double quantisation">
+
+$$
+4 + \tfrac{32}{64} \;\longrightarrow\;
+4 + \tfrac{8}{64} + \tfrac{32}{64 \cdot 256}
+\;\approx\; 4.127 \;\text{bits/param}
+$$
+
+</Eq>
+
+> The base weights never leave 4 bits in memory; they are dequantised into bf16
+> tile by tile inside the matmul. This is why QLoRA is compute-bound where LoRA is
+> not — you pay a dequantisation per forward *and* per recompute.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · transformers + peft">
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, BitsAndBytesConfig
+from peft import LoraConfig, get_peft_model
+
+bnb = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_use_double_quant=True,
+    bnb_4bit_compute_dtype=torch.bfloat16,
+)
+
+model = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.1-8B", quantization_config=bnb
+)
+model.gradient_checkpointing_enable()
+
+model = get_peft_model(model, LoraConfig(
+    r=64, lora_alpha=16, lora_dropout=0.05,
+    target_modules="all-linear",   # every projection, not just q/v
+))
+```
+
+</CodeFrame>
+
+Keep `compute_dtype` at bf16; fp16 reintroduces the overflow problems that the NF4
+block scales were meant to remove.

@@ -1,0 +1,102 @@
+---
+name: 'Mixture-of-Experts Routing'
+desc: 'Top-k gate over expert FFNs with auxiliary load-balancing loss.'
+category: 'architectures'
+complexity: 'O(k·d²)'
+path: 'architectures/sparse'
+difficulty: 'advanced'
+described: '2017'
+status: 'standard'
+statusNote: 'Now the default at frontier scale. The unsettled parts are routing stability and expert granularity, not whether to use it.'
+revised: 2026-08-11
+added: 2025-02-23
+tags: ['sparse', 'scaling']
+lede: 'Replace one feed-forward block with E of them and a gate that picks k. Parameters scale with E; FLOPs scale with k.'
+implNote:
+  label: 'caveat'
+  html: 'Capacity factor is the other half of the story. Experts have fixed buffers, and tokens routed to a full expert are dropped outright.'
+related: [expert-capacity-and-token-dropping, shared-and-fine-grained-experts, loss-free-load-balancing, expert-parallelism, sparse-upcycling, expert-choice-routing]
+refs:
+  - cite: 'Shazeer et al. — Outrageously Large Neural Networks: The Sparsely-Gated MoE Layer (2017)'
+    id: 'arXiv:1701.06538'
+    href: https://arxiv.org/abs/1701.06538
+  - cite: 'Fedus et al. — Switch Transformers (2021)'
+    id: 'arXiv:2101.03961'
+    href: https://arxiv.org/abs/2101.03961
+  - cite: 'Zoph et al. — ST-MoE: Designing Stable and Transferable Sparse Expert Models (2022)'
+    id: 'arXiv:2202.08906'
+    href: https://arxiv.org/abs/2202.08906
+---
+
+A router produces logits over experts, keeps the top $k$, renormalises them into
+weights and sums the selected experts' outputs. Everything interesting about MoE
+is a consequence of the routing being discrete: the gate is not differentiable
+through the selection, only through the weights of what was selected.
+
+<Eq lead caption="eq. 1">
+
+$$
+y = \sum_{i \in \TopK(g)} \softmax(g)_i \cdot E_i(x),
+\qquad g = W_r x
+$$
+
+</Eq>
+
+### Load balancing
+
+<Note label="aside">
+A rich-get-richer dynamic, and the only one in the book that a loss term
+genuinely fixes rather than papers over.
+</Note>
+
+Left alone, routers collapse: a few experts win early, receive more gradient, and
+win harder. The standard remedy is an auxiliary loss on the product of the
+dispatch fraction $f_i$ and the mean gate probability $p_i$, which is minimised
+when both are uniform.
+
+<Eq caption="eq. 2 — α typically 10⁻²" source="Fedus et al. §2.2">
+
+$$
+L_{\text{aux}} = \alpha \cdot E \sum_{i} f_i \, p_i
+$$
+
+</Eq>
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
+
+
+class TopKRouter(nn.Module):
+    def __init__(self, d_model: int, n_experts: int, k: int = 2):
+        super().__init__()
+        self.gate = nn.Linear(d_model, n_experts, bias=False)
+        self.k = k
+
+    def forward(self, x: Tensor):
+        logits = self.gate(x)                 # [T, E]
+        probs = logits.softmax(dim=-1)
+        weights, idx = probs.topk(self.k, dim=-1)
+        weights = weights / weights.sum(-1, keepdim=True)
+
+        # auxiliary balance loss: dispatch fraction x mean gate prob
+        n_experts = probs.size(-1)
+        one_hot = F.one_hot(idx[..., 0], n_experts).float()
+        f = one_hot.mean(0)
+        p = probs.mean(0)
+        aux = n_experts * (f * p).sum()
+        return weights, idx, aux
+```
+
+</CodeFrame>
+
+The balance loss here is computed over the top-1 assignment only, which is what
+the Switch formulation specifies; summing over all $k$ selected experts changes
+the fixed point. In a distributed setting $f$ must be all-reduced across
+data-parallel ranks, or each rank balances its own shard and nothing balances
+globally.

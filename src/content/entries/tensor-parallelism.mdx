@@ -1,0 +1,170 @@
+---
+name: 'Tensor Parallelism'
+desc: 'Split each matrix across devices; two all-reduces per layer buy the memory back.'
+category: 'training'
+complexity: 'O(P/N)'
+memory: 'O(P/N)'
+path: 'training/distributed'
+difficulty: 'intermediate'
+described: '2019'
+status: 'standard'
+statusNote: 'How a layer too large for one device is run, in training and in serving alike. Confined to a single node in every sensible deployment.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['distributed', 'training', 'inference']
+lede: 'Cut every weight matrix in pieces and give each device one. The arithmetic works out so that a column split followed by a row split needs only one collective — which is the whole reason the layout is what it is.'
+metrics:
+  caption: 'Per transformer layer, per rank'
+  rows:
+    - { label: 'All-reduces, forward', value: '2' }
+    - { label: 'All-reduces, backward', value: '2' }
+    - { label: 'Bytes each', value: '2·B·T·d', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Keep it inside a node. Four collectives per layer at eighty layers is 320 synchronisations per step; over InfiniBand rather than NVLink that is most of the step time, and the degradation is smooth enough that people run it for months without noticing.'
+related: [collective-communication, zero-sharding, pipeline-parallelism, parallelism-composition, multi-head-attention, feed-forward-networks]
+refs:
+  - cite: 'Shoeybi et al. — Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism (2019)'
+    id: 'arXiv:1909.08053'
+    href: https://arxiv.org/abs/1909.08053
+  - cite: 'Korthikanti et al. — Reducing Activation Recomputation in Large Transformer Models (2022)'
+    id: 'arXiv:2205.05198'
+    href: https://arxiv.org/abs/2205.05198
+  - cite: 'Narayanan et al. — Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM (2021)'
+    id: 'arXiv:2104.04473'
+    href: https://arxiv.org/abs/2104.04473
+---
+
+[Data parallelism](/entries/data-parallelism) requires the model to fit on one
+device. When a single layer does not, the matrices themselves have to be split.
+
+There are two ways to cut a matmul, and the trick is that they compose.
+
+<Eq lead caption="eq. 1 — column split: outputs are independent, no collective">
+
+$$
+Y = X\,[W_1 \mid W_2] = [\,X W_1 \mid X W_2\,]
+$$
+
+</Eq>
+
+<Eq caption="eq. 2 — row split: partial sums, one all-reduce">
+
+$$
+Y = [X_1 \mid X_2]\begin{bmatrix} W_1 \\ W_2 \end{bmatrix} = X_1 W_1 + X_2 W_2
+$$
+
+</Eq>
+
+A column split leaves each rank with a slice of the output and needs no
+communication. A row split leaves each rank with a partial sum of the *whole*
+output and needs an all-reduce.
+
+### Why the feed-forward block costs one collective
+
+Column-split the up-projection, row-split the down-projection.
+
+$X W_{\text{up}}$ leaves rank $i$ holding columns $i$ of the hidden
+activation — which is exactly the input the row-split down-projection wants. The
+nonlinearity is elementwise, so it applies to the slice without any exchange. One
+all-reduce at the end of the block, and none in the middle.
+
+<Note label="annotation">
+This only works because the activation is elementwise. A
+<a href="/entries/layer-normalisation">normalisation</a> between the two
+projections would need statistics over the full hidden dimension and force a
+collective — which is precisely why norms sit outside the sharded region, not
+inside it.
+</Note>
+
+Attention has the same structure for free: heads are independent, so
+column-splitting $W_Q, W_K, W_V$ by head and row-splitting the output projection
+gives one all-reduce per attention block. Two per layer forward, two more in the
+backward pass.
+
+### Sequence parallelism, the companion
+
+The all-reduce boundaries leave the layer norms and dropout replicated — every
+rank computes the same thing on the same full activation, wasting both compute
+and, more importantly, memory.
+
+Korthikanti et al.'s addition splits *those* regions along the sequence
+dimension instead, and replaces one of the all-reduces with a reduce-scatter and
+the other with an all-gather. Same total bytes moved, and the replicated
+activations disappear.
+
+<Eq caption="eq. 3 — the collective identity that makes it free">
+
+$$
+\text{all-reduce} = \text{reduce-scatter} + \text{all-gather}
+$$
+
+</Eq>
+
+Since the all-reduce was already going to be paid, splitting it in two and doing
+the sequence-parallel region in between costs nothing. It is on by default in
+Megatron and there is no reason to disable it.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+import torch.distributed as dist
+from torch import Tensor, nn
+
+
+class ColumnParallel(nn.Module):
+    """Split the output dimension. No collective; each rank keeps its slice."""
+
+    def __init__(self, in_f: int, out_f: int, world: int, rank: int):
+        super().__init__()
+        assert out_f % world == 0
+        self.w = nn.Parameter(torch.empty(out_f // world, in_f))
+
+    def forward(self, x: Tensor) -> Tensor:
+        return torch.nn.functional.linear(x, self.w)
+
+
+class RowParallel(nn.Module):
+    """Split the input dimension. Each rank produces a partial sum."""
+
+    def __init__(self, in_f: int, out_f: int, world: int, rank: int):
+        super().__init__()
+        assert in_f % world == 0
+        self.w = nn.Parameter(torch.empty(out_f, in_f // world))
+
+    def forward(self, x: Tensor) -> Tensor:
+        y = torch.nn.functional.linear(x, self.w)
+        dist.all_reduce(y)                    # the one collective in the block
+        return y
+
+
+class ParallelFFN(nn.Module):
+    def __init__(self, dim: int, hidden: int, world: int, rank: int):
+        super().__init__()
+        self.up = ColumnParallel(dim, hidden, world, rank)
+        self.down = RowParallel(hidden, dim, world, rank)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # No exchange between them: the activation is elementwise, so each
+        # rank's slice of the hidden state is exactly what its rows need.
+        return self.down(torch.nn.functional.silu(self.up(x)))
+```
+
+</CodeFrame>
+
+The real implementation needs an autograd function on each boundary: the
+column-parallel forward is an identity that becomes an all-reduce in the
+backward, and the row-parallel forward is an all-reduce that becomes an identity.
+Getting those the wrong way round gives correct forward passes and wrong
+gradients, which is the worst available failure mode.
+
+<Rule label="Against the alternatives" />
+
+Tensor parallelism is the only strategy that shrinks a single layer's memory
+*during* its computation, which is why it is unavoidable for very wide models and
+for low-latency serving. It is also the most communication-intensive per unit of
+compute, which is why it is confined to a node and composed with the others
+rather than scaled on its own.

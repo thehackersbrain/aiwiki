@@ -1,0 +1,144 @@
+---
+title: 'Things I had backwards'
+desc: 'Eight beliefs I held confidently and had to revise, and what each one cost.'
+lede: 'Not a list of things I did not know — a list of things I was sure of. The pattern in them is more useful than any individual correction.'
+minutes: 9
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['foundations', 'notes']
+related: [batch-normalisation, kaplan-scaling-laws, emergent-abilities, mixed-precision-training, attention-sinks, gelu, lstm-and-gru, gradient-accumulation]
+refs:
+  - cite: 'Santurkar et al. — How Does Batch Normalization Help Optimization? (2018)'
+    id: 'arXiv:1805.11604'
+    href: https://arxiv.org/abs/1805.11604
+  - cite: 'Schaeffer et al. — Are Emergent Abilities of Large Language Models a Mirage? (2023)'
+    id: 'arXiv:2304.15004'
+    href: https://arxiv.org/abs/2304.15004
+  - cite: 'Shazeer — GLU Variants Improve Transformer (2020)'
+    id: 'arXiv:2002.05202'
+    href: https://arxiv.org/abs/2002.05202
+---
+
+A wrong belief that you know is wrong costs nothing. This is about the other
+kind.
+
+### 1. Mixed precision halves memory
+
+It increases weight memory. The bf16 copy is *additional* to an fp32 master, so
+mixed-precision AdamW is 18 bytes per parameter against pure fp32's 16.
+
+The saving is in activations and bandwidth, and it is a large net win — but I
+sized a run on the assumption that halving the dtype halved the model's
+footprint, and it did not load.
+
+### 2. Attention weights show what the model is looking at
+
+They show where a head put its softmax mass. Since [the softmax must sum to
+one](/entries/attention-sinks), a head with nothing to retrieve still has to put
+its mass somewhere, and it learns to dump it on the first token.
+
+So more than half the mass in a typical attention map is a head saying *nothing
+here*, rendered identically to a head saying *this, urgently*. I spent time
+reading heatmaps before I understood that, and the interpretations I drew were
+mostly noise.
+
+### 3. BatchNorm works by reducing internal covariate shift
+
+That is the original paper's explanation and it did not survive testing.
+Santurkar et al. injected noise *after* the normalisation to deliberately worsen
+the distribution shift and found training just as fast — then showed the actual
+mechanism is that the reparameterisation smooths the loss landscape.
+
+The lesson I took is not about BatchNorm. It is that a technique can work
+reliably for years while its stated explanation is wrong, and the explanation
+being wrong tells you nothing about whether the technique works.
+
+### 4. Bigger models are the compute-optimal choice
+
+[Kaplan et al.](/entries/kaplan-scaling-laws) said put the compute into
+parameters. GPT-3 was built on it, and so was almost everything for two years.
+
+Chinchilla showed the exponents are both about 0.5 — parameters and data should
+scale together — and a 70B model on 1.4T tokens beat a 175B on 300B. The
+discrepancy came from a learning-rate schedule held fixed across a sweep, which
+penalised the short runs and made data look less valuable than it is.
+
+<Note label="annotation">
+This one changed how I read scaling papers generally. The failure was not in the
+theory; it was that something held constant across the sweep was correlated with
+the variable being measured. That is a hazard for every scaling study and it has
+no general defence.
+</Note>
+
+### 5. Emergent abilities are phase transitions
+
+Sharp jumps in benchmark curves looked like something real switching on.
+[Schaeffer et al.](/entries/emergent-abilities) showed most of them are the
+metric: exact-match on a five-token answer is $p^5$, and a smooth rise in $p$
+produces a curve that looks flat and then vertical.
+
+They manufacture the effect on demand in a vision model, which settles it. What
+survives is the weaker and still awkward claim that loss does not predict
+capability — but the phase-transition framing, which I had found genuinely
+unsettling, is largely a plotting artefact.
+
+### 6. The activation function matters
+
+I read comparisons of ReLU, GELU, SiLU and Mish as though the choice were
+consequential. [Shazeer's ablation](/entries/gelu) trained the whole matrix — each
+activation with and without a gate — and the gated versions beat the ungated ones
+clearly while the activations *within* each group were separated by noise.
+
+Gating is the design decision. The function inside it is a detail. Llama uses
+SiLU because Shazeer named the variant SwiGLU; had he named GEGLU we would all be
+using GELU and nothing else would differ.
+
+### 7. Gradient accumulation is approximate
+
+I believed this because accumulated runs reached worse loss than the equivalent
+large batch, and I attributed it to the method.
+
+It is exact. The [implementations were
+wrong](/entries/gradient-accumulation) — dividing each micro-batch's loss by the
+number of accumulation steps rather than by the total token count, which weights
+short sequences too heavily whenever the micro-batches are ragged. Several major
+libraries had this until late 2024.
+
+<Note label="caveat">
+The general shape here is the one I most want to remember: I had an observation,
+a plausible theoretical story, and they agreed. Both were wrong, and their
+agreement is exactly what stopped me looking further.
+</Note>
+
+### 8. Attention replaced recurrence because it models sequences better
+
+It replaced recurrence because it fits the hardware. An
+[LSTM's](/entries/lstm-and-gru) recurrence is sequential, so training cannot
+parallelise over the sequence — a length-1024 sequence is 1024 dependent kernel
+launches. Attention computes every position at once, and on a machine that
+rewards parallelism above all else, quadratic cost was worth paying.
+
+Long-range modelling quality was never the deciding argument. The evidence is
+that the whole modern recurrence branch — SSMs, RWKV, gated linear attention —
+exists to recover the RNN's *inference* properties, and every one of them is
+linear specifically so that a
+[parallel scan](/entries/parallel-scan) can train it. If attention had won on
+modelling grounds, that line of work would make no sense.
+
+### The pattern
+
+Six of the eight came from the same place: I accepted an explanation that was
+offered alongside a result, without checking whether the explanation was the
+thing that had been tested.
+
+The result and the story about the result are different claims with different
+evidence. Covariate shift, the parameter-scaling recommendation, emergence as a
+phase transition, activation-function comparisons, accumulation being approximate
+— in each case the measurement was fine and the narrative attached to it was
+doing work it had not earned.
+
+I have not found a way to be reliably careful about this. What I do now is
+smaller: when a paper explains *why* something works, I try to notice whether the
+experiments distinguish that explanation from the obvious alternative. Often they
+do not, and the explanation is the authors' hypothesis presented in the register
+of a finding.

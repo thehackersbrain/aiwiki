@@ -1,0 +1,138 @@
+---
+name: 'FlashAttention'
+desc: 'Tiled, IO-aware attention kernel; recomputes softmax statistics online.'
+category: 'inference'
+complexity: 'O(n²·d)'
+memory: 'O(n)'
+path: 'inference/kernels'
+difficulty: 'advanced'
+described: '2022'
+status: 'standard'
+statusNote: 'Not an approximation and not optional. It computes the same function, so there is no trade to weigh — running anything else is leaving throughput on the table.'
+revised: 2026-08-26
+added: 2024-10-09
+tags: ['attention', 'kernels', 'memory']
+lede: 'Exactly the same function as scaled dot-product attention, computed without ever writing the n × n score matrix to HBM.'
+metrics:
+  caption: 'n = 4096, d = 128, fp16, A100 — forward + backward'
+  rows:
+    - { label: 'HBM traffic', value: '−91%' }
+    - { label: 'Peak memory', value: 'O(n)', accent: true }
+    - { label: 'Wall clock', value: '2.4×' }
+implNote:
+  label: 'annotation'
+  html: 'This loop reproduces the recurrence, not the speedup. The tiles must live in SRAM for any of it to matter, which needs CUDA.'
+related: [scaled-dot-product-attention, multi-query-attention, speculative-decoding, paged-attention]
+refs:
+  - cite: 'Dao et al. — FlashAttention: Fast and Memory-Efficient Exact Attention (2022)'
+    id: 'arXiv:2205.14135'
+    href: https://arxiv.org/abs/2205.14135
+  - cite: 'Dao — FlashAttention-2: Faster Attention with Better Parallelism (2023)'
+    id: 'arXiv:2307.08691'
+    href: https://arxiv.org/abs/2307.08691
+  - cite: 'Milakov & Gimelshein — Online normalizer calculation for softmax (2018)'
+    id: 'arXiv:1805.02867'
+    href: https://arxiv.org/abs/1805.02867
+  - cite: 'Rabe & Staats — Self-attention Does Not Need O(n²) Memory (2021)'
+    id: 'arXiv:2112.05682'
+    href: https://arxiv.org/abs/2112.05682
+---
+
+Standard attention is memory-bound, not compute-bound: it reads and writes
+$\Theta(n^2)$ words of high-bandwidth memory to hold a matrix it immediately
+reduces away. FlashAttention tiles the computation so that the score block for a
+(query, key) tile lives only in SRAM.
+
+<Note label="aside">
+Online softmax predates FlashAttention by four years and was written for something
+else entirely. It is the load-bearing idea, borrowed.
+</Note>
+
+The obstacle is the softmax denominator, which is a global reduction over each
+row. Online softmax fixes this with a running maximum and a running sum, rescaling
+the accumulated output whenever the maximum moves.
+
+<Eq caption="eq. 1 — running max and normaliser" lead>
+
+$$
+\begin{aligned}
+m^{(j)} &= \max\bigl(m^{(j-1)},\, \max S_j\bigr) \\[2pt]
+\ell^{(j)} &= e^{\,m^{(j-1)} - m^{(j)}} \, \ell^{(j-1)}
++ \textstyle\sum e^{\,S_j - m^{(j)}}
+\end{aligned}
+$$
+
+</Eq>
+
+<Eq caption="eq. 2 — output rescaled in lockstep" source="Dao et al. §3.1">
+
+$$
+O^{(j)} = e^{\,m^{(j-1)} - m^{(j)}} O^{(j-1)} + e^{\,S_j - m^{(j)}} V_j
+$$
+
+</Eq>
+
+<Note label="in numbers">
+$M$ is SRAM — around 100 KB per SM. The whole result turns on a constant that
+never appears in the complexity.
+</Note>
+
+The backward pass does not store $A$ either. It recomputes each score tile from
+$Q$, $K$ and the saved per-row statistics $(m, \ell)$, trading a second pass of
+FLOPs for the removal of the $\Theta(n^2)$ read.
+
+<Eq caption="eq. 3 — HBM accesses, SRAM size M">
+
+$$
+\mathrm{IO}_{\text{standard}} = \Theta(n^2 + nd),
+\qquad
+\mathrm{IO}_{\text{flash}} = \Theta\!\left(\frac{n^2 d^2}{M}\right)
+$$
+
+</Eq>
+
+> The FLOP count is unchanged and the result is bit-comparable to a well-ordered
+> reference. Everything gained is bandwidth. This is the cleanest example in the
+> book of an algorithm whose complexity class says nothing about its speed.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · reference tiling, not the kernel">
+
+```python
+import math
+import torch
+from torch import Tensor
+
+
+def flash_reference(q: Tensor, k: Tensor, v: Tensor, tile: int = 128) -> Tensor:
+    """Illustrates the online-softmax recurrence. Real speedups
+    require the tiles to live in SRAM, which needs CUDA."""
+    n, d = q.shape
+    scale = 1.0 / math.sqrt(d)
+    out = torch.zeros_like(q)
+    m = torch.full((n, 1), -float("inf"))
+    l = torch.zeros((n, 1))
+
+    for j in range(0, n, tile):
+        kj, vj = k[j:j + tile], v[j:j + tile]
+        s = (q @ kj.T) * scale                     # [n, tile]
+
+        m_new = torch.maximum(m, s.max(-1, keepdim=True).values)
+        correction = (m - m_new).exp()
+        p = (s - m_new).exp()
+
+        l = correction * l + p.sum(-1, keepdim=True)
+        out = correction * out + p @ vj
+        m = m_new
+
+    return out / l
+```
+
+</CodeFrame>
+
+The correction factor is applied to the accumulator **and** the normaliser on
+every tile — dropping it from either one gives a result that looks plausible and
+is wrong by a per-row constant. Initialising $m$ to $-\infty$ makes the first
+correction $e^{-\infty - m_1} = 0$, which is intended and not an edge case to
+special-case.

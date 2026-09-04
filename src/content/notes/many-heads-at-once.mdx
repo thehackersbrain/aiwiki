@@ -1,0 +1,153 @@
+---
+title: 'Many heads at once'
+desc: 'Why one attention operation is not enough, and what the heads actually turn out to be doing.'
+lede: 'The subspace argument for multiple heads is clean, standard, and only about half of what is going on. The other half is that most heads are doing nothing in particular.'
+series: 'attention-from-scratch'
+part: 5
+minutes: 9
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['attention', 'foundations', 'interpretability']
+related: [multi-head-attention, grouped-query-attention, induction-heads, scaled-dot-product-attention, attention-sinks]
+refs:
+  - cite: 'Vaswani et al. — Attention Is All You Need (2017)'
+    id: 'arXiv:1706.03762'
+    href: https://arxiv.org/abs/1706.03762
+  - cite: 'Michel et al. — Are Sixteen Heads Really Better than One? (2019)'
+    id: 'arXiv:1905.10650'
+    href: https://arxiv.org/abs/1905.10650
+  - cite: 'Voita et al. — Analyzing Multi-Head Self-Attention (2019)'
+    id: 'arXiv:1905.09531'
+    href: https://arxiv.org/abs/1905.09531
+  - cite: 'Elhage et al. — A Mathematical Framework for Transformer Circuits (2021)'
+    id: 'transformer-circuits.pub'
+    href: https://transformer-circuits.pub/2021/framework/index.html
+---
+
+By the end of part 2 we had one attention operation: a similarity, a softmax, a
+weighted sum. Part 3 looked at what its output matrix contains. This part is
+about why nobody uses one of them.
+
+### The averaging problem
+
+Consider a single head reading the word *bank* in "she sat by the bank and
+counted the notes". Two things want attention: *sat by* disambiguates the sense,
+and *notes* is the object the eventual prediction depends on.
+
+One softmax row has to produce one distribution. It can split its mass between
+the two, and then the context vector is a blend — half of one signal and half of
+the other, added into the same $d$ dimensions with no way to tell them apart
+downstream.
+
+<Eq lead caption="eq. 1 — one row, one budget">
+
+$$
+c = \alpha_{\text{by}}\,v_{\text{by}} + \alpha_{\text{notes}}\,v_{\text{notes}},
+\qquad \alpha_{\text{by}} + \alpha_{\text{notes}} \le 1
+$$
+
+</Eq>
+
+This is not a subtlety I appreciated for a long time. The constraint is not that
+attention cannot look at two places — it obviously can, and part 1 made a point
+of that. It is that both retrievals land in *the same vector*, so they interfere,
+and the network has no free parameters left with which to separate them.
+
+### The standard fix
+
+Run $h$ attention operations in parallel, each with its own projections, each on
+a $d/h$-dimensional slice, and concatenate.
+
+<Eq caption="eq. 2 — h independent operations, one output">
+
+$$
+\mathrm{MHA}(x) = \bigl[\mathrm{head}_1 \,\|\, \cdots \,\|\, \mathrm{head}_h\bigr] W^O,
+\qquad \mathrm{head}_i = \softmax\!\left(\frac{Q_iK_i^\top}{\sqrt{d_k}}\right)V_i
+$$
+
+</Eq>
+
+Each head has its own $\alpha$, so each can attend somewhere different, and each
+writes into its own slice of the concatenation. The interference is gone because
+the outputs occupy disjoint dimensions until $W^O$ mixes them deliberately.
+
+The parameter count is unchanged. $d_k = d/h$, so $h$ heads of width $d/h$ is the
+same total projection size as one head of width $d$ — multi-head attention is
+free relative to single-head, which is the detail that makes the argument
+persuasive rather than merely appealing.
+
+<Note label="annotation">
+It took me a while to see that this is a <em>rearrangement</em> and not an
+addition. The same weights, partitioned differently, buy the ability to hold
+several retrievals apart. That is a surprisingly good deal, and it is the same
+kind of trick as <a href="/entries/shared-and-fine-grained-experts">fine-grained
+experts</a> — carve a fixed budget into more pieces and get combinatorially more
+behaviour out of it.
+</Note>
+
+### What they actually learn
+
+Here the tidy story ends, and I think the tidy story is taught for too long.
+
+Michel et al. pruned heads from trained models one at a time. On most layers,
+most heads could be removed with no measurable loss — many layers ran fine on a
+single head. Voita et al. found the same and characterised the survivors:
+positional heads that attend to a fixed offset, syntactic heads that follow
+dependency relations, and rare-token heads. A small minority doing something
+identifiable, and a majority that could be deleted.
+
+That is not what "each head learns a different subspace" predicts. The prediction
+is a division of labour; the observation is a handful of specialists and a lot of
+redundancy.
+
+<Note label="caveat">
+Both papers prune <em>after</em> training. That the heads are removable at the
+end does not mean they were useless during it — a redundant head may have been
+providing gradient paths or exploring alternatives early on. "Prunable" and
+"never mattered" are different claims and the experiments only support the first.
+</Note>
+
+### The reframing that helped me
+
+Elhage et al.'s circuits framework gave me the version I now use. A head is not a
+subspace specialist; it is a pair of maps.
+
+<Eq caption="eq. 3 — two circuits, and they are independent">
+
+$$
+\underbrace{W_Q^\top W_K}_{\text{QK: where to look}}
+\qquad\qquad
+\underbrace{W_O W_V}_{\text{OV: what to write}}
+$$
+
+</Eq>
+
+QK decides the attention pattern; OV decides what gets copied into the residual
+stream when it attends. They compose only through the head, so a head is fully
+described by "which positions does it read, and what does reading them write".
+
+This is a better frame for two reasons. It explains why heads compose across
+layers — an [induction head](/entries/induction-heads) is a head whose QK circuit
+reads the output of a previous head's OV circuit, which the subspace story has no
+vocabulary for. And it explains why so many heads look empty: a head with a
+near-zero OV circuit attends to things and writes nothing, which is exactly what
+a prunable head is.
+
+### The direction it went afterwards
+
+Everything since has reduced the head count on the *key and value* side while
+keeping it on the query side. [Multi-query](/entries/multi-query-attention)
+attention gives all heads one shared K and V;
+[grouped-query](/entries/grouped-query-attention) attention shares them among
+small groups.
+
+The justification is KV-cache size, and it is entirely an inference argument —
+but it is worth noticing that it works at all. If heads genuinely needed
+independent subspaces, sharing the keys and values across eight of them should
+hurt badly. It does not, and the redundancy above is presumably why.
+
+<Rule label="Next" />
+
+The last part is about what attention still cannot do. Not efficiency — part 4
+covered that — but the things the operation structurally cannot express, which
+turn out to explain several behaviours that look like bugs.

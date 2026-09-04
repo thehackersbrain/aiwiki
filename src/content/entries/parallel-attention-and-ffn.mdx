@@ -1,0 +1,131 @@
+---
+name: 'Parallel Attention and FFN'
+desc: 'Run both branches off the same input instead of one after the other.'
+category: 'architectures'
+complexity: '—'
+path: 'architectures/ffn'
+difficulty: 'intermediate'
+described: '2021'
+status: 'common'
+statusNote: 'In GPT-J, PaLM, GPT-NeoX and Falcon; absent from the Llama line. A throughput choice that costs a little quality at small scale and apparently none at large.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['ffn', 'attention', 'training']
+lede: 'The two halves of a transformer block do not have to be sequential. Feed both from the same normalised input, add both to the residual stream, and one matmul and one all-reduce disappear.'
+metrics:
+  caption: 'PaLM, reported at 62B'
+  rows:
+    - { label: 'Training speed-up', value: '≈ 15%' }
+    - { label: 'Quality, 8B', value: 'slightly worse' }
+    - { label: 'Quality, 62B', value: 'no difference', accent: true }
+implNote:
+  label: 'annotation'
+  html: 'The input projections of attention and the FFN can now be one matrix, since they consume the same vector. That fusion is where most of the speed-up comes from — not from the parallelism itself.'
+related: [feed-forward-networks, pre-norm-and-post-norm, swiglu, scaled-dot-product-attention, zero-sharding]
+refs:
+  - cite: 'Chowdhery et al. — PaLM: Scaling Language Modeling with Pathways (2022)'
+    id: 'arXiv:2204.02311'
+    href: https://arxiv.org/abs/2204.02311
+  - cite: 'Wang & Komatsuzaki — GPT-J-6B (2021)'
+    id: 'GPT-J'
+    href: https://github.com/kingoflolz/mesh-transformer-jax
+  - cite: 'Black et al. — GPT-NeoX-20B: An Open-Source Autoregressive Language Model (2022)'
+    id: 'arXiv:2204.06745'
+    href: https://arxiv.org/abs/2204.06745
+---
+
+The standard block applies attention, adds it to the residual stream, then
+applies the feed-forward block to the result.
+
+<Eq lead caption="eq. 1 — serial, the usual arrangement">
+
+$$
+y = x + \mathrm{FFN}\bigl(\mathrm{LN}_2(x + \mathrm{Attn}(\mathrm{LN}_1(x)))\bigr)
+$$
+
+</Eq>
+
+<Eq caption="eq. 2 — parallel: both read x, both write to x">
+
+$$
+y = x + \mathrm{Attn}\bigl(\mathrm{LN}(x)\bigr) + \mathrm{FFN}\bigl(\mathrm{LN}(x)\bigr)
+$$
+
+</Eq>
+
+In the serial form the FFN sees what attention just wrote. In the parallel form
+it does not — it sees the block's input, and the two contributions are summed
+without either knowing about the other.
+
+### What it buys
+
+**One normalisation instead of two.** Both branches read the same normalised
+vector, so the second LayerNorm is gone.
+
+**One input projection instead of two.** $W_Q, W_K, W_V$ and the FFN's
+up-projection all consume the same vector, so they concatenate into a single
+matrix. Larger matmuls are more efficient than several smaller ones, and this is
+where the measurable win is.
+
+**One all-reduce instead of two.** Under tensor parallelism each branch's output
+projection normally needs a collective. In the parallel form the two outputs are
+summed locally first and reduced together — halving the communication in the
+block, which at scale is the bound that matters.
+
+<Note label="annotation">
+Note what the arrangement is <em>not</em> doing: the two branches were already
+able to run concurrently on a single device, because the FFN's dependency on
+attention is a data dependency the scheduler can only respect. The win is
+structural — fewer, bigger operations — not extra parallelism.
+</Note>
+
+### What it costs
+
+PaLM reports the honest version: a small quality degradation at 8B that is not
+detectable at 62B. The usual reading is that depth-wise sequential composition
+matters less as the model gets wider, since each block's contribution to the
+residual stream is a smaller fraction of it either way.
+
+Nobody has published a careful study at frontier scale, which is why the field is
+split. GPT-J, GPT-NeoX, PaLM and Falcon parallelise; Llama, Mistral, Qwen and
+DeepSeek do not. Given that the gain is roughly 15% of training throughput, the
+split says something about how much appetite there is for architectural risk on
+an expensive run.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+from torch import Tensor, nn
+
+
+class ParallelBlock(nn.Module):
+    def __init__(self, dim: int, heads: int, hidden: int):
+        super().__init__()
+        self.norm = nn.RMSNorm(dim)                     # one norm, both branches
+
+        # Fused input projection: q, k, v and the FFN up-projection at once.
+        self.wi = nn.Linear(dim, 3 * dim + hidden, bias=False)
+        self.attn_out = nn.Linear(dim, dim, bias=False)
+        self.ffn_down = nn.Linear(hidden, dim, bias=False)
+        self.dim, self.heads, self.hidden = dim, heads, hidden
+
+    def forward(self, x: Tensor) -> Tensor:
+        h = self.wi(self.norm(x))
+        qkv, up = h.split([3 * self.dim, self.hidden], dim=-1)
+
+        a = self.attn_out(attention(qkv, self.heads))
+        f = self.ffn_down(squared_relu(up))
+
+        # One residual add; under tensor parallelism, one all-reduce.
+        return x + a + f
+```
+
+</CodeFrame>
+
+The split point in that fused projection is the thing to get right when porting.
+GPT-NeoX orders it `[q, k, v, ffn]` per tensor-parallel shard rather than
+globally, so a checkpoint converted without accounting for the shard interleave
+produces a model that runs and is wrong — the failure mode catalogued in
+[tensor layout conventions](/entries/tensor-layout-conventions).

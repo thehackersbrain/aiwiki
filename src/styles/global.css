@@ -1,0 +1,237 @@
+@import "tailwindcss";
+@import "./fonts.css";
+
+@theme {
+  /* ── Surfaces ─────────────────────────────────────── */
+  --color-ink: #0e0f11;
+  --color-panel: #121316;
+  --color-raise: #131417;
+
+  /* ── Rules & borders ──────────────────────────────── */
+  --color-rule-faint: #1a1c1f;
+  --color-rule: #1e2023;
+  --color-rule-strong: #2a2d31;
+  --color-edge: #23262a;
+  --color-edge-hi: #3a3e44;
+
+  /* ── Type ─────────────────────────────────────────── */
+  --color-bone: #f4f6f8;
+  --color-chalk: #f2f4f6;
+  --color-quill: #dfe3e8;
+  --color-body: #cfd2d6;
+  --color-prose: #b4b9c0;
+  --color-lede: #a9aeb5;
+  --color-mute: #9aa0a8;
+  --color-mute-2: #8a9098;
+  --color-mute-3: #79808a;
+  --color-dim: #6a6f76;
+  --color-dim-2: #5c6168;
+  --color-dim-3: #4e535a;
+
+  /* ── Accent ───────────────────────────────────────── */
+  --color-accent: var(--ac);
+  --color-accent-hi: #f0c795;
+  --color-accent-edge: #3d2c17;
+  --color-accent-wash: #1a1611;
+
+  /* ── Syntax ───────────────────────────────────────── */
+  --color-syn-kw: #b39ddb;
+  --color-syn-fn: #e0a86a;
+  --color-syn-type: #8fbf9f;
+  --color-syn-num: #e0a86a;
+  --color-syn-comment: #5c6168;
+
+  --font-serif: "Literata", Georgia, "Times New Roman", serif;
+  --font-mono: "Space Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --animate-rise: rise .3s ease-out;
+  --animate-fade: fade .2s ease-out;
+}
+
+@keyframes rise { from { opacity: 0; transform: translateY(7px) } to { opacity: 1; transform: none } }
+@keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+
+:root {
+  --ac: #e0a86a;
+  color-scheme: dark;
+
+  /* Status palette.
+     Declared here rather than in @theme on purpose: Tailwind v4 emits only the
+     theme variables some generated utility references, and these are read from
+     an inline style, so in @theme they would be tree-shaken away and the badge
+     would inherit its colour from the page. */
+  --status-standard: #7fc99a;
+  --status-standard-edge: #2b4c39;
+  --status-standard-wash: #0f1a14;
+
+  --status-common: #79b0dd;
+  --status-common-edge: #23405a;
+  --status-common-wash: #0e161d;
+
+  --status-emerging: #c2a5ec;
+  --status-emerging-edge: #3b3057;
+  --status-emerging-wash: #15111e;
+
+  --status-superseded: #949aa3;
+  --status-superseded-edge: #33373d;
+  --status-superseded-wash: #15161a;
+}
+
+@layer base {
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--color-ink);
+  }
+  body {
+    -webkit-font-smoothing: antialiased;
+    color: var(--color-body);
+    font-family: var(--font-serif);
+    font-size: 16px;
+    line-height: 1.7;
+  }
+  a { color: var(--ac); text-decoration: none; }
+  a:hover { color: var(--color-accent-hi); }
+  ::selection { background: var(--color-accent-edge); color: #fdf2e6; }
+  ::-webkit-scrollbar { width: 9px; height: 9px; }
+  ::-webkit-scrollbar-track { background: var(--color-ink); }
+  ::-webkit-scrollbar-thumb { background: var(--color-edge); }
+  sup { font-size: 0.68em; vertical-align: super; line-height: 0; }
+  sub { font-size: 0.68em; vertical-align: sub; line-height: 0; }
+}
+
+@utility label {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+
+@utility eyebrow {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+/* ── Entry body ─────────────────────────────────────────────────────────
+   MDX renders bare elements, so the measure and rhythm live here rather
+   than in a class on every paragraph. The container itself stays full
+   column width: display maths and code frames use all of it, prose does
+   not. */
+.entry-prose {
+  --measure: 68ch;
+}
+.entry-prose > p {
+  margin: 0 0 1.375rem;
+  /* max-width: var(--measure); */
+  max-width: full;
+  color: var(--color-prose);
+  text-wrap: pretty;
+}
+.entry-prose > h2,
+.entry-prose > h3 {
+  margin: 2rem 0 0.625rem;
+  max-width: var(--measure);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--color-mute);
+}
+.entry-prose > ul,
+.entry-prose > ol {
+  margin: 0 0 1.375rem;
+  max-width: var(--measure);
+  padding-left: 1.2rem;
+  color: var(--color-prose);
+}
+.entry-prose > ul { list-style: none; }
+.entry-prose > ul > li::before {
+  content: '—';
+  margin-left: -1.2rem;
+  padding-right: 0.5rem;
+  color: var(--color-dim-2);
+}
+.entry-prose li { margin-bottom: 0.4rem; }
+.entry-prose > blockquote {
+  margin: 0 0 1.375rem;
+  max-width: var(--measure);
+  border: none;
+  padding: 0;
+  font-size: 15px;
+  font-style: italic;
+  color: var(--color-mute-3);
+  text-wrap: pretty;
+}
+.entry-prose > blockquote > p { margin: 0; }
+.entry-prose strong { font-weight: 500; color: var(--color-chalk); }
+.entry-prose :not(pre) > code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  color: var(--color-quill);
+}
+.entry-prose > hr {
+  margin: 2rem 0;
+  border: none;
+  border-top: 1px solid var(--color-rule);
+}
+
+/* Tables. Ruled rather than boxed, to match the spec sheet: a strong line under
+   the mono header, hairlines between rows, and nothing down the sides. Set to
+   display:block so a wide table scrolls inside itself instead of widening the
+   page — the trade is that it no longer fills the measure, which is why width
+   is set explicitly. */
+.entry-prose > table {
+  display: block;
+  overflow-x: auto;
+  width: 100%;
+  max-width: var(--measure);
+  margin: 0 0 1.375rem;
+  border-collapse: collapse;
+  font-size: 15px;
+  color: var(--color-prose);
+}
+.entry-prose > table th {
+  border-bottom: 1px solid var(--color-rule-strong);
+  padding: 0.5rem 1.25rem 0.5rem 0;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 400;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  text-align: left;
+  white-space: nowrap;
+  color: var(--color-dim-2);
+}
+.entry-prose > table td {
+  border-bottom: 1px solid var(--color-rule-faint);
+  padding: 0.6rem 1.25rem 0.6rem 0;
+  text-align: left;
+  vertical-align: baseline;
+}
+.entry-prose > table tr > *:last-child {
+  padding-right: 0;
+}
+.entry-prose > table td:first-child {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: nowrap;
+  color: var(--color-accent);
+}
+
+/* A section label and a note that opens the section share one anchor point,
+   because both are zero-height. Drop the note clear of the label. */
+@media (min-width: 48rem) {
+  [data-margin-rule] + [data-margin-note] > aside {
+    top: 2.25rem;
+  }
+}
+
+/* KaTeX, tuned to sit with Literata rather than shout over it. */
+.entry-prose .katex { color: var(--color-bone); }
+.entry-prose .katex-display > .katex { white-space: nowrap; }
+/* Inline maths is short here; letting it break mid-expression reads as a typo. */
+.entry-prose :not(.katex-display) > .katex { white-space: nowrap; }
+.entry-prose p .katex { color: var(--color-quill); font-size: 1em; }

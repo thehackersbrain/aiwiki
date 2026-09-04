@@ -1,0 +1,159 @@
+---
+name: 'Mixture-of-Depths'
+desc: 'Route tokens past whole blocks: conditional depth rather than conditional width.'
+category: 'architectures'
+complexity: 'O(c·n²·d)'
+path: 'architectures/sparse'
+difficulty: 'intermediate'
+described: '2024'
+status: 'emerging'
+statusNote: 'A clean idea with a published fix for the causal problem, demonstrated at moderate scale. Nobody has yet shipped it in a frontier model.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['sparse', 'inference', 'scaling']
+lede: 'MoE varies which parameters a token uses. This varies how many layers it passes through — a fixed fraction of tokens takes the block, the rest go straight down the residual stream.'
+metrics:
+  caption: 'Raposo et al., 2024'
+  rows:
+    - { label: 'Tokens per block', value: '12.5%' }
+    - { label: 'Blocks affected', value: 'every other' }
+    - { label: 'FLOPs at equal loss', value: '−50%', accent: true }
+implNote:
+  label: 'annotation'
+  html: 'Because the capacity is fixed in advance, the tensor shapes are static and the FLOP count is known before the run. This is a real advantage over MoE, whose cost depends on how the router behaves.'
+related: [expert-choice-routing, mixture-of-experts-routing, causal-masking, speculative-decoding, pre-norm-and-post-norm, sliding-window-attention]
+refs:
+  - cite: 'Raposo et al. — Mixture-of-Depths: Dynamically allocating compute in transformer-based language models (2024)'
+    id: 'arXiv:2404.02258'
+    href: https://arxiv.org/abs/2404.02258
+  - cite: 'Zhou et al. — Mixture-of-Experts with Expert Choice Routing (2022)'
+    id: 'arXiv:2202.09368'
+    href: https://arxiv.org/abs/2202.09368
+  - cite: 'Elbayad et al. — Depth-Adaptive Transformer (2019)'
+    id: 'arXiv:1910.10073'
+    href: https://arxiv.org/abs/1910.10073
+---
+
+Every token in a standard transformer traverses every layer. The full depth of
+the network is spent on the second half of a common word and on the pivotal term
+of a hard question alike, and there is no reason to think those need the same
+amount of computation.
+
+[MoE](/entries/mixture-of-experts-routing) makes the *width* conditional — which
+parameters run. Mixture-of-Depths makes the *depth* conditional: whether the
+block runs at all.
+
+<Eq lead caption="eq. 1 — take the block, or skip it">
+
+$$
+x_{\ell+1} =
+\begin{cases}
+x_\ell + F_\ell\bigl(x_\ell\bigr) & t \in \mathrm{top}_C\bigl(r_\ell\bigr) \\[4pt]
+x_\ell & \text{otherwise}
+\end{cases}
+$$
+
+</Eq>
+
+$C$ is fixed in advance — 12.5% of the sequence in the paper — so exactly that
+many tokens enter the block and the rest pass through untouched. Both attention
+and the feed-forward block are skipped, and because the skipped tokens are absent
+from attention entirely, the quadratic term shrinks with the square of the
+fraction.
+
+### Static shapes, which is the point
+
+MoE's cost depends on the router: capacity factors, dropped tokens, imbalance
+between devices. Mixture-of-Depths has none of that, because the capacity is
+chosen rather than emergent. The tensor entering block $\ell$ is always
+$[C, d]$, the FLOP count is known before training starts, and there is nothing
+to balance.
+
+<Note label="annotation">
+It is applied to alternate blocks, not all of them. Every other block stays dense,
+which guarantees that no token can skip more than half the network however the
+router behaves — a bound worth having, since the alternative is a token that
+reaches the output having been transformed almost not at all.
+</Note>
+
+### The causal problem, and the fix
+
+The selection is a top-$C$ over the token axis, which is
+[expert-choice routing](/entries/expert-choice-routing) and inherits its defect:
+whether token 5 is in the top 12.5% depends on how tokens 6 onward scored. Fine
+during training, impossible during generation.
+
+Raposo et al. solve it rather than living with it. Train a small auxiliary
+predictor — a linear head on the block's input — to predict whether a token will
+make the top-$C$, supervised by the actual selection, which is available during
+training as a label. At inference the predictor decides alone, per token, causally.
+
+<Eq caption="eq. 2 — a binary classifier standing in for a global ranking">
+
+$$
+\mathcal{L}_{\text{aux}} = \mathrm{BCE}\Bigl(\sigma\bigl(w^\top x_t\bigr),\;
+\mathbb{1}\bigl[t \in \mathrm{top}_C(r)\bigr]\Bigr)
+$$
+
+</Eq>
+
+The gradient is stopped into the main model, so the predictor is fitted to the
+router's behaviour without perturbing it. Reported accuracy is around 97%, and
+the resulting deviation from the training-time routing is small enough not to
+show in the loss.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor, nn
+
+
+class MoDBlock(nn.Module):
+    def __init__(self, dim: int, capacity: float = 0.125, **kw):
+        super().__init__()
+        self.router = nn.Linear(dim, 1, bias=False)
+        self.predictor = nn.Linear(dim, 1)          # causal stand-in, inference
+        self.block = TransformerBlock(dim, **kw)
+        self.capacity = capacity
+
+    def forward(self, x: Tensor) -> Tensor:                   # [B, T, D]
+        b, t, _ = x.shape
+        r = self.router(x).squeeze(-1)                        # [B, T]
+
+        if self.training:
+            k = max(1, int(self.capacity * t))
+            idx = r.topk(k, dim=-1).indices                   # non-causal, fine here
+            self._fit_predictor(x, r, idx)
+        else:
+            idx = (self.predictor(x).squeeze(-1) > 0).nonzero(as_tuple=True)[1][None]
+
+        chosen = x.gather(1, idx[..., None].expand(-1, -1, x.size(-1)))
+
+        # The router weight multiplies the output, so it sits on the gradient
+        # path — without it the routing decision would receive no signal at all.
+        out = self.block(chosen) * torch.sigmoid(r.gather(1, idx))[..., None]
+        return x.scatter_add(1, idx[..., None].expand_as(out), out)
+```
+
+</CodeFrame>
+
+The multiplication by the router weight is the load-bearing line. A hard top-$k$
+is not differentiable, so if the block's output were used unscaled the router
+would receive no gradient and never learn anything — the same trick that makes
+MoE's gate trainable, and the same reason both are written this way.
+
+<Rule label="Where it stands" />
+
+The headline result is a model matching baseline loss at roughly half the FLOPs
+per forward pass, or equivalently a faster step at equal quality. The routing is
+also interpretable in a satisfying way: the tokens selected are disproportionately
+the content-bearing ones, and function words skip.
+
+What has not happened is adoption. The likeliest reason is that the gain is in
+FLOPs, and decoding at batch size one is bound by memory bandwidth rather than
+FLOPs — skipping a block still requires its weights to be resident. MoE trades
+memory for compute in the direction hardware likes; Mixture-of-Depths trades
+compute for nothing else, and that is a smaller prize than it appears.

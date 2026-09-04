@@ -1,0 +1,128 @@
+---
+name: 'Dynamic Tanh'
+desc: 'Replace the normalisation layer with a scaled tanh; no statistics at all.'
+category: 'architectures'
+complexity: 'O(n·d)'
+path: 'architectures/normalisation'
+difficulty: 'intermediate'
+described: '2025'
+status: 'emerging'
+statusNote: 'A clean result on a real question, reproduced at ViT and LLaMA scale by its authors and not yet at frontier scale by anyone else. Worth watching rather than adopting.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['normalisation', 'training']
+lede: 'Plot what LayerNorm does to a vector and it looks like an S-curve. So write down the S-curve directly: one learned scalar inside a tanh, one learned gain outside, and no reduction over the feature dimension.'
+metrics:
+  caption: 'Reported cost, LLaMA-7B'
+  rows:
+    - { label: 'Learned params', value: '1 scalar + gain' }
+    - { label: 'Reductions', value: 'none', accent: true }
+    - { label: 'Inference latency', value: '≈ −8%' }
+implNote:
+  label: 'caveat'
+  html: 'The initial value of α is the one thing that must be tuned, and it is depth- and width-dependent: 0.5 works for vision, and language models need smaller values in the larger layers or the first few hundred steps diverge.'
+related: [layer-normalisation, rmsnorm, pre-norm-and-post-norm, qk-normalisation, batch-normalisation]
+refs:
+  - cite: 'Zhu et al. — Transformers without Normalization (2025)'
+    id: 'arXiv:2503.10622'
+    href: https://arxiv.org/abs/2503.10622
+  - cite: 'Xu et al. — Understanding and Improving Layer Normalization (2019)'
+    id: 'arXiv:1911.07013'
+    href: https://arxiv.org/abs/1911.07013
+  - cite: 'Brock et al. — High-Performance Large-Scale Image Recognition Without Normalization (2021)'
+    id: 'arXiv:2102.06171'
+    href: https://arxiv.org/abs/2102.06171
+---
+
+Take a trained transformer, pick a LayerNorm, and plot each output component
+against its input. The result is not a straight line, which is what the formula
+naïvely suggests for a fixed $\sigma$ — it is a sigmoid, close to linear in the
+middle and flattening at both ends. Deeper layers give sharper curves.
+
+Zhu et al. take that plot at face value and replace the layer with the function
+it appears to compute.
+
+<Eq lead caption="eq. 1 — one scalar in, one gain and bias out">
+
+$$
+\mathrm{DyT}(x) = g \odot \tanh(\alpha x) + b, \qquad \alpha \in \mathbb{R}
+$$
+
+</Eq>
+
+$\alpha$ is a single learned scalar for the whole layer; $g$ and $b$ are the
+per-channel gain and bias that LayerNorm already had. There is no mean, no
+variance, and no reduction over the feature dimension.
+
+### Why the S-curve appears
+
+LayerNorm divides by $\sigma$, which is computed over the same vector, so the
+mapping is linear *for a fixed vector* and the slope differs between vectors. The
+observed curve is the aggregate over many tokens: vectors with small norm are
+scaled up, vectors with large norm are scaled down, and the extreme components of
+any given vector — the ones far out in the tail that dominate $\sigma$ — get
+compressed relative to the bulk.
+
+<Note label="annotation">
+That squashing of extremes is the part worth keeping. Xu et al.'s analysis
+attributes LayerNorm's benefit to gradient shaping rather than to the forward
+statistics, and tanh reproduces the shaping — saturating gradients on outliers —
+without needing the statistics to produce it.
+</Note>
+
+### What it costs and what it buys
+
+No reduction means no synchronisation across the feature dimension, which is
+where the speed comes from: a normalisation layer is bandwidth-bound and
+serialises the block, and an elementwise function does not. The authors report
+inference-latency reductions around 8% on LLaMA-7B, with training throughput
+gains of a similar order.
+
+The evidence covers ViT and ConvNeXt on ImageNet, LLaMA pre-training to 7B,
+diffusion transformers, and speech models, matching the normalised baseline in
+each case. What it does not cover is frontier scale, and normalisation-removal
+has a history here — Brock et al.'s NF-ResNets matched BatchNorm on ImageNet with
+careful gradient clipping, were correct, and did not displace it.
+
+There is also one honest negative result in the paper: DyT does not work as a
+drop-in for BatchNorm in classical ResNets. It matches in transformers and loses
+in convnets, and the authors do not claim to know why.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor, nn
+
+
+class DyT(nn.Module):
+    """Drop-in for nn.LayerNorm(dim) with no reduction over the feature dim."""
+
+    def __init__(self, dim: int, init_alpha: float = 0.5):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.tensor(init_alpha))
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+
+    def forward(self, x: Tensor) -> Tensor:
+        return torch.tanh(self.alpha * x) * self.weight + self.bias
+```
+
+</CodeFrame>
+
+Four lines, and the interesting one is the initialisation. $\alpha_0 = 0.5$ holds
+for vision at any size the paper tried. Language models are sensitive to it: the
+attention blocks want a smaller value than the feed-forward blocks, and both want
+smaller values as width grows — the paper's LLaMA-7B recipe uses 0.2 for the
+attention norms and 0.2 for the final norm against 1.0 elsewhere. A single global
+$\alpha_0$ is the reported failure mode, not a subtlety.
+
+<Rule label="Reading it as a claim" />
+
+The interesting content is not the speedup. It is that a transformer does not
+need *normalisation* — it needs a bounded, saturating map with a learnable slope,
+and normalisation is one way to obtain one. If that holds up at scale, most of
+this shelf is describing implementations of a requirement rather than the
+requirement itself.

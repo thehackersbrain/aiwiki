@@ -1,0 +1,48 @@
+---
+name: 'Path Patching'
+desc: 'Restrict the intervention to a single computational path between components.'
+category: 'interpretability'
+complexity: 'O(L²·n)'
+path: 'interpretability/causal'
+difficulty: 'advanced'
+described: '2022'
+status: 'common'
+revised: 2026-08-04
+added: 2024-10-19
+tags: ['causal', 'circuits']
+lede: 'Activation patching changes a component’s output for every downstream reader at once. Path patching changes it for one reader only, which is what a claim about an edge in a circuit actually requires.'
+related: [activation-patching, attribution-patching, sparse-autoencoders]
+refs:
+  - cite: 'Wang et al. — Interpretability in the Wild: a Circuit for Indirect Object Identification (2022)'
+    id: 'arXiv:2211.00593'
+    href: https://arxiv.org/abs/2211.00593
+  - cite: 'Goldowsky-Dill et al. — Localizing Model Behavior with Path Patching (2023)'
+    id: 'arXiv:2304.05969'
+    href: https://arxiv.org/abs/2304.05969
+---
+
+Because the residual stream is a sum, a component's output reaches every later
+block. Patching it measures the total effect along all paths simultaneously. To
+isolate an edge $A \rightarrow B$ you must present the patched value of $A$ to $B$
+alone, while every other consumer of $A$ continues to see the original.
+
+<Eq caption="eq. 1 — one edge, all other consumers untouched" lead>
+
+$$
+\mathrm{effect}(A \rightarrow B) =
+M\bigl( \mathrm{do}(\mathrm{input}_B(A) \leftarrow a') \bigr) - M(\cdot)
+$$
+
+</Eq>
+
+<Note label="caveat">
+Direct-effect-only patching — freezing every intermediate rather than recomputing —
+answers a third question again. The three variants are routinely conflated. State
+which one you ran.
+</Note>
+
+Implementation requires three runs: a clean run, a corrupt run, and a run in which
+$B$ is recomputed from a residual stream that has had $A$'s contribution swapped,
+with everything downstream of $B$ then freely recomputed. Doing it for all pairs is
+quadratic in components, which is why
+[attribution methods](/entries/attribution-patching) exist.

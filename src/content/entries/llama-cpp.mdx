@@ -1,0 +1,109 @@
+---
+name: 'llama.cpp'
+desc: 'A dependency-free C++ inference engine, and the GGUF format everything local uses.'
+category: 'tooling'
+complexity: '—'
+path: 'tooling/serving'
+difficulty: 'introductory'
+described: '2023'
+status: 'standard'
+statusNote: 'The substrate for essentially all local inference. Ollama, LM Studio and most desktop LLM software are wrappers around it or around its format.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['tooling', 'inference', 'quantisation']
+lede: 'One C++ project with no dependencies that runs a quantised model on a laptop CPU, a Mac GPU, a phone, or a Raspberry Pi. Its file format became the standard by being the only one anyone could load anywhere.'
+metrics:
+  caption: 'Llama-3-8B, GGUF'
+  rows:
+    - { label: 'fp16', value: '16 GB' }
+    - { label: 'Q4_K_M', value: '4.9 GB', accent: true }
+    - { label: 'Q4 quality cost', value: 'small' }
+implNote:
+  label: 'in practice'
+  html: '<code>Q4_K_M</code> is the default worth starting from — roughly 4.8 bits per weight, with the sensitive tensors kept wider. Below <code>Q3</code> the degradation becomes obvious on anything requiring precision.'
+related: [ollama, gptq, qlora, floating-point-formats, vllm, paged-attention]
+refs:
+  - cite: 'Gerganov — llama.cpp'
+    id: 'github'
+    href: https://github.com/ggml-org/llama.cpp
+  - cite: 'GGUF format specification'
+    id: 'ggml docs'
+    href: https://github.com/ggml-org/ggml/blob/master/docs/gguf.md
+  - cite: 'Dettmers et al. — The case for 4-bit precision: k-bit Inference Scaling Laws (2022)'
+    id: 'arXiv:2212.09720'
+    href: https://arxiv.org/abs/2212.09720
+---
+
+Running a model normally means Python, PyTorch, CUDA and several gigabytes of
+dependencies. llama.cpp is a C++ program with none of that, which is the entire
+reason it matters — it compiles anywhere and runs on hardware that has no
+business running a language model.
+
+### What it is for
+
+- **Local inference on whatever you have.** CPU, Apple Metal, CUDA, ROCm, Vulkan.
+  A Mac with unified memory is a genuinely good target and the main reason
+  Apple hardware became popular for this.
+- **Aggressive quantisation.** Its k-quant formats hold models at 2–8 bits with a
+  per-block scheme that keeps the sensitive tensors wider.
+- **Embedding in something else.** No runtime, no interpreter, one library to
+  link. This is why it is inside so much desktop software.
+
+### What it is not for
+
+Serving. It handles concurrent requests, but it is not built for the throughput
+problem — no [continuous batching](/entries/continuous-batching) in the sense
+[vLLM](/entries/vllm) means it, and the per-request cost at high concurrency is
+much worse. One user, one machine is the design point.
+
+### GGUF
+
+The format is arguably the more durable contribution. A single file holding the
+weights, the tokeniser, the architecture and the metadata — self-describing, so
+a runtime can load a model it has never seen without a config file, a Python
+class or a download of anything else.
+
+| Quantisation | Bits/weight | Use |
+| --- | --- | --- |
+| `Q8_0` | 8.5 | near-lossless, large |
+| `Q6_K` | 6.6 | when quality matters |
+| `Q4_K_M` | 4.8 | the default |
+| `Q3_K_M` | 3.9 | tight memory, visible cost |
+| `Q2_K` | 2.6 | last resort |
+
+The `_K` suffix marks the k-quant schemes, which vary bit width per tensor —
+attention and feed-forward weights are treated differently, on the same
+sensitivity argument that [GPTQ](/entries/gptq) makes. `_M` is the medium variant
+within a family.
+
+<Note label="annotation">
+Quantisation is a strictly better use of a memory budget than a smaller model.
+Dettmers et al. found 4-bit consistently optimal for a fixed number of bytes: a
+4-bit 13B beats an 8-bit 7B, which beats an fp16 3B. Reach for a smaller
+quantisation before a smaller model.
+</Note>
+
+<Rule label="Using it" />
+
+<CodeFrame meta="shell">
+
+```bash
+# Convert and quantise from a HuggingFace checkpoint.
+python convert_hf_to_gguf.py ./Llama-3-8B --outfile model-f16.gguf
+./llama-quantize model-f16.gguf model-q4.gguf Q4_K_M
+
+# One-shot, or an OpenAI-compatible server.
+./llama-cli -m model-q4.gguf -p "Explain attention sinks." -n 256
+./llama-server -m model-q4.gguf --port 8080 -c 8192 -ngl 99
+```
+
+</CodeFrame>
+
+`-ngl` is the flag that matters on a machine with a GPU: it sets how many layers
+are offloaded to it. The remainder run on CPU, so a model slightly too large for
+VRAM still runs at a reasonable speed rather than not at all — the
+[offloading](/entries/cpu-and-nvme-offloading) trade, exposed as a single number.
+
+`-c` sets the context length and allocates the KV cache up front. Leaving it at
+the model's maximum on a 128k-context model reserves a great deal of memory that
+a short conversation will never use.

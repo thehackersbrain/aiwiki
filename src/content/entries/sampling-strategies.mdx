@@ -1,0 +1,127 @@
+---
+name: 'Sampling Strategies'
+desc: 'Temperature, top-k, nucleus and min-p as successive truncations of the tail.'
+category: 'inference'
+complexity: 'O(V log V)'
+path: 'inference/decoding'
+difficulty: 'introductory'
+described: '2019'
+status: 'standard'
+revised: 2026-08-05
+added: 2025-02-11
+tags: ['decoding', 'metric']
+lede: 'The model gives a distribution over 100,000 tokens, most of which are wrong. Every sampler is a rule for deciding how much of the tail to throw away before drawing.'
+implNote:
+  label: 'caveat'
+  html: 'Order matters: truncate first, then renormalise, then apply temperature — or apply temperature first and truncate on the scaled distribution. The two give different results and libraries disagree.'
+related: [speculative-decoding, perplexity, llm-as-judge]
+refs:
+  - cite: 'Holtzman et al. — The Curious Case of Neural Text Degeneration (2019)'
+    id: 'arXiv:1904.09751'
+    href: https://arxiv.org/abs/1904.09751
+  - cite: 'Fan et al. — Hierarchical Neural Story Generation (2018)'
+    id: 'arXiv:1805.04833'
+    href: https://arxiv.org/abs/1805.04833
+  - cite: 'Nguyen et al. — Turning Up the Heat: Min-p Sampling (2024)'
+    id: 'arXiv:2407.01082'
+    href: https://arxiv.org/abs/2407.01082
+---
+
+Temperature rescales the logits before the softmax. Below 1 it sharpens the
+distribution, above 1 it flattens it, and in the limits it becomes argmax or
+uniform.
+
+<Eq caption="eq. 1" lead>
+
+$$
+p_i = \frac{\exp(z_i / T)}{\sum_j \exp(z_j / T)}
+$$
+
+</Eq>
+
+Temperature alone never removes a token. Even at $T = 0.7$ a vocabulary of
+128,000 leaves an enormous amount of probability mass spread across tokens that
+are individually absurd, and over hundreds of steps one of them gets drawn.
+Truncation is what prevents that.
+
+### Top-k and nucleus
+
+<Note label="caveat">
+Top-$k$ is the wrong shape. A flat distribution has far more than $k$ reasonable
+continuations; a peaked one has fewer, and $k$ admits nonsense to fill the quota.
+</Note>
+
+Nucleus sampling fixes the shape problem by truncating on cumulative mass rather
+than rank: keep the smallest set whose probability sums past $p$.
+
+<Eq caption="eq. 2 — the nucleus" source="Holtzman et al. §3.2">
+
+$$
+V^{(p)} = \arg\min_{V' \subseteq V} |V'|
+\quad \text{s.t.} \quad \sum_{i \in V'} p_i \ge p
+$$
+
+</Eq>
+
+### Min-p
+
+Nucleus still misbehaves at high temperature, where flattening the distribution
+inflates the tail and the nucleus swallows it. Min-p sets the threshold relative
+to the most likely token instead, so the cut scales with the model's confidence.
+
+<Eq caption="eq. 3 — keep tokens within a fraction of the mode">
+
+$$
+V^{(\text{min-}p)} = \{\, i : p_i \ge p_{\text{base}} \cdot \max_j p_j \,\}
+$$
+
+</Eq>
+
+When the model is certain, $\max_j p_j$ is near 1 and the set collapses to a
+handful; when it is uncertain, the threshold falls and the set widens. That is
+the behaviour top-$k$ was reaching for.
+
+> Greedy decoding is not a neutral baseline. It is the mode of the
+> distribution, and the mode of a language model is systematically bland — the
+> degeneration Holtzman documented is a property of maximisation, not of the
+> model.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor
+
+
+def sample(
+    logits: Tensor,          # [V]
+    temperature: float = 1.0,
+    top_p: float | None = None,
+    min_p: float | None = None,
+) -> int:
+    if temperature <= 0:
+        return int(logits.argmax())
+
+    probs = (logits / temperature).softmax(-1)
+
+    if min_p is not None:
+        probs[probs < min_p * probs.max()] = 0.0
+
+    if top_p is not None:
+        ordered, index = probs.sort(descending=True)
+        cutoff = ordered.cumsum(-1) - ordered > top_p
+        ordered[cutoff] = 0.0
+        probs = torch.zeros_like(probs).scatter_(-1, index, ordered)
+
+    return int((probs / probs.sum()).multinomial(1))
+```
+
+</CodeFrame>
+
+The `cumsum - ordered` in the nucleus mask is deliberate: it keeps the token
+that *crosses* the threshold rather than dropping it, so a single token with
+probability above `top_p` is never excluded — the failure mode that makes a
+confident model produce garbage. Note that this truncates on the
+temperature-scaled distribution, which is the convention in most serving stacks.

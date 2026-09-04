@@ -1,0 +1,121 @@
+---
+name: 'Chinchilla Scaling Laws'
+desc: 'Compute-optimal allocation between parameters and training tokens.'
+category: 'training'
+complexity: '—'
+path: 'training/scaling'
+difficulty: 'intermediate'
+described: '2022'
+status: 'common'
+statusNote: 'Still the first calculation anyone does, and routinely overridden: inference cost now argues for training smaller models on far more data than compute-optimality alone would.'
+revised: 2026-08-28
+added: 2024-11-30
+tags: ['scaling', 'training']
+lede: 'Given a fixed compute budget, how large should the model be and how much data should it see? The answer is that both scale as the square root of compute — roughly twenty tokens per parameter.'
+metrics:
+  caption: 'compute-optimal points on the Hoffmann fit'
+  rows:
+    - { label: '7B model', value: '140B tokens' }
+    - { label: '70B model', value: '1.4T tokens' }
+    - { label: 'Tokens / param', value: '≈ 20', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Compute-optimal is optimal for the *training* budget. If the model will serve billions of requests, the right model is smaller and trained far past this point.'
+related: [kaplan-scaling-laws, training-compute-accounting, compute-optimal-versus-inference-optimal, data-constrained-scaling, scaling-law-methodology, perplexity]
+refs:
+  - cite: 'Hoffmann et al. — Training Compute-Optimal Large Language Models (2022)'
+    id: 'arXiv:2203.15556'
+    href: https://arxiv.org/abs/2203.15556
+  - cite: 'Kaplan et al. — Scaling Laws for Neural Language Models (2020)'
+    id: 'arXiv:2001.08361'
+    href: https://arxiv.org/abs/2001.08361
+  - cite: 'Besiroglu et al. — Chinchilla Scaling: A Replication Attempt (2024)'
+    id: 'arXiv:2404.10102'
+    href: https://arxiv.org/abs/2404.10102
+---
+
+Fit the loss as a function of parameter count $N$ and training tokens $D$. The
+functional form has three terms: an irreducible entropy of the data, a penalty
+for finite model capacity, and a penalty for finite data.
+
+<Eq caption="eq. 1 — α ≈ 0.34, β ≈ 0.28 on the Hoffmann fit" source="Hoffmann et al. §3.3" lead>
+
+$$
+L(N, D) = E + \frac{A}{N^{\alpha}} + \frac{B}{D^{\beta}}
+$$
+
+</Eq>
+
+<Note label="annotation">
+The near-equality of $\alpha$ and $\beta$ is the whole result. Had they differed
+much, compute-optimal scaling would favour one of the two sharply.
+</Note>
+
+Minimise eq. 1 subject to the compute constraint $C \approx 6ND$ — six FLOPs per
+parameter per token, two for the forward pass and four for the backward. Because
+$\alpha \approx \beta$, the optimum splits the budget almost evenly between the
+two terms.
+
+<Eq caption="eq. 2 — both exponents ≈ 0.5">
+
+$$
+N_{\text{opt}} \propto C^{\frac{\beta}{\alpha+\beta}},
+\qquad
+D_{\text{opt}} \propto C^{\frac{\alpha}{\alpha+\beta}},
+\qquad
+\frac{D_{\text{opt}}}{N_{\text{opt}}} \approx 20
+$$
+
+</Eq>
+
+### What it corrected
+
+Kaplan's earlier fit concluded that parameters should grow far faster than data,
+which is why the models of 2020–2021 were large and badly undertrained. The
+difference traces to two methodological points: Kaplan held the learning-rate
+schedule fixed rather than matching it to each run's length, and counted
+non-embedding parameters. Chinchilla, at 70B trained on 1.4T tokens, beat a
+280B model trained on 300B tokens using the same compute.
+
+> The replication attempt is worth reading alongside the original: it recovers
+> the same conclusion but finds the reported confidence intervals implausibly
+> tight, and estimates $\alpha$ and $\beta$ closer to $0.35$ each.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · numpy + scipy">
+
+```python
+import numpy as np
+from scipy.optimize import minimize
+
+# Hoffmann et al., Table 2
+E, A, B, ALPHA, BETA = 1.69, 406.4, 410.7, 0.34, 0.28
+
+
+def loss(n_params: float, n_tokens: float) -> float:
+    return E + A / n_params**ALPHA + B / n_tokens**BETA
+
+
+def compute_optimal(flops: float) -> tuple[float, float]:
+    """Minimise loss subject to C = 6ND."""
+    def objective(log_n):
+        n = np.exp(log_n[0])
+        return loss(n, flops / (6 * n))
+
+    best = minimize(objective, [np.log(1e9)], method="Nelder-Mead")
+    n = float(np.exp(best.x[0]))
+    return n, flops / (6 * n)
+
+
+n, d = compute_optimal(1e23)
+print(f"{n/1e9:.1f}B params, {d/1e12:.2f}T tokens, {d/n:.0f} tokens/param")
+```
+
+</CodeFrame>
+
+The $6ND$ estimate ignores attention, which is fine while $n \ll 12d$ and
+increasingly wrong at long context — at 32k tokens and $d = 4096$ the attention
+term is no longer a rounding error. Fitting the constants to your own
+architecture on a ladder of small runs beats importing Hoffmann's numbers
+wholesale; what transfers is the shape, not the coefficients.

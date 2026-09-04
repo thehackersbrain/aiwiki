@@ -1,0 +1,108 @@
+---
+name: 'ALiBi'
+desc: 'Linear distance penalty on attention scores in place of position embeddings.'
+category: 'architectures'
+complexity: 'O(n²·d)'
+path: 'architectures/position'
+difficulty: 'introductory'
+described: '2021'
+status: 'superseded'
+statusNote: 'Solved the extrapolation problem first and lost to RoPE plus context extension, which extrapolates further without giving up an explicit position representation.'
+revised: 2026-07-24
+added: 2025-01-20
+tags: ['position', 'attention']
+lede: 'No position embeddings at all. Subtract a per-head constant times the query–key distance from the attention scores, and the model extrapolates past its training length.'
+implNote:
+  label: 'annotation'
+  html: 'The bias matrix depends only on positions, so it is built once per sequence length and cached — never recomputed per layer.'
+related: [rotary-position-embedding, t5-relative-position-bias, relative-position-embeddings, xpos, sliding-window-attention]
+refs:
+  - cite: 'Press et al. — Train Short, Test Long: Attention with Linear Biases (2021)'
+    id: 'arXiv:2108.12409'
+    href: https://arxiv.org/abs/2108.12409
+  - cite: 'Su et al. — RoFormer: Rotary Position Embedding (2021)'
+    id: 'arXiv:2104.09864'
+    href: https://arxiv.org/abs/2104.09864
+  - cite: 'Chi et al. — KERPLE: Kernelized Relative Positional Embedding (2022)'
+    id: 'arXiv:2205.09921'
+    href: https://arxiv.org/abs/2205.09921
+---
+
+ALiBi adds nothing to the embeddings. It biases the attention logits directly
+with a penalty proportional to how far back the key is, using a slope $m_h$
+fixed per head.
+
+<Eq caption="eq. 1 — bias added before the softmax" source="Press et al. §3" lead>
+
+$$
+\mathrm{softmax}\!\left( \frac{q_i K^{\top}}{\sqrt{d_k}} - m_h \,|i - j| \right)
+$$
+
+</Eq>
+
+<Note label="in numbers">
+For 8 heads the slopes run $\tfrac{1}{2}, \tfrac{1}{4}, \dots, \tfrac{1}{256}$
+— from a head that sees a handful of tokens to one that barely notices distance.
+</Note>
+
+The slopes are a geometric sequence, not learned. For $H$ heads the ratio
+starts at $2^{-8/H}$, which spreads the heads from steeply local to nearly
+position-blind.
+
+<Eq caption="eq. 2 — slope for head h, 1-indexed">
+
+$$
+m_h = 2^{-8h/H}
+$$
+
+</Eq>
+
+### Why it extrapolates
+
+A model trained with learned or sinusoidal absolute positions has no defined
+behaviour past its training length: it is being asked about embeddings it never
+saw. ALiBi has no such embeddings. Evaluated at four times the training length
+its perplexity keeps falling, because the only thing the extra distance changes
+is a larger penalty — and a large enough penalty is simply a soft local window.
+
+> That framing is also the limitation. What extrapolates is the *recency bias*,
+> not the ability to retrieve from far away: an ALiBi model handed a fact 8k
+> tokens back has been actively discouraged from attending to it.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import math
+import torch
+from torch import Tensor
+
+
+def alibi_slopes(n_heads: int) -> Tensor:
+    """Geometric slopes; the paper's fallback covers non-powers of two."""
+    def powers(n: int) -> list[float]:
+        start = 2 ** -(2 ** -(math.log2(n) - 3))
+        return [start ** (i + 1) for i in range(n)]
+
+    if math.log2(n_heads).is_integer():
+        return torch.tensor(powers(n_heads))
+
+    closest = 2 ** math.floor(math.log2(n_heads))
+    extra = powers(2 * closest)[0::2][: n_heads - closest]
+    return torch.tensor(powers(closest) + extra)
+
+
+def alibi_bias(n_heads: int, seq_len: int) -> Tensor:
+    """[1, H, N, N], causal. Build once, reuse for every layer."""
+    pos = torch.arange(seq_len)
+    distance = (pos[None, :] - pos[:, None]).tril()   # <= 0 below diagonal
+    return (alibi_slopes(n_heads)[:, None, None] * distance)[None]
+```
+
+</CodeFrame>
+
+Note the sign: `distance` is negative or zero on and below the diagonal, so
+multiplying by a positive slope already gives the penalty — no separate
+negation. Add the result to the scores *before* the causal mask, or the masked
+positions will pick up a finite bias and stop being masked.

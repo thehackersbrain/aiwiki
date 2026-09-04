@@ -1,0 +1,95 @@
+---
+name: 'GPTQ'
+desc: 'Layer-wise second-order weight quantisation with Hessian-guided rounding.'
+category: 'inference'
+complexity: 'O(d³)'
+path: 'inference/quantisation'
+difficulty: 'advanced'
+described: '2022'
+status: 'common'
+statusNote: 'One of several established weight-quantisation methods. The category is settled; the specific algorithm is competitive rather than dominant.'
+revised: 2026-08-04
+added: 2026-03-08
+tags: ['quantisation']
+lede: 'Round weights one column at a time, and after each rounding push the resulting error into the columns not yet quantised, weighted by the inverse Hessian.'
+implNote:
+  label: 'in practice'
+  html: 'Calibration data matters more than the bit width at 4 bits. A few hundred sequences from the target domain is enough; the wrong domain is worse than round-to-nearest.'
+related: [qlora, speculative-decoding]
+refs:
+  - cite: 'Frantar et al. — GPTQ: Accurate Post-Training Quantization for Generative Transformers (2022)'
+    id: 'arXiv:2210.17323'
+    href: https://arxiv.org/abs/2210.17323
+  - cite: 'Hassibi & Stork — Second Order Derivatives for Network Pruning: Optimal Brain Surgeon (1992)'
+    id: 'NIPS 1992'
+  - cite: 'Lin et al. — AWQ: Activation-aware Weight Quantization (2023)'
+    id: 'arXiv:2306.00978'
+    href: https://arxiv.org/abs/2306.00978
+---
+
+<Note label="caveat">
+Per layer, not end to end. Nothing in the objective knows that an error in layer 3
+may be amplified by layer 30.
+</Note>
+
+Frame quantisation per layer as minimising output error on a calibration set
+rather than weight error. The objective is quadratic in the weight perturbation,
+with Hessian $H = 2XX^{\top}$ given by the layer's input activations.
+
+<Eq caption="eq. 1 — per-layer reconstruction" lead>
+
+$$
+\arg\min_{\hat{W}} \; \bigl\| W X - \hat{W} X \bigr\|_2^2,
+\qquad H = 2 X X^{\top}
+$$
+
+</Eq>
+
+Optimal Brain Surgeon gives the compensation for a single rounded weight in closed
+form. GPTQ applies it greedily in a fixed column order, so the inverse Hessian can
+be Cholesky-factorised once and reused, dropping the cost from $O(d^4)$ to
+$O(d^3)$.
+
+<Eq caption="eq. 2 — error pushed onto remaining columns" source="Frantar et al. §3">
+
+$$
+\delta_F = -\,\frac{w_q - \mathrm{quant}(w_q)}{[H^{-1}]_{qq}} \cdot [H^{-1}]_{:,q}
+$$
+
+</Eq>
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch — sketch of the inner loop">
+
+```python
+import torch
+from torch import Tensor
+
+
+def gptq_column_loop(W: Tensor, Hinv: Tensor, bits: int = 4) -> Tensor:
+    """W: [out, in] rows quantised jointly, columns in order.
+    Hinv: upper-Cholesky inverse Hessian [in, in]."""
+    W = W.clone()
+    n_cols = W.size(1)
+    scale = W.abs().max(dim=1, keepdim=True).values / (2 ** (bits - 1) - 1)
+
+    for q in range(n_cols):
+        w = W[:, q]
+        dq = (w / scale.squeeze(1)).round().clamp(
+            -(2 ** (bits - 1)), 2 ** (bits - 1) - 1
+        ) * scale.squeeze(1)
+        err = (w - dq) / Hinv[q, q]
+        W[:, q] = dq
+        # push the error onto columns not yet visited
+        W[:, q + 1:] -= err[:, None] * Hinv[q, q + 1:][None, :]
+    return W
+```
+
+</CodeFrame>
+
+Dampen the Hessian diagonal by about 1% of its mean before inverting; activation
+Hessians from a small calibration set are routinely singular, and an unregularised
+Cholesky will fail or, worse, succeed with garbage. Quantising in blocks of 128
+columns with a re-derived scale per block is what the released implementations
+actually do — the single global scale above is for legibility.

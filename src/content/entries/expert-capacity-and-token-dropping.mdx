@@ -1,0 +1,154 @@
+---
+name: 'Expert Capacity and Token Dropping'
+desc: 'Fixed buffers per expert, and what happens to the tokens that do not fit.'
+category: 'architectures'
+complexity: 'O(k·d²)'
+memory: 'O(E·C·d)'
+path: 'architectures/sparse'
+difficulty: 'intermediate'
+described: '2020'
+status: 'common'
+statusNote: 'Unavoidable wherever experts are sharded across devices, which is everywhere at scale. Dropless kernels remove the need on a single device and not across a cluster.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['sparse', 'training', 'scaling']
+lede: 'A routed layer is a ragged assignment forced into a rectangular tensor. Capacity is the width of that rectangle, and the tokens past the edge are simply not computed.'
+metrics:
+  caption: 'Typical settings'
+  rows:
+    - { label: 'Capacity factor, train', value: '1.0 … 1.25' }
+    - { label: 'Capacity factor, eval', value: '2.0' }
+    - { label: 'Tokens dropped', value: '1 … 10%', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'A dropped token is not zeroed — it passes through the layer on the residual stream unchanged. The block becomes an identity for that token, which is survivable in one layer and compounding across thirty.'
+related: [mixture-of-experts-routing, loss-free-load-balancing, expert-choice-routing, expert-parallelism, nondeterminism]
+refs:
+  - cite: 'Lepikhin et al. — GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding (2020)'
+    id: 'arXiv:2006.16668'
+    href: https://arxiv.org/abs/2006.16668
+  - cite: 'Fedus et al. — Switch Transformers: Scaling to Trillion Parameter Models (2021)'
+    id: 'arXiv:2101.03961'
+    href: https://arxiv.org/abs/2101.03961
+  - cite: 'Gale et al. — MegaBlocks: Efficient Sparse Training with Mixture-of-Experts (2022)'
+    id: 'arXiv:2211.15841'
+    href: https://arxiv.org/abs/2211.15841
+---
+
+[Routing](/entries/mixture-of-experts-routing) assigns each token to $k$ experts.
+Nothing in that assignment says the experts get equal shares, and in practice
+they do not — routers concentrate, particularly early in training.
+
+But an expert is a matmul, and a matmul needs a fixed shape. So each expert is
+given a buffer of $C$ slots, and the assignment is truncated to fit.
+
+<Eq lead caption="eq. 1 — capacity, as a multiple of the fair share">
+
+$$
+C = f \cdot \frac{k \cdot T}{E}
+$$
+
+</Eq>
+
+$f$ is the capacity factor. At $f = 1$ every expert gets exactly its even share
+and any imbalance costs dropped tokens; at $f = 2$ an expert can take twice its
+share, at twice the memory and compute for the buffers.
+
+### What dropping does
+
+The token keeps its position in the sequence and its residual stream. It just
+does not get the block's contribution — the feed-forward transformation for that
+token, at that layer, does not happen.
+
+<Note label="annotation">
+Which tokens get dropped is decided by position in the buffer, which is decided
+by order within the batch. So a token's computation depends on which other tokens
+it was batched with — the structural version of the batch dependence catalogued
+under <a href="/entries/nondeterminism">nondeterminism</a>, and the reason
+evaluation runs at a higher capacity factor than training.
+</Note>
+
+Dropping is not purely harmful. Switch Transformer's authors observed it acts as
+a regulariser and that models trained with modest dropping generalise fine. What
+is harmful is dropping *systematically* — if the router has collapsed onto a few
+experts, the same kinds of token are dropped every time, and the model develops a
+blind spot rather than noise.
+
+### The auxiliary loss
+
+Since capacity punishes imbalance, the fix is to train against imbalance
+directly. Switch Transformer's load-balancing loss multiplies the fraction of
+tokens routed to each expert by the mean router probability for that expert:
+
+<Eq caption="eq. 2 — minimised when both are uniform">
+
+$$
+\mathcal{L}_{\text{aux}} = \alpha \, E \sum_{i=1}^{E} f_i \cdot P_i,
+\qquad
+f_i = \frac{1}{T}\sum_t \mathbb{1}[\text{argmax} = i],
+\qquad
+P_i = \frac{1}{T}\sum_t p_i(t)
+$$
+
+</Eq>
+
+$f_i$ is not differentiable — it counts argmaxes — so the gradient flows only
+through $P_i$, pushing the router's probabilities away from experts that are
+already overloaded. $\alpha = 0.01$ is the usual weight, and it is a genuine
+trade: too small and the router collapses, too large and it routes uniformly,
+which is to say randomly. [Loss-free
+balancing](/entries/loss-free-load-balancing) exists because that trade-off is
+unpleasant.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch · top-1 dispatch with capacity">
+
+```python
+import torch
+from torch import Tensor
+
+
+def dispatch(gates: Tensor, n_experts: int, capacity_factor: float = 1.25):
+    """gates: [T, E] router probabilities. Returns per-expert token indices."""
+    t = gates.size(0)
+    capacity = int(capacity_factor * t / n_experts)
+
+    top = gates.argmax(-1)                                    # [T]
+    # Position within each expert's buffer: a running count per expert.
+    onehot = torch.zeros(t, n_experts, dtype=torch.long, device=gates.device)
+    onehot[torch.arange(t), top] = 1
+    slot = onehot.cumsum(0)[torch.arange(t), top] - 1         # [T]
+
+    kept = slot < capacity                                    # the rest are dropped
+    return top, slot, kept
+
+
+def combine(y_expert: Tensor, top: Tensor, slot: Tensor, kept: Tensor, x: Tensor):
+    """Scatter expert outputs back; dropped tokens keep their input unchanged."""
+    out = torch.zeros_like(x)
+    idx = kept.nonzero(as_tuple=True)[0]
+    out[idx] = y_expert[top[idx], slot[idx]]
+    return out
+```
+
+</CodeFrame>
+
+The `cumsum` is the whole dispatch algorithm and it is worth reading twice: it
+assigns each token the number of earlier tokens that chose the same expert, which
+is exactly its buffer slot. Everything past `capacity` falls off the end.
+
+<Rule label="Dropless routing" />
+
+MegaBlocks makes the observation that capacity exists only because a dense matmul
+needs a rectangle. Express the layer as *block-sparse* matrix multiplication
+instead and the ragged assignment is representable directly — every token is
+computed, no buffers, no dropping, no capacity factor to tune, and it is faster
+than the padded version because no compute is spent on empty slots.
+
+The catch is the one that keeps capacity alive: under [expert
+parallelism](/entries/expert-parallelism) the all-to-all that moves tokens
+between devices needs to know how many are coming. A dropless layer sends a
+variable count, which means either a second communication round to exchange
+sizes, or an upper bound — and an upper bound is a capacity factor wearing a
+different hat.

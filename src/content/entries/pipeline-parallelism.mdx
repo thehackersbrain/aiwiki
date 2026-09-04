@@ -1,0 +1,146 @@
+---
+name: 'Pipeline Parallelism'
+desc: 'Layers on different devices, and the bubble that schedule design exists to shrink.'
+category: 'training'
+complexity: 'O(P/N)'
+memory: 'O(P/N)'
+path: 'training/distributed'
+difficulty: 'intermediate'
+described: '2018'
+status: 'standard'
+statusNote: 'How a model is spread across nodes when tensor parallelism has run out of NVLink. Necessary at frontier scale and avoided below it.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['distributed', 'training']
+lede: 'Give each device a contiguous run of layers and pass activations down the chain. Cheap to communicate and structurally idle — the whole literature is about the fraction of time the devices spend waiting.'
+metrics:
+  caption: 'Bubble fraction, S stages, M micro-batches'
+  rows:
+    - { label: 'Naïve', value: '(S−1)/S' }
+    - { label: 'GPipe', value: '(S−1)/(M+S−1)' }
+    - { label: 'Interleaved, v chunks', value: '÷ v', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Stages must be balanced in <em>time</em>, not in layer count. The first stage carries the embedding and the last the unembedding and the loss, so an even split of layers leaves those two stages slower and every other device waiting on them.'
+related: [tensor-parallelism, data-parallelism, collective-communication, parallelism-composition, gradient-accumulation, zero-sharding]
+refs:
+  - cite: 'Huang et al. — GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism (2018)'
+    id: 'arXiv:1811.06965'
+    href: https://arxiv.org/abs/1811.06965
+  - cite: 'Narayanan et al. — PipeDream: Generalized Pipeline Parallelism for DNN Training (2019)'
+    id: 'SOSP 19'
+    href: https://dl.acm.org/doi/10.1145/3341301.3359646
+  - cite: 'Narayanan et al. — Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM (2021)'
+    id: 'arXiv:2104.04473'
+    href: https://arxiv.org/abs/2104.04473
+---
+
+Split the model by depth: layers 1–20 on device 0, 21–40 on device 1, and so on.
+Communication is one activation tensor per stage boundary — far less than
+[tensor parallelism](/entries/tensor-parallelism), and point-to-point rather than
+a collective, so it survives crossing a network.
+
+The problem is that a pipeline with one item in it is not a pipeline.
+
+### The bubble
+
+Device 1 cannot start until device 0 finishes. With one batch, $S$ stages and no
+other work, each device is busy for $1/S$ of the time.
+
+The fix is to split the batch into micro-batches and keep several in flight.
+GPipe does exactly this: run $M$ micro-batches forward through the pipeline, then
+all their backwards.
+
+<Eq lead caption="eq. 1 — the bubble shrinks with micro-batches, never to zero">
+
+$$
+\text{bubble} = \frac{S-1}{M + S - 1}
+$$
+
+</Eq>
+
+At $S=8$ and $M=32$ that is 18% idle. Raising $M$ helps and costs activation
+memory, since GPipe holds every micro-batch's activations until its backward
+pass runs.
+
+### 1F1B
+
+The scheduling improvement that made pipelines practical. Instead of all forwards
+then all backwards, alternate — once the pipeline is full, each device does one
+forward and one backward per slot.
+
+The bubble is unchanged. What changes is memory: a micro-batch's activations are
+freed as soon as its backward completes, so a device holds at most $S$
+micro-batches' worth rather than $M$. That decouples $M$ from memory, and $M$ is
+the term that shrinks the bubble.
+
+<Note label="annotation">
+This is the pattern worth extracting: GPipe and 1F1B compute identical gradients
+and differ only in <em>when</em> each operation runs. A large part of distributed
+training is scheduling of this kind — same arithmetic, different order, very
+different resource profile.
+</Note>
+
+### Interleaving
+
+Megatron's addition. Rather than one contiguous block per device, give each
+device $v$ non-adjacent chunks — device 0 gets layers 1–4 and 17–20, device 1
+gets 5–8 and 21–24, and so on.
+
+<Eq caption="eq. 2 — v times smaller, at v times the messages">
+
+$$
+\text{bubble} = \frac{1}{v}\cdot\frac{S-1}{M + S - 1}
+$$
+
+</Eq>
+
+Each stage is smaller, so the pipeline fills faster. The cost is $v$ times as
+many point-to-point transfers, which is why it is worth it on a fast interconnect
+and not on a slow one.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · the 1F1B schedule">
+
+```python
+def schedule_1f1b(stage: int, stages: int, micro_batches: int) -> list[str]:
+    """What this stage does, in order. Warmup, steady, drain."""
+    warmup = min(stages - stage - 1, micro_batches)
+
+    ops = ["F"] * warmup                                  # fill the pipeline
+    steady = micro_batches - warmup
+    ops += ["F", "B"] * steady                            # one of each per slot
+    ops += ["B"] * warmup                                 # drain
+
+    return ops
+
+
+# Stage 0 of 4, 8 micro-batches:
+#   F F F  FB FB FB FB FB  B B B
+# Stage 3 of 4 starts its backward immediately — no warmup, no drain.
+```
+
+</CodeFrame>
+
+The asymmetry in that schedule is the memory story. Stage 0 holds $S$
+micro-batches of activations through its warmup; the last stage holds one. In
+practice the first stage is given fewer layers to compensate, which is the same
+balancing problem as the embedding, from the other direction.
+
+<Rule label="When to use it" />
+
+Only when you must. Pipeline parallelism adds a scheduling problem, a balancing
+problem and an irreducible bubble, and it interacts awkwardly with anything that
+changes sequence length between steps.
+
+The rule of thumb at scale: tensor parallelism inside a node, up to the NVLink
+domain; pipeline parallelism across nodes, because it communicates least; data
+parallelism outermost. [Composing them](/entries/parallelism-composition) is what
+a frontier training configuration actually is.
+
+Note that [ZeRO stage 3](/entries/zero-sharding) is an alternative to the middle
+term rather than a complement — it shards parameters across the data-parallel
+group and gathers them per layer, which achieves the same memory reduction with
+collectives instead of a schedule. Which is better depends on the interconnect,
+and the answer at frontier scale has been changing every couple of years.

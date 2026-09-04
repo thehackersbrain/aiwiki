@@ -1,0 +1,58 @@
+---
+interface Props {
+  /** Shown in the frame's gutter, e.g. `python · torch ≥ 2.1`. */
+  meta: string;
+}
+
+const { meta } = Astro.props;
+---
+
+<div class="not-prose mb-7 border border-rule" data-code>
+  <div
+    class="flex items-center justify-between gap-4 border-b border-rule px-3.5 py-2 font-mono text-[11px] text-dim"
+  >
+    <span>{meta}</span>
+    <button
+      type="button"
+      data-copy
+      class="cursor-pointer bg-transparent p-0 font-mono text-[11px] text-dim transition-colors hover:text-chalk"
+    >
+      copy
+    </button>
+  </div>
+  <div
+    class="[&_code]:font-mono [&_pre]:m-0 [&_pre]:overflow-x-auto [&_pre]:px-4 [&_pre]:py-4.5 [&_pre]:text-[12.5px] [&_pre]:leading-[1.85]"
+  >
+    <slot />
+  </div>
+</div>
+
+<style is:global>
+  [data-code] pre {
+    background: var(--color-ink) !important;
+  }
+</style>
+
+<script>
+  document.querySelectorAll<HTMLElement>('[data-code]').forEach((frame) => {
+    const button = frame.querySelector<HTMLButtonElement>('[data-copy]');
+    const pre = frame.querySelector('pre');
+    if (!button || !pre) return;
+
+    let reset: ReturnType<typeof setTimeout>;
+    button.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(pre.textContent ?? '');
+        button.textContent = 'copied';
+        button.style.color = 'var(--ac)';
+      } catch {
+        button.textContent = 'select and copy';
+      }
+      clearTimeout(reset);
+      reset = setTimeout(() => {
+        button.textContent = 'copy';
+        button.style.color = '';
+      }, 1400);
+    });
+  });
+</script>

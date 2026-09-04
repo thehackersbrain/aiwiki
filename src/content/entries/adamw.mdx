@@ -1,0 +1,124 @@
+---
+name: 'AdamW'
+desc: 'Adaptive moments with weight decay decoupled from the gradient.'
+category: 'training'
+complexity: 'O(d)'
+memory: 'O(d)'
+path: 'training/optimisers'
+difficulty: 'introductory'
+described: '2017'
+status: 'standard'
+statusNote: 'Decoupled weight decay is the default everywhere. The challengers are real but none has displaced it.'
+revised: 2026-08-14
+added: 2024-12-11
+tags: ['optimiser', 'training', 'core']
+lede: 'Adam, with the one change that matters: weight decay applied to the parameter directly rather than smuggled in as an L2 term that the adaptive step then rescales.'
+metrics:
+  caption: 'per parameter, mixed-precision training'
+  rows:
+    - { label: 'fp32 master', value: '4 B' }
+    - { label: 'momentum + variance', value: '8 B' }
+    - { label: 'total state', value: '12 B', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Decay is applied to weights, not to biases, norm gains or embeddings. Decaying a LayerNorm gain toward zero is decaying the layer toward silence.'
+related: [stochastic-gradient-descent, gradient-clipping, memory-efficient-optimisers, maximal-update-parameterisation, learning-rate-schedules, muon-and-second-order-preconditioning]
+refs:
+  - cite: 'Loshchilov & Hutter — Decoupled Weight Decay Regularization (2017)'
+    id: 'arXiv:1711.05101'
+    href: https://arxiv.org/abs/1711.05101
+  - cite: 'Kingma & Ba — Adam: A Method for Stochastic Optimization (2014)'
+    id: 'arXiv:1412.6980'
+    href: https://arxiv.org/abs/1412.6980
+  - cite: 'Reddi et al. — On the Convergence of Adam and Beyond (2019)'
+    id: 'arXiv:1904.09237'
+    href: https://arxiv.org/abs/1904.09237
+---
+
+Adam keeps two exponential moving averages per parameter — of the gradient and of its square — and steps along the first divided by the root of the second.
+
+<Eq caption="eq. 1 — moments and their bias correction" lead>
+
+$$
+m_t = \beta_1 m_{t-1} + (1-\beta_1) g_t,
+\qquad
+v_t = \beta_2 v_{t-1} + (1-\beta_2) g_t^2
+$$
+
+</Eq>
+
+Both are initialised at zero, so early estimates are biased toward it. Dividing by $1 - \beta^t$ removes the bias exactly; with $\beta_2 = 0.999$ the correction is still a factor of two at step 700, which is why omitting it produces the famous need for a longer warmup.
+
+<Eq caption="eq. 2 — the update">
+
+$$
+\hat{m}_t = \frac{m_t}{1-\beta_1^t},
+\quad
+\hat{v}_t = \frac{v_t}{1-\beta_2^t},
+\quad
+\theta_t = \theta_{t-1} - \eta \left( \frac{\hat{m}_t}{\sqrt{\hat{v}_t} + \varepsilon} + \lambda \theta_{t-1} \right)
+$$
+
+</Eq>
+
+### The decoupling
+
+<Note label="annotation">
+Under L2, a parameter with a large historical gradient has a large $\sqrt{v}$ —
+and therefore gets *less* regularisation, exactly backwards.
+</Note>
+
+Classic L2 adds $\lambda\theta$ to the gradient, so it enters $m$ and $v$ and is
+then divided by $\sqrt{\hat v}$ along with everything else. The effective decay
+becomes per-parameter and inversely proportional to gradient history. AdamW
+applies $\lambda\theta$ outside the adaptive step, as in eq. 2, so every
+parameter decays at the same rate.
+
+<Eq caption="eq. 3 — what L2 actually does inside Adam">
+
+$$
+\text{L2:}\;\; \theta \mathrel{-}= \eta \frac{\hat{m}(g + \lambda\theta)}{\sqrt{\hat{v}} + \varepsilon}
+\qquad
+\text{decoupled:}\;\; \theta \mathrel{-}= \eta\frac{\hat{m}(g)}{\sqrt{\hat{v}} + \varepsilon} + \eta\lambda\theta
+$$
+
+</Eq>
+
+> The consequence for tuning is that $\eta$ and $\lambda$ decouple too: under
+> L2 they interact, and a learning-rate sweep silently sweeps the regularisation
+> strength with it.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import torch
+from torch import Tensor
+
+
+@torch.no_grad()
+def adamw_step(
+    p: Tensor, grad: Tensor, m: Tensor, v: Tensor, step: int,
+    lr: float = 3e-4, betas: tuple[float, float] = (0.9, 0.95),
+    eps: float = 1e-8, weight_decay: float = 0.1,
+) -> None:
+    b1, b2 = betas
+    m.mul_(b1).add_(grad, alpha=1 - b1)
+    v.mul_(b2).addcmul_(grad, grad, value=1 - b2)
+
+    m_hat = m / (1 - b1**step)
+    v_hat = v / (1 - b2**step)
+
+    # decay the weight itself, untouched by the adaptive scale
+    p.mul_(1 - lr * weight_decay)
+    p.addcdiv_(m_hat, v_hat.sqrt().add_(eps), value=-lr)
+```
+
+</CodeFrame>
+
+$\beta_2 = 0.95$ rather than Adam's default $0.999$ is near-universal for
+language models: the shorter window reacts faster to the variance spikes that
+precede a loss divergence. Keep the moments in fp32 whatever the compute dtype
+— $v$ in bf16 underflows to zero for small gradients, and the step then divides
+by $\varepsilon$.

@@ -1,0 +1,152 @@
+---
+name: 'Context Parallelism'
+desc: 'Split the sequence across devices, and pass the KV blocks around a ring.'
+category: 'training'
+complexity: 'O(n²·d/N)'
+memory: 'O(n·d/N)'
+path: 'training/distributed'
+difficulty: 'advanced'
+described: '2023'
+status: 'common'
+statusNote: 'How long-context training is done. Llama 3 used it for its 128k stage; every model advertising a very long window has something like it.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['distributed', 'training', 'long-context']
+lede: 'Every other strategy splits the model or the batch. This one splits the sequence — which attention makes awkward, because every position needs every other.'
+metrics:
+  caption: 'Ring attention, N devices'
+  rows:
+    - { label: 'Activation memory', value: '÷ N' }
+    - { label: 'Communication rounds', value: 'N−1' }
+    - { label: 'Context reachable', value: 'unbounded', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'With a causal mask the naïve ring is badly load-imbalanced: the rank holding the last chunk attends to everything and the rank holding the first attends to almost nothing. Zigzag assignment — each rank takes one early chunk and one late one — is what fixes it.'
+related: [flash-attention, tensor-parallelism, activation-memory-accounting, causal-masking, rope-scaling, collective-communication, parallelism-composition]
+refs:
+  - cite: 'Liu et al. — Ring Attention with Blockwise Transformers for Near-Infinite Context (2023)'
+    id: 'arXiv:2310.01889'
+    href: https://arxiv.org/abs/2310.01889
+  - cite: 'Jacobs et al. — DeepSpeed Ulysses: System Optimizations for Enabling Training of Extreme Long Sequence Transformer Models (2023)'
+    id: 'arXiv:2309.14509'
+    href: https://arxiv.org/abs/2309.14509
+  - cite: 'Dubey et al. — The Llama 3 Herd of Models (2024)'
+    id: 'arXiv:2407.21783'
+    href: https://arxiv.org/abs/2407.21783
+---
+
+[Activation memory](/entries/activation-memory-accounting) scales with sequence
+length, so a long-context run hits a wall that no amount of model sharding
+addresses — the activations for one 128k-token sequence do not fit on one device
+however small the weights are.
+
+Splitting the sequence is the obvious response and attention is the obstacle.
+Position 100 000 must attend to position 5, which is on a different machine.
+
+### Ring attention
+
+The insight comes from [FlashAttention](/entries/flash-attention): attention is
+already computed blockwise, accumulating an output and a running softmax
+normaliser over key blocks. Nothing requires those blocks to be in the same
+memory.
+
+Arrange the devices in a ring. Each holds its own query block permanently and its
+own KV block initially. Then, $N-1$ times: compute attention of the local
+queries against the currently held KV block, and pass that KV block to the next
+device while receiving one from the previous.
+
+<Eq lead caption="eq. 1 — the running update, identical to FlashAttention’s">
+
+$$
+m' = \max(m, \tilde{m}), \qquad
+\ell' = e^{m - m'}\ell + e^{\tilde{m} - m'}\tilde{\ell}, \qquad
+O' = \frac{e^{m-m'}\ell\,O + e^{\tilde{m}-m'}\tilde{\ell}\,\tilde{O}}{\ell'}
+$$
+
+</Eq>
+
+After $N-1$ rounds every query has seen every key. The result is *exact* — this
+is not an approximation of full attention, it is full attention with the
+accumulation distributed.
+
+<Note label="annotation">
+The transfer overlaps the compute: while attending to block $i$, block $i{+}1$ is
+already in flight. Since attention over a block is $O(c^2 d)$ and the block is
+$O(cd)$ bytes, the compute grows faster than the transfer with block size — so
+above a threshold the communication is entirely hidden and context length is
+bounded only by device count.
+</Note>
+
+### The causal imbalance
+
+With a [causal mask](/entries/causal-masking), a naïve contiguous split is
+badly unbalanced. Rank 0 holds queries 0–1023 and attends to almost nothing; rank
+7 holds the last chunk and attends to everything. Rank 7 sets the pace and the
+rest wait.
+
+Zigzag assignment fixes it: split into $2N$ chunks and give rank $i$ chunks $i$
+and $2N-1-i$. Every rank then holds one early chunk and one late one, and the
+total masked-in work is equal across ranks.
+
+### Ulysses, the alternative
+
+DeepSpeed Ulysses splits the sequence too, but instead of ringing the KV around,
+it performs an all-to-all before attention to redistribute the tensor by *head*
+rather than by position — each rank then computes complete attention for a subset
+of heads — and an all-to-all after to redistribute back.
+
+| | Ring | Ulysses |
+| --- | --- | --- |
+| communication | $N-1$ point-to-point | 2 all-to-all |
+| bytes | $O(n \cdot d)$ | $O(n \cdot d / N)$ |
+| limit | none | head count |
+| overlap | good | poor |
+
+Ulysses moves fewer bytes and cannot scale past the number of attention heads,
+which [GQA](/entries/grouped-query-attention) makes a real constraint — eight KV
+heads means eight devices. Llama 3 uses a ring-based scheme for that reason.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch.distributed">
+
+```python
+import torch
+import torch.distributed as dist
+from torch import Tensor
+
+
+def ring_attention(q: Tensor, k: Tensor, v: Tensor, group) -> Tensor:
+    """q, k, v: this rank's chunk, [B, H, C, D]. Exact full attention."""
+    world, rank = dist.get_world_size(group), dist.get_rank(group)
+    out = torch.zeros_like(q)
+    m = torch.full(q.shape[:-1] + (1,), -torch.inf, device=q.device)
+    lse = torch.zeros_like(m)
+
+    for step in range(world):
+        # Start the next hop before computing on the current block, so the
+        # transfer overlaps the matmul rather than following it.
+        if step + 1 < world:
+            next_k, next_v = torch.empty_like(k), torch.empty_like(v)
+            reqs = [dist.P2POp(dist.isend, k, (rank + 1) % world, group),
+                    dist.P2POp(dist.irecv, next_k, (rank - 1) % world, group),
+                    dist.P2POp(dist.isend, v, (rank + 1) % world, group),
+                    dist.P2POp(dist.irecv, next_v, (rank - 1) % world, group)]
+            handles = dist.batch_isend_irecv(reqs)
+
+        out, m, lse = flash_block(q, k, v, out, m, lse, source=(rank - step) % world)
+
+        if step + 1 < world:
+            for h in handles:
+                h.wait()
+            k, v = next_k, next_v
+
+    return out
+```
+
+</CodeFrame>
+
+The `source` argument is not decoration — the block currently held came from a
+known rank, and the mask depends on where those keys sit in the global sequence.
+Getting it wrong produces a model that trains, with an attention pattern that is
+causal on each device and not globally.

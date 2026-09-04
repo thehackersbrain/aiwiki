@@ -1,0 +1,378 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import Rail from '../../components/Rail.astro';
+import { allCategories, allEntries, counts, tagCounts } from '../../lib/grimoire';
+import { breadcrumbs, collectionNode, siteNodes } from '../../lib/schema';
+import StatusBadge from '../../components/StatusBadge.astro';
+import Pager from '../../components/Pager.astro';
+import { STATUS, STATUS_ORDER } from '../../lib/status';
+import { STATUS_AS_OF } from '../../consts';
+
+/**
+ * Rows per page. Declared here rather than in the script because the markup
+ * needs it too — the script reads it back off the element, so there is one
+ * number, not two that can drift.
+ */
+const PER_PAGE = 10;
+
+const tags = await tagCounts();
+
+// How many entries carry each standing, so the filter can hide labels nothing
+// uses and the legend can say how much of the book each one covers.
+const statusCounts = new Map<string, number>();
+for (const entry of await allEntries()) {
+  if (entry.data.status) {
+    statusCounts.set(entry.data.status, (statusCounts.get(entry.data.status) ?? 0) + 1);
+  }
+}
+const { total } = await counts();
+const categoryName = new Map(
+  (await allCategories()).map((c) => [c.id, c.data.name])
+);
+const rows = await allEntries();
+
+const INDEX_DESCRIPTION =
+  'Every entry in the grimoire, including stubs: architectures, training, ' +
+  'fine-tuning, inference, interpretability, adversarial ML and evaluation.';
+const columns = ['name', 'category', 'complexity'] as const;
+---
+
+<BaseLayout
+  title="Index"
+  tabTitle="Index — AI Grimoire"
+  description={INDEX_DESCRIPTION}
+  nav="index"
+  schema={[
+    ...siteNodes(),
+    collectionNode({
+      path: '/entries',
+      name: 'Index',
+      description: INDEX_DESCRIPTION,
+      entries: rows,
+    }),
+    breadcrumbs([{ name: 'AI Grimoire', path: '/' }, { name: 'Index' }]),
+  ]}
+>
+  <main class="mx-auto max-w-[1180px] animate-rise px-6 pb-20 sm:px-12">
+    <Rail divider={false} sticky class="pt-14">
+      <div slot="rail" class="font-mono text-[11px] text-dim">
+        <div class="label mb-3.5 text-accent">Filter by tag</div>
+        <div data-filters>
+          <button
+            type="button"
+            data-tag=""
+            class="flex w-full cursor-pointer justify-between bg-transparent py-1 text-left text-accent transition-colors hover:text-chalk"
+            aria-pressed="true"
+          >
+            <span>all entries</span><span class="text-dim-3">{total}</span>
+          </button>
+          {
+            tags.map((t) => (
+              <button
+                type="button"
+                data-tag={t.tag}
+                class="flex w-full cursor-pointer justify-between bg-transparent py-1 text-left text-mute-2 transition-colors hover:text-chalk"
+                aria-pressed="false"
+              >
+                <span>[{t.tag}]</span>
+                <span class="text-dim-3">{t.count}</span>
+              </button>
+            ))
+          }
+        </div>
+
+        <div class="label mt-6.5 mb-3.5 text-accent">Sort</div>
+        <div data-sorts>
+          {
+            columns.map((col) => (
+              <button
+                type="button"
+                data-sort={col}
+                class="flex w-full cursor-pointer justify-between bg-transparent py-1 text-left text-dim transition-colors hover:text-chalk"
+              >
+                <span>{col}</span>
+                <span class="text-accent" data-arrow />
+              </button>
+            ))
+          }
+        </div>
+
+        <div class="label mt-6 mb-3.5 text-accent">Standing</div>
+        <div data-status-filters>
+          <button
+            type="button"
+            data-status-filter=""
+            class="block w-full py-0.5 text-left font-mono text-[11px] text-mute-2 hover:text-chalk"
+          >
+            all
+          </button>
+          {
+            STATUS_ORDER.filter((key) => statusCounts.get(key)).map((key) => (
+              <button
+                type="button"
+                data-status-filter={key}
+                title={STATUS[key].tooltip}
+                class="flex w-full justify-between gap-2 py-0.5 text-left font-mono text-[11px] text-mute-2 hover:text-chalk"
+              >
+                <span style={`color: var(--status-${key})`}>{STATUS[key].short}</span>
+                <span class="text-dim-3">{statusCounts.get(key)}</span>
+              </button>
+            ))
+          }
+        </div>
+      </div>
+
+      <h1 class="mt-0 mb-2 text-[34px] font-normal tracking-[-0.022em] text-bone">Index</h1>
+      <p class="mt-0 mb-6.5 text-[16px] text-mute-3">
+        Every entry in the grimoire, including stubs. Filter in the margin, grep below.
+      </p>
+
+      <div class="mb-2.5 flex items-center gap-2.5 border-b border-rule-strong">
+        <span class="font-mono text-[13px] text-accent">/</span>
+        <input
+          type="search"
+          data-query
+          placeholder="grep name, tag, complexity…"
+          aria-label="Search entries"
+          class="flex-1 border-none bg-transparent py-3 font-mono text-[13px] text-chalk outline-none placeholder:text-dim-2"
+        />
+        <span class="font-mono text-[11px] text-dim-2" data-count>
+          {total}/{total}
+        </span>
+      </div>
+
+      <div data-rows>
+        {
+          rows.map((e) => (
+            <a
+              href={`/entries/${e.id}`}
+              data-row
+              data-name={e.data.name}
+              data-category={categoryName.get(e.data.category.id)}
+              data-complexity={e.data.complexity}
+              data-tags={e.data.tags.join(' ')}
+              data-standing={e.data.status ?? ''}
+              data-haystack={`${e.data.name} ${e.data.desc} ${categoryName.get(e.data.category.id)} ${e.data.complexity} ${e.data.tags.join(' ')} ${e.data.status ?? ''}`.toLowerCase()}
+              class="grid grid-cols-1 items-baseline gap-x-6 gap-y-2 border-b border-rule-faint py-4 transition-colors hover:bg-raise sm:grid-cols-[minmax(0,1fr)_130px_110px]"
+            >
+              <div>
+                <div class="text-[19px] tracking-[-0.012em] text-bone">
+                  {e.data.name}
+                  {e.data.stub && <span class="eyebrow ml-2.5 text-accent">stub</span>}
+                  {e.data.status && <StatusBadge status={e.data.status} class="ml-2.5" />}
+                </div>
+                <div class="mt-0.5 text-[15px] text-mute-3 text-pretty">{e.data.desc}</div>
+                <div class="mt-2 flex flex-wrap gap-1.5">
+                  {e.data.tags.map((tag) => (
+                    <span class="border border-edge px-1.5 py-0.5 font-mono text-[10px] tracking-[0.06em] whitespace-nowrap text-mute-2">
+                      {tag}
+                    </span>
+                  ))}
+                </div>
+              </div>
+              <div class="font-mono text-[11px] tracking-[0.08em] text-mute uppercase">
+                {categoryName.get(e.data.category.id)}
+              </div>
+              <div class="font-mono text-[12px] text-accent sm:text-right">
+                {e.data.complexity}
+              </div>
+            </a>
+          ))
+        }
+      </div>
+
+      <div class="hidden py-11 font-mono text-[12px] text-dim-2" data-empty>
+        no matches — 0 of {total}
+      </div>
+      <Pager per={PER_PAGE} auto={false} label="Index pages" />
+    </Rail>
+
+    <Rail labelAs="h2" label="What the labels mean" divider={false} class="pt-11">
+      <p id="standing" class="mt-0 mb-5 max-w-[62ch] scroll-mt-24 text-[16px] text-mute-3 text-pretty">
+        Where a technique stands in current practice, reviewed as a set in {STATUS_AS_OF}.
+        These are judgements rather than facts, and they date — an entry with no
+        label is one I have not formed a firm view on.
+      </p>
+      {
+        STATUS_ORDER.map((key) => (
+          <div class="grid grid-cols-1 items-baseline gap-x-6 gap-y-1.5 border-b border-rule-faint py-3.5 sm:grid-cols-[110px_minmax(0,1fr)_44px]">
+            <StatusBadge status={key} class="justify-self-start" />
+            <p class="m-0 max-w-[62ch] text-[15px] text-mute-3 text-pretty">
+              {STATUS[key].blurb}
+            </p>
+            <span class="font-mono text-[11px] text-dim-3 sm:text-right">
+              {statusCounts.get(key) ?? 0}
+            </span>
+          </div>
+        ))
+      }
+    </Rail>
+  </main>
+</BaseLayout>
+
+<script>
+  import { paintPages } from '../../lib/pager';
+
+  const list = document.querySelector<HTMLElement>('[data-rows]');
+  if (list) {
+    const rows = [...list.querySelectorAll<HTMLAnchorElement>('[data-row]')];
+    const input = document.querySelector<HTMLInputElement>('[data-query]')!;
+    const counter = document.querySelector<HTMLElement>('[data-count]')!;
+    const empty = document.querySelector<HTMLElement>('[data-empty]')!;
+    const tagButtons = [
+      ...document.querySelectorAll<HTMLButtonElement>('[data-filters] button'),
+    ];
+    const statusButtons = [
+      ...document.querySelectorAll<HTMLButtonElement>('[data-status-filters] button'),
+    ];
+    const sortButtons = [
+      ...document.querySelectorAll<HTMLButtonElement>('[data-sorts] button'),
+    ];
+
+    const pager = document.querySelector<HTMLElement>('[data-pager]')!;
+    const range = pager.querySelector<HTMLElement>('[data-range]')!;
+    const numbers = pager.querySelector<HTMLElement>('[data-page-numbers]')!;
+    const prev = pager.querySelector<HTMLButtonElement>('[data-page-prev]')!;
+    const next = pager.querySelector<HTMLButtonElement>('[data-page-next]')!;
+
+    /**
+     * Every row stays in the document — pagination hides rows rather than
+     * fetching them, so filtering, sorting and grep still work across the whole
+     * index and a crawler still sees all of it in the HTML.
+     */
+    const PER_PAGE = Number(pager.dataset.per) || 10;
+    let page = 1;
+
+    type SortKey = 'name' | 'category' | 'complexity';
+    let activeTag = '';
+    let activeStatus = '';
+    let sort: SortKey = 'name';
+    let direction = 1;
+
+    const field = (row: HTMLElement, key: SortKey) => row.dataset[key] ?? '';
+
+    const render = () => {
+      const query = input.value.trim().toLowerCase();
+      let shown = 0;
+
+      for (const row of rows) {
+        const tagOk = !activeTag || (row.dataset.tags ?? '').split(' ').includes(activeTag);
+        const textOk = !query || (row.dataset.haystack ?? '').includes(query);
+        const statusOk = !activeStatus || row.dataset.standing === activeStatus;
+        const visible = tagOk && textOk && statusOk;
+        row.hidden = !visible;
+        if (visible) shown += 1;
+      }
+
+      const ordered = [...rows].sort(
+        (a, b) => field(a, sort).localeCompare(field(b, sort)) * direction
+      );
+      for (const row of ordered) list.appendChild(row);
+
+      // Paginate what survived the filter, in the order just applied.
+      const matched = ordered.filter((row) => !row.hidden);
+      const pages = Math.max(1, Math.ceil(matched.length / PER_PAGE));
+      page = Math.min(page, pages);
+      const start = (page - 1) * PER_PAGE;
+
+      matched.forEach((row, i) => {
+        row.hidden = i < start || i >= start + PER_PAGE;
+      });
+
+      pager.hidden = matched.length <= PER_PAGE;
+      range.textContent = matched.length
+        ? `${start + 1}–${Math.min(start + PER_PAGE, matched.length)} of ${matched.length}`
+        : '';
+      prev.disabled = page === 1;
+      next.disabled = page === pages;
+
+      paintPages(numbers, pages, page);
+
+      counter.textContent = `${shown}/${rows.length}`;
+      empty.classList.toggle('hidden', shown > 0);
+
+      for (const button of tagButtons) {
+        const on = (button.dataset.tag ?? '') === activeTag;
+        button.setAttribute('aria-pressed', String(on));
+        button.classList.toggle('text-accent', on);
+        button.classList.toggle('text-mute-2', !on);
+      }
+      for (const button of statusButtons) {
+        const on = (button.dataset.statusFilter ?? '') === activeStatus;
+        button.setAttribute('aria-pressed', String(on));
+        button.classList.toggle('text-chalk', on);
+        button.classList.toggle('text-mute-2', !on);
+      }
+      for (const button of sortButtons) {
+        const on = button.dataset.sort === sort;
+        button.classList.toggle('text-chalk', on);
+        button.classList.toggle('text-dim', !on);
+        button.querySelector<HTMLElement>('[data-arrow]')!.textContent = on
+          ? direction === 1
+            ? '↑'
+            : '↓'
+          : '';
+      }
+    };
+
+    /** Re-filter from the top: a new query should not leave you on page 4. */
+    const refilter = () => {
+      page = 1;
+      render();
+    };
+
+    /** Change page, then put the top of the list back in view. */
+    const goTo = (n: number) => {
+      page = n;
+      render();
+      list.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    };
+
+    input.addEventListener('input', refilter);
+    prev.addEventListener('click', () => goTo(page - 1));
+    next.addEventListener('click', () => goTo(page + 1));
+    numbers.addEventListener('click', (event) => {
+      const target = (event.target as HTMLElement).closest<HTMLElement>('[data-page]');
+      if (target) goTo(Number(target.dataset.page));
+    });
+
+    for (const button of tagButtons) {
+      button.addEventListener('click', () => {
+        activeTag = button.dataset.tag ?? '';
+        refilter();
+      });
+    }
+
+    for (const button of statusButtons) {
+      button.addEventListener('click', () => {
+        activeStatus = button.dataset.statusFilter ?? '';
+        refilter();
+      });
+    }
+
+    for (const button of sortButtons) {
+      button.addEventListener('click', () => {
+        const key = button.dataset.sort as SortKey;
+        direction = sort === key ? -direction : 1;
+        sort = key;
+        refilter();
+      });
+    }
+
+    // Deep links: /entries?tag=attention from an entry's tag chips, and
+    // /entries?q=… which is the SearchAction this site advertises.
+    const params = new URLSearchParams(window.location.search);
+    const requestedTag = params.get('tag');
+    if (requestedTag && tagButtons.some((b) => b.dataset.tag === requestedTag)) {
+      activeTag = requestedTag;
+    }
+    const requestedStatus = params.get('status');
+    if (requestedStatus && statusButtons.some((b) => b.dataset.statusFilter === requestedStatus)) {
+      activeStatus = requestedStatus;
+    }
+    const requestedQuery = params.get('q');
+    if (requestedQuery) input.value = requestedQuery;
+
+    render();
+  }
+</script>

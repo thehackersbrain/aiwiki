@@ -1,0 +1,272 @@
+---
+import {
+  getCollection,
+  getEntry,
+  render,
+  type CollectionEntry,
+} from "astro:content";
+import { metaDescription, relativeDate } from "../../lib/grimoire";
+import { breadcrumbs, entryNode, siteNodes } from "../../lib/schema";
+import BaseLayout from "../../layouts/BaseLayout.astro";
+import Rail from "../../components/Rail.astro";
+import Breadcrumb from "../../components/Breadcrumb.astro";
+import Note from "../../components/mdx/Note.astro";
+import Eq from "../../components/mdx/Eq.astro";
+import CodeFrame from "../../components/mdx/CodeFrame.astro";
+import Rule from "../../components/mdx/Rule.astro";
+import StatusBadge from "../../components/StatusBadge.astro";
+import { STATUS } from "../../lib/status";
+import { STATUS_AS_OF } from "../../consts";
+import "katex/dist/katex.min.css";
+
+export async function getStaticPaths() {
+  const entries = await getCollection("entries");
+  return entries.map((entry) => ({
+    params: { slug: entry.id },
+    props: { entry },
+  }));
+}
+
+interface Props {
+  entry: CollectionEntry<"entries">;
+}
+
+const { entry } = Astro.props;
+const data = entry.data;
+const category = (await getEntry(data.category))!;
+const subcategory = (await getEntry(data.path))!;
+const subLeaf = subcategory.id.split("/").pop()!;
+const subHref = `/categories/${category.id}/${subLeaf}`;
+const { Content } = await render(entry);
+
+const spec: { k: string; v: string; href?: string }[] = [
+  { k: "path", v: subcategory.id, href: subHref },
+  ...(data.status ? [{ k: "status", v: STATUS[data.status].short }] : []),
+  { k: "difficulty", v: data.difficulty },
+  { k: "time", v: data.complexity },
+  ...(data.memory ? [{ k: "memory", v: data.memory }] : []),
+  { k: "described", v: data.described },
+  { k: "revised", v: relativeDate(data.revised) },
+];
+
+const related = (
+  await Promise.all(data.related.map((ref) => getEntry(ref)))
+).filter((e): e is CollectionEntry<"entries"> => e !== undefined);
+
+// MDX resolves these by name at render time, so entry files import nothing.
+const shortcodes = { Note, Eq, CodeFrame, Rule };
+
+const schema = [
+  ...siteNodes(),
+  entryNode(entry, category.data.name),
+  breadcrumbs([
+    { name: "AI Grimoire", path: "/" },
+    { name: category.data.name, path: `/categories/${category.id}` },
+    { name: subcategory.data.name, path: subHref },
+    { name: data.name },
+  ]),
+];
+---
+
+<BaseLayout
+  title={data.name}
+  tabTitle={`${data.name} — AI Grimoire`}
+  description={metaDescription(data.lede)}
+  nav="index"
+  type="article"
+  image={`/og/${entry.id}.png`}
+  imageAlt={`${data.name} — ${data.complexity}`}
+  publishedTime={data.added}
+  modifiedTime={data.revised}
+  section={category.data.name}
+  tags={data.tags}
+  schema={schema}
+>
+  <main class="mx-auto max-w-[70%] animate-rise px-6 pb-20 sm:px-12">
+    <Breadcrumb
+      trail={[
+        { label: "AI Grimoire", href: "/" },
+        { label: category.data.name, href: `/categories/${category.id}` },
+        { label: subcategory.data.name, href: subHref },
+        { label: data.name },
+      ]}
+    />
+
+    <Rail class="pt-12 pb-9">
+      <div slot="rail" class="font-mono text-[11px] leading-[2] text-dim">
+        <div class="label mb-3 text-accent">Sheet</div>
+        {
+          spec.map((row) => (
+            <div class="flex justify-between gap-2.5 border-b border-rule-faint">
+              <span>{row.k}</span>
+              {row.href ? (
+                <a href={row.href} class="text-quill hover:text-chalk">
+                  {row.v}
+                </a>
+              ) : (
+                <span class="text-quill">{row.v}</span>
+              )}
+            </div>
+          ))
+        }
+      </div>
+
+      <h1
+        class="mt-0 mb-3.5 max-w-[28ch] text-[30px] leading-[1.14] font-normal tracking-[-0.024em] text-bone sm:text-[40px]"
+      >
+        {data.name}
+      </h1>
+      <p
+        class="mt-0 mb-5.5 max-w-[62ch] text-[18px] text-lede text-pretty"
+        set:html={data.lede}
+      />
+      <div
+        class="flex flex-wrap gap-1.5 font-mono text-[10px] tracking-[0.1em]"
+      >
+        {
+          data.tags.map((tag) => (
+            <a
+              href={`/entries?tag=${encodeURIComponent(tag)}`}
+              class="border border-accent-edge bg-accent-wash px-2 py-1 whitespace-nowrap text-accent hover:text-accent-hi"
+            >
+              [{tag}]
+            </a>
+          ))
+        }
+        {
+          data.stub && (
+            <span class="border border-edge px-2 py-1 whitespace-nowrap text-mute-2">
+              [stub]
+            </span>
+          )
+        }
+        {
+          data.status && (
+            <StatusBadge status={data.status} full size="md" />
+          )
+        }
+      </div>
+    </Rail>
+
+    {
+      data.status && (
+        <Rail labelAs="h2" label="Standing">
+          <div class="max-w-[62ch]">
+            <p class="mt-0 mb-3 flex flex-wrap items-baseline gap-2.5 text-[17px] text-lede">
+              <StatusBadge status={data.status} full size="md" />
+              <span>{STATUS[data.status].blurb}</span>
+            </p>
+            {data.statusNote && (
+              <p class="mt-0 mb-3 text-[16px] text-prose text-pretty">{data.statusNote}</p>
+            )}
+            <p class="m-0 font-mono text-[11px] text-dim-2">
+              judged as of {STATUS_AS_OF} · <a href="/entries#standing" class="hover:text-accent">what the labels mean</a>
+            </p>
+          </div>
+        </Rail>
+      )
+    }
+
+    {
+      data.stub && (
+        <Rail labelAs="h2" label="Status">
+          <div class="max-w-[62ch]">
+            <p class="mt-0 mb-4 text-[17px] text-lede text-pretty">
+              This entry is a stub. The maths has not been rederived by hand, or
+              the implementation has not been run on real tensors, so it is
+              recorded here as an open question rather than an answer.
+            </p>
+            <p class="m-0 text-[16px] text-dim italic">
+              Read what follows as a pointer to the sources, not as a settled
+              account.
+            </p>
+          </div>
+        </Rail>
+      )
+    }
+
+    {
+      /*
+      The body is one continuous column. Section labels and margin notes are
+      lifted out into the margin by the MDX components themselves, so the prose
+      is never interrupted by the apparatus around it.
+    */
+    }
+    <section class="border-b border-rule py-11">
+      {/* The prose column is offset by the width of the margin column plus
+          the gutter, so notes and section labels land in the margin rather
+          than off the edge of the page. */}
+      <div class="entry-prose md:ml-[258px]">
+        <Rule label={data.stub ? "Notes" : "Theory"} divider={false} />
+        <Content components={shortcodes} />
+
+        {
+          data.metrics && (
+            <div class="not-prose mt-8">
+              <div class="grid grid-cols-3 border-t border-rule font-mono">
+                {data.metrics.rows.map((m) => (
+                  <div class="py-3.5">
+                    <div class="eyebrow tracking-[0.14em] text-dim-2">
+                      {m.label}
+                    </div>
+                    <div
+                      class:list={[
+                        "mt-1 text-[17px]",
+                        m.accent ? "text-accent" : "text-chalk",
+                      ]}
+                    >
+                      {m.value}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div class="font-mono text-[10px] tracking-[0.08em] text-dim-2">
+                {data.metrics.caption}
+              </div>
+            </div>
+          )
+        }
+      </div>
+    </section>
+
+    {
+      related.length > 0 && (
+        <Rail labelAs="h2" label="Related" class="py-9">
+          <div class="flex flex-wrap gap-2">
+            {related.map((r) => (
+              <a
+                href={`/entries/${r.id}`}
+                title={r.data.desc}
+                class="border border-edge px-3 py-1.5 font-mono text-[12px] whitespace-nowrap text-mute transition-colors hover:border-accent hover:text-chalk"
+              >
+                {r.id}
+              </a>
+            ))}
+          </div>
+        </Rail>
+      )
+    }
+
+    {
+      data.refs.length > 0 && (
+        <Rail labelAs="h2" label="References" divider={false} class="pt-9">
+          {data.refs.map((ref, i) => (
+            <div class="grid grid-cols-[30px_minmax(0,1fr)] items-baseline gap-x-4 gap-y-1 border-b border-rule-faint py-3 sm:grid-cols-[30px_minmax(0,1fr)_150px]">
+              <span class="font-mono text-[11px] text-dim-3">[{i + 1}]</span>
+              <span class="text-[15px] text-prose">{ref.cite}</span>
+              <span class="col-start-2 font-mono text-[11px] text-accent sm:col-start-3 sm:text-right">
+                {ref.href ? (
+                  <a href={ref.href} rel="noreferrer" target="_blank">
+                    {ref.id}
+                  </a>
+                ) : (
+                  ref.id
+                )}
+              </span>
+            </div>
+          ))}
+        </Rail>
+      )
+    }
+  </main>
+</BaseLayout>

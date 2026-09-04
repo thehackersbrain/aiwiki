@@ -1,0 +1,158 @@
+---
+name: 'Stochastic Gradient Descent'
+desc: 'A step against the gradient, momentum on top, and why it loses to Adam on transformers.'
+category: 'training'
+complexity: 'O(P)'
+memory: 'O(P)'
+path: 'training/optimisers'
+difficulty: 'introductory'
+described: '1951'
+status: 'common'
+statusNote: 'Still the right choice for convolutional vision, where it generalises better than Adam. Not competitive on transformers, and the reason why is a genuinely open question.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['optimisers', 'training', 'core']
+lede: 'The baseline every other optimiser is measured against: one learning rate, one direction, one state tensor. It trains ResNets better than Adam does and transformers considerably worse.'
+metrics:
+  caption: 'Optimiser state, per parameter'
+  rows:
+    - { label: 'SGD', value: '0' }
+    - { label: 'SGD + momentum', value: '1×' }
+    - { label: 'AdamW', value: '2×', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'PyTorch implements Polyak momentum, not Nesterov, unless asked. The two differ in whether the gradient is evaluated before or after the momentum step, and the difference is worth roughly a small constant on the learning rate — not nothing, and not what most tuning budgets are spent on.'
+related: [adamw, learning-rate-schedules, gradient-clipping, muon-and-second-order-preconditioning, maximal-update-parameterisation]
+refs:
+  - cite: 'Robbins & Monro — A Stochastic Approximation Method (1951)'
+    id: 'Ann. Math. Statist. 22(3)'
+    href: https://projecteuclid.org/euclid.aoms/1177729586
+  - cite: 'Sutskever et al. — On the importance of initialization and momentum in deep learning (2013)'
+    id: 'PMLR 28(3)'
+    href: https://proceedings.mlr.press/v28/sutskever13.html
+  - cite: 'Kunstner et al. — Heavy-Tailed Class Imbalance and Why Adam Outperforms Gradient Descent on Language Models (2024)'
+    id: 'arXiv:2402.19449'
+    href: https://arxiv.org/abs/2402.19449
+---
+
+<Eq lead caption="eq. 1 — the whole method">
+
+$$
+\theta_{t+1} = \theta_t - \eta\, g_t,
+\qquad
+g_t = \nabla_\theta \mathcal{L}\bigl(\theta_t; \mathcal{B}_t\bigr)
+$$
+
+</Eq>
+
+The gradient is computed on a minibatch rather than the full dataset, which is
+the "stochastic" part and is what makes it tractable. The noise this introduces
+is not purely a cost — it is a regulariser, and small-batch SGD generalises
+better than large-batch SGD on the same number of epochs, which is not what a
+pure optimisation view predicts.
+
+### Momentum
+
+Plain SGD oscillates across the narrow direction of a ravine and crawls along the
+long one. Momentum accumulates the consistent component and cancels the
+oscillating one.
+
+<Eq caption="eq. 2 — an exponential moving average of the gradient">
+
+$$
+v_{t+1} = \mu\, v_t + g_t,
+\qquad
+\theta_{t+1} = \theta_t - \eta\, v_{t+1}
+$$
+
+</Eq>
+
+At $\mu = 0.9$ the effective step is roughly $1/(1-\mu) = 10$ gradients averaged,
+so the learning rate is doing ten times the work it appears to. This is the
+single most common source of confusion when porting a configuration between
+optimisers.
+
+<Note label="annotation">
+Nesterov's variant evaluates the gradient at the point momentum is about to carry
+you to, rather than where you are. It is a genuinely better estimator and the
+practical difference on deep networks is small — the theoretical acceleration is
+for convex problems, and nothing here is convex.
+</Note>
+
+### Why it fails on transformers
+
+This is the interesting part, and it is not settled.
+
+The observation is robust: on a language model, SGD with any learning rate
+reaches a substantially worse loss than [AdamW](/entries/adamw), and the gap
+widens with scale. On a ResNet the ordering reverses. Same optimiser, same
+framework, opposite conclusion.
+
+The best current explanation is Kunstner et al.'s. Token frequency is heavy-
+tailed — a handful of tokens account for most of the corpus, and the long tail is
+where most of the *classes* are. The gradient contribution of a rare token is
+small and infrequent; under SGD its parameters receive a small step, and it takes
+enormously many occurrences to learn. Adam's per-parameter normalisation divides
+by the second moment, so a rare, consistently-signed gradient produces a full-
+sized step.
+
+<Eq caption="eq. 3 — what the normalisation actually removes">
+
+$$
+\frac{m_t}{\sqrt{v_t}} \;\approx\; \mathrm{sign}(g_t) \quad\text{when the gradient is consistent}
+$$
+
+</Eq>
+
+They show this directly by training with plain sign-SGD, which has none of Adam's
+other machinery and recovers most of the gap. The adaptivity is not estimating
+curvature — it is discarding magnitude, and magnitude is precisely what makes
+rare tokens invisible to SGD.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor
+
+
+@torch.no_grad()
+def sgd_step(
+    params: list[Tensor], state: dict, lr: float, momentum: float = 0.9, wd: float = 0.0
+) -> None:
+    for p in params:
+        if p.grad is None:
+            continue
+        g = p.grad
+
+        # Decoupled: decay the weight, not the gradient. Folding it in makes
+        # the effective decay depend on the momentum buffer.
+        if wd:
+            p.mul_(1 - lr * wd)
+
+        buf = state.setdefault(p, torch.zeros_like(p))
+        buf.mul_(momentum).add_(g)
+        p.add_(buf, alpha=-lr)
+```
+
+</CodeFrame>
+
+<Rule label="The sign-based descendants" />
+
+If the useful part of Adam is the sign, an optimiser can take the sign and skip
+the second moment — halving the state.
+
+**Lion** does exactly that: momentum, then $\mathrm{sign}$, with different decay
+rates for the update and the buffer. Found by symbolic search over optimiser
+programs, one state tensor instead of two, and competitive with AdamW on both
+vision and language.
+
+**[Muon](/entries/muon-and-second-order-preconditioning)** generalises the idea
+to matrices — where sign is the elementwise version, orthogonalisation is the
+matrix version — and is the strongest current challenger.
+
+Both are readable as answers to the same question this entry ends on: what is
+Adam's normalisation actually for, and how much of the machinery around it is
+load-bearing.

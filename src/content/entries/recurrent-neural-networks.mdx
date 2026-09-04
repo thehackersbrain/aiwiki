@@ -1,0 +1,146 @@
+---
+name: 'Recurrent Neural Networks'
+desc: 'One hidden state, carried forward one step at a time, and why the gradient dies.'
+category: 'architectures'
+complexity: 'O(n·d²)'
+memory: 'O(d)'
+path: 'architectures/recurrence'
+difficulty: 'introductory'
+described: '1990'
+status: 'superseded'
+statusNote: 'Nothing is trained this way. The entry is here because every linear-recurrence model on this shelf is an answer to the specific failure described below.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['recurrence', 'sequence', 'core']
+lede: 'A fixed-size state, a nonlinearity, and the same weights at every step. The design is inevitable and so is its failure: repeated multiplication by a matrix either vanishes or explodes.'
+metrics:
+  caption: 'Gradient over k steps'
+  rows:
+    - { label: 'Largest eigenvalue < 1', value: 'vanishes' }
+    - { label: '> 1', value: 'explodes' }
+    - { label: 'Usable range', value: '≈ 10 steps', accent: true }
+implNote:
+  label: 'annotation'
+  html: 'Exploding gradients are the easy half — clip the norm and carry on. Vanishing gradients cannot be clipped back into existence, which is why every fix is architectural rather than an optimiser setting.'
+related: [lstm-and-gru, state-space-models, parallel-scan, scaled-dot-product-attention, rwkv]
+refs:
+  - cite: 'Elman — Finding Structure in Time (1990)'
+    id: 'Cognitive Science 14(2)'
+    href: https://onlinelibrary.wiley.com/doi/10.1207/s15516709cog1402_1
+  - cite: 'Bengio et al. — Learning Long-Term Dependencies with Gradient Descent is Difficult (1994)'
+    id: 'IEEE TNN 5(2)'
+    href: https://ieeexplore.ieee.org/document/279181
+  - cite: 'Pascanu et al. — On the difficulty of training Recurrent Neural Networks (2013)'
+    id: 'arXiv:1211.5063'
+    href: https://arxiv.org/abs/1211.5063
+---
+
+Before attention, a sequence model was a loop. Keep a hidden state, update it
+with each token, and read the answer off the end.
+
+<Eq lead caption="eq. 1 — the same weights at every step">
+
+$$
+h_t = \tanh\bigl(W_h h_{t-1} + W_x x_t + b\bigr)
+$$
+
+</Eq>
+
+Everything appealing about the design is in that equation. The state is a fixed
+size, so memory does not grow with the sequence. The weights are shared across
+steps, so the model handles any length. Decoding is $O(1)$ per token, which is
+the property the whole
+[recurrence](/categories/architectures/recurrence) shelf is trying to recover
+sixty years later.
+
+### Why it does not train
+
+Backpropagation through time unrolls the loop and applies the chain rule down it.
+The gradient from step $t$ to step $t-k$ is a product of $k$ Jacobians.
+
+<Eq caption="eq. 2 — a matrix power, and matrix powers do not behave">
+
+$$
+\frac{\partial h_t}{\partial h_{t-k}}
+= \prod_{i=0}^{k-1} W_h^\top \,\mathrm{diag}\bigl(\tanh'(\cdot)\bigr)
+$$
+
+</Eq>
+
+A product of $k$ matrices is governed by the largest singular value. Below one it
+decays geometrically and the gradient at distance 20 is numerically zero; above
+one it grows geometrically and overflows. The knife-edge in between is not a
+region you can train in, because the value drifts as the weights update.
+
+<Note label="annotation">
+The $\tanh'$ term makes it strictly worse. Its derivative is at most 1 and is
+below 0.5 for most inputs, so the product is multiplied by something under one at
+every step even when $W_h$ is well-behaved. Saturating nonlinearities and long-
+range gradients are in direct opposition.
+</Note>
+
+Bengio et al. proved the trade-off is not an artefact of a bad initialisation: a
+recurrence that stores information robustly must have its Jacobian's spectral
+radius below one, and that is precisely the condition under which gradients
+vanish. Stability and trainability pull in opposite directions.
+
+### What the fixes have in common
+
+Everything after this attacks the product in eq. 2.
+
+**Gating** — [LSTM and GRU](/entries/lstm-and-gru) insert an additive path with a
+Jacobian near the identity, so the product does not decay.
+
+**Attention** — [remove the recurrence](/entries/scaled-dot-product-attention)
+altogether. Every position reaches every other in one step, so there is no
+product to control. This is what won, and the cost is the quadratic.
+
+**Linearity** — [state space models](/entries/state-space-models) drop the
+nonlinearity from the recurrence, which makes the Jacobian a constant diagonal
+and its product analytically controllable — and, unexpectedly, makes the whole
+sequence computable by [parallel scan](/entries/parallel-scan) rather than a
+loop.
+
+That third route is the interesting one, because the nonlinearity looked
+essential. It turns out that a linear recurrence with nonlinearities *between*
+layers is expressive enough, and it is the only formulation that keeps constant-
+memory decoding while training as fast as attention.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor, nn
+
+
+class ElmanRNN(nn.Module):
+    def __init__(self, dim: int, hidden: int):
+        super().__init__()
+        self.wx = nn.Linear(dim, hidden, bias=False)
+        self.wh = nn.Linear(hidden, hidden, bias=True)
+        self.hidden = hidden
+
+    def forward(self, x: Tensor) -> Tensor:                   # [B, T, D]
+        h = x.new_zeros(x.size(0), self.hidden)
+        out = []
+        # Sequential and unavoidably so: h_t needs h_{t-1}.
+        for t in range(x.size(1)):
+            h = torch.tanh(self.wx(x[:, t]) + self.wh(h))
+            out.append(h)
+        return torch.stack(out, dim=1)
+
+
+def spectral_radius(w: Tensor) -> float:
+    """The number that decides whether gradients survive. Log it."""
+    return torch.linalg.eigvals(w).abs().max().item()
+```
+
+</CodeFrame>
+
+The loop is the other half of the problem, and it is the half that made attention
+inevitable. $h_t$ depends on $h_{t-1}$, so training cannot parallelise over the
+sequence — a GPU that could process 4096 tokens at once processes them one at a
+time. Attention's quadratic cost bought perfect parallelism, and on the hardware
+of 2017 that was a trade worth making by a wide margin.

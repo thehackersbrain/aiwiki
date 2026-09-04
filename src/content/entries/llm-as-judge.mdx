@@ -1,0 +1,129 @@
+---
+name: 'LLM-as-Judge'
+desc: 'Using a model to score model outputs, and the biases that come with it.'
+category: 'evaluation'
+complexity: 'O(P)'
+path: 'evaluation/metrics'
+difficulty: 'intermediate'
+described: '2023'
+status: 'common'
+statusNote: 'Ubiquitous and known to be biased in documented ways. Used because the alternative is human annotation, not because it is trusted.'
+revised: 2026-08-30
+added: 2025-02-26
+tags: ['metric', 'preference']
+lede: 'Human preference data is slow and expensive; a strong model agrees with human annotators about as often as they agree with each other. That agreement is real, and so is the list of things it systematically gets wrong.'
+metrics:
+  caption: 'MT-Bench, GPT-4 judge vs. human annotators'
+  rows:
+    - { label: 'Judge–human', value: '≈ 85%' }
+    - { label: 'Human–human', value: '≈ 81%' }
+    - { label: 'Position bias', value: 'real', accent: true }
+implNote:
+  label: 'in practice'
+  html: 'Run every pair twice with the order swapped and discard disagreements as ties. It doubles the cost and removes most of the position bias.'
+related: [elo-bradley-terry-scoring, statistical-power, perplexity, contamination-detection]
+refs:
+  - cite: 'Zheng et al. — Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena (2023)'
+    id: 'arXiv:2306.05685'
+    href: https://arxiv.org/abs/2306.05685
+  - cite: 'Dubois et al. — Length-Controlled AlpacaEval (2024)'
+    id: 'arXiv:2404.04475'
+    href: https://arxiv.org/abs/2404.04475
+  - cite: 'Panickssery et al. — LLM Evaluators Recognize and Favor Their Own Generations (2024)'
+    id: 'arXiv:2404.13076'
+    href: https://arxiv.org/abs/2404.13076
+---
+
+A judge is asked to compare two responses to the same prompt and pick one. The
+outputs feed a [Bradley–Terry fit](/entries/elo-bradley-terry-scoring) exactly
+as human votes would.
+
+<Eq caption="eq. 1 — order-symmetrised judgement" lead>
+
+$$
+\hat{y} =
+\begin{cases}
+A & J(A, B) = A \;\wedge\; J(B, A) = A \\
+B & J(A, B) = B \;\wedge\; J(B, A) = B \\
+\text{tie} & \text{otherwise}
+\end{cases}
+$$
+
+</Eq>
+
+### The three biases
+
+<Note label="caveat">
+Position bias is large enough that a judge run in one order only is measuring
+its own ordering preference alongside quality.
+</Note>
+
+**Position.** Judges prefer the first response, or in some models the second,
+at rates well above chance. Eq. 1 is the standard correction.
+
+**Verbosity.** Longer answers win more often, beyond any quality difference.
+Length-controlled scoring fits a regression with length as a covariate and
+reports the length-adjusted effect.
+
+<Eq caption="eq. 2 — length as a covariate, not a signal" source="Dubois et al.">
+
+$$
+\operatorname{logit} \Pr[A \succ B] = \theta_{m} + \gamma\,\Delta_{\text{len}}(A, B)
+$$
+
+</Eq>
+
+**Self-preference.** A judge scores its own generations higher, and the effect
+tracks its ability to recognise them. Evaluating a model with a judge from the
+same family is a conflict of interest with a measured magnitude.
+
+### What it is bad at
+
+Judging is bounded by the judge's own competence. On a maths problem the judge
+must solve it to grade it; on domain expertise it does not have, it grades
+fluency. Where a programmatic check exists — tests pass, the answer matches, the
+JSON parses — use the check.
+
+> The 85% agreement figure is quoted far more often than its context. It is
+> agreement on open-ended chat comparisons where humans themselves agree 81% of
+> the time. It is not a claim about grading correctness.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · symmetrised pairwise judging">
+
+```python
+import itertools
+
+TEMPLATE = """Compare the two responses to the question below.
+Judge accuracy first, then helpfulness. Ignore length and ordering.
+
+Question: {question}
+
+[A] {a}
+
+[B] {b}
+
+Answer with exactly one of: A, B, TIE."""
+
+
+def judge_pair(client, question: str, a: str, b: str) -> str:
+    """Run both orders; a judgement that flips is a tie."""
+    def ask(first: str, second: str) -> str:
+        reply = client(TEMPLATE.format(question=question, a=first, b=second))
+        return reply.strip().upper()[:3].rstrip(".")
+
+    forward = ask(a, b)
+    reverse = ask(b, a)
+    flip = {"A": "B", "B": "A", "TIE": "TIE"}
+
+    return forward if forward == flip.get(reverse, "TIE") else "TIE"
+```
+
+</CodeFrame>
+
+Asking for a single token rather than a rationale is a deliberate trade: chain
+of thought improves judge accuracy on reasoning-heavy comparisons and costs
+throughput, so it is worth measuring on your own data rather than assuming.
+Parse strictly and count unparseable replies — a judge that starts refusing to
+choose is telling you something about the comparison.

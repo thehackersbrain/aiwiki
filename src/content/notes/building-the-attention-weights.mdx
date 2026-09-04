@@ -1,0 +1,170 @@
+---
+title: 'Building the attention weights'
+desc: 'From "which positions matter" to softmax over scaled dot products, by elimination.'
+lede: 'Part 1 ended with a weighted average and no way to compute the weights. This part derives them — additive scoring first, because that is what came first, then the dot product and the scale factor that makes it usable.'
+series: 'attention-from-scratch'
+part: 2
+minutes: 9
+revised: 2026-09-01
+added: 2026-08-16
+tags: ['attention', 'foundations', 'maths']
+related: [scaled-dot-product-attention, additive-attention, cross-attention]
+refs:
+  - cite: 'Bahdanau et al. — Neural Machine Translation by Jointly Learning to Align and Translate (2014)'
+    id: 'arXiv:1409.0473'
+    href: https://arxiv.org/abs/1409.0473
+  - cite: 'Luong et al. — Effective Approaches to Attention-based Neural Machine Translation (2015)'
+    id: 'arXiv:1508.04025'
+    href: https://arxiv.org/abs/1508.04025
+  - cite: 'Vaswani et al. — Attention Is All You Need (2017)'
+    id: 'arXiv:1706.03762'
+    href: https://arxiv.org/abs/1706.03762
+---
+
+We need $\alpha_{ti}$: how much output step $t$ should read from input position
+$i$. Three requirements, all forced by what it is for.
+
+1. It must depend on both sides — on what $t$ is looking for and on what $i$
+   contains. A weight that ignores either is not doing selection.
+2. The weights over $i$ must be non-negative and sum to one, or "weighted
+   average" is a lie and the scale of $c_t$ drifts with sequence length.
+3. It must be differentiable, or none of this trains.
+
+The standard route is: compute an unnormalised score $e_{ti}$, then normalise.
+
+<Eq caption="eq. 1 — score, then normalise" lead>
+
+$$
+\alpha_{ti} = \frac{\exp(e_{ti})}{\sum_{j=1}^{n} \exp(e_{tj})}
+$$
+
+</Eq>
+
+<Note label="annotation">
+Requirement 2 does not force a *softmax* specifically — dividing non-negative
+scores by their sum would also do it. Softmax is chosen because exponentiation
+makes the distribution sharpenable: a score gap of 3 becomes a ratio of 20.
+</Note>
+
+So the real question is $e_{ti}$.
+
+### Attempt one: learn the comparison
+
+Bahdanau's answer is to let a small network decide. Concatenate the decoder state
+and the encoder state, push them through a tanh layer, project to a scalar.
+
+<Eq caption="eq. 2 — additive (Bahdanau) scoring">
+
+$$
+e_{ti} = v^{\top} \tanh\!\left( W_s s_{t-1} + W_h h_i \right)
+$$
+
+</Eq>
+
+This works, and it has a real advantage: $s$ and $h$ need not have the same
+dimension, because $W_s$ and $W_h$ map them into a shared space independently.
+
+It also has a cost that took me a while to see as decisive. For each of the $n
+\times m$ pairs, eq. 2 requires a tanh over a $d$-vector and a dot with $v$.
+Those cannot be folded into a single matrix multiplication, because the
+nonlinearity sits in the middle. You get $n \cdot m$ small operations rather than
+one big one — which on a GPU is close to the worst possible shape for a
+computation.
+
+### Attempt two: just use the inner product
+
+Drop the learned comparator. Two vectors in the same space already have a
+similarity function.
+
+<Eq caption="eq. 3 — dot-product scoring">
+
+$$
+e_{ti} = s_{t-1}^{\top} h_i
+$$
+
+</Eq>
+
+<Note label="in numbers">
+For $n = m = 4096$ and $d = 64$: additive scoring is ~17 M tanh evaluations;
+dot-product scoring is one $4096 \times 64 \times 4096$ matmul, which a modern
+accelerator does in under a millisecond.
+</Note>
+
+Every score for every pair is now a single matrix product, $S = Q K^{\top}$. This
+is the change that mattered — not because dot products are more expressive than a
+learned comparator (they are less), but because the whole score matrix becomes
+one GEMM.
+
+The expressivity is bought back by projecting first. $Q = X W^Q$ and $K = X W^K$
+are learned, so the model still chooses *which* subspace similarity is measured
+in; it just does not get to choose the similarity function itself.
+
+### The scale factor is not cosmetic
+
+Here is the part I originally skipped, and skipping it is why I could not
+reproduce a working implementation from memory.
+
+Suppose $q$ and $k$ have independent components with mean 0 and variance 1. Then
+
+<Eq caption="eq. 4 — variance grows with dimension">
+
+$$
+\Var\!\left[\, q^{\top} k \,\right] = \sum_{i=1}^{d_k} \Var[\, q_i k_i \,] = d_k
+$$
+
+</Eq>
+
+so the logits have standard deviation $\sqrt{d_k}$. At $d_k = 64$ that is 8, and
+a gap of a few standard deviations between the largest logit and the rest sends
+softmax to a one-hot vector.
+
+That is bad not because the attention is sharp but because of what it does to the
+gradient. The softmax Jacobian is $\diag(a) - a a^{\top}$; as $a$ approaches
+one-hot, it approaches zero, and no gradient reaches $W^Q$ or $W^K$ at all. The
+layer stops learning while looking perfectly healthy in the forward pass.
+
+Dividing by $\sqrt{d_k}$ restores unit variance and the problem goes away.
+
+<Eq caption="eq. 5 — the whole thing, assembled" lead>
+
+$$
+\mathrm{Attention}(Q, K, V) = \softmax\!\left( \frac{Q K^{\top}}{\sqrt{d_k}} \right) V
+$$
+
+</Eq>
+
+### Checking it myself
+
+I did not believe the saturation argument until I plotted it, and it is a
+five-line experiment worth doing rather than reading.
+
+<CodeFrame meta="python · the saturation, measured">
+
+```python
+import torch
+
+for d in (8, 64, 512):
+    q = torch.randn(4096, d)
+    k = torch.randn(4096, d)
+    logits = q @ k.T
+
+    for name, s in (("unscaled", logits), ("scaled", logits / d**0.5)):
+        a = s.softmax(dim=-1)
+        # Entropy in nats: log(4096) = 8.32 is uniform, 0 is one-hot.
+        entropy = -(a * a.clamp_min(1e-12).log()).sum(-1).mean()
+        print(f"d={d:4d} {name:9s} std={s.std():6.2f} entropy={entropy:5.2f}")
+```
+
+</CodeFrame>
+
+At $d = 512$ the unscaled entropy collapses towards zero while the scaled version
+stays near $\log n$. The scaled row is not sharp *yet* — sharpness is something
+the model learns by growing the magnitude of $W^Q$ and $W^K$ during training. The
+point of the scale factor is that it starts diffuse and lets training decide,
+rather than starting saturated with no gradient to escape with.
+
+<Rule label="Next" />
+
+Part 3 takes the finished operation and looks at what the resulting matrix
+actually contains — and at how much of what people read off attention maps is
+really there.

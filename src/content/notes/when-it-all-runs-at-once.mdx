@@ -1,0 +1,157 @@
+---
+title: 'When it all runs at once'
+desc: 'Four parallelisms, one cluster, and the silent misconfiguration that halves it.'
+lede: 'A frontier training layout is a product of four strategies ordered by how much they talk. Getting the order wrong produces a job that trains correctly, at half speed, with nothing in the logs.'
+series: 'making-it-fit'
+part: 4
+minutes: 9
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['memory', 'training', 'distributed']
+related: [parallelism-composition, tensor-parallelism, pipeline-parallelism, context-parallelism, fault-tolerance, collective-communication]
+refs:
+  - cite: 'Narayanan et al. — Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM (2021)'
+    id: 'arXiv:2104.04473'
+    href: https://arxiv.org/abs/2104.04473
+  - cite: 'Dubey et al. — The Llama 3 Herd of Models (2024)'
+    id: 'arXiv:2407.21783'
+    href: https://arxiv.org/abs/2407.21783
+  - cite: 'Korthikanti et al. — Reducing Activation Recomputation in Large Transformer Models (2022)'
+    id: 'arXiv:2205.05198'
+    href: https://arxiv.org/abs/2205.05198
+---
+
+Part 3 split the batch. That handles memory only if the model fits on one device,
+and past a few tens of billions of parameters it does not. So the model gets
+split too — in three different directions, each with its own cost.
+
+### Three ways to cut a model
+
+**By matrix.** [Tensor parallelism](/entries/tensor-parallelism) splits every
+weight matrix across devices. Column-split the up-projection and row-split the
+down-projection and the arithmetic works out to one all-reduce per block instead
+of two, because the elementwise activation in between needs no exchange. Four
+collectives per layer, forward and backward.
+
+**By depth.** [Pipeline parallelism](/entries/pipeline-parallelism) gives each
+device a run of layers and passes activations down the chain. One point-to-point
+message per boundary — far less traffic than anything else — and a structural
+idle period while the pipeline fills.
+
+**By sequence.** [Context parallelism](/entries/context-parallelism) splits the
+tokens. Attention makes this awkward, since every position needs every other, and
+the resolution is to pass KV blocks around a ring while accumulating the same
+running softmax that FlashAttention already uses. Exact, not approximate.
+
+### The ordering rule, which is all of it
+
+<Eq lead caption="eq. 1 — sort by this, and match to link bandwidth">
+
+$$
+\text{intensity} = \frac{\text{bytes communicated}}{\text{FLOPs performed}}
+$$
+
+</Eq>
+
+Rank the strategies by intensity. Rank the links by bandwidth. Match them up.
+
+| Strategy | Traffic | Belongs |
+| --- | --- | --- |
+| tensor | 4 collectives / layer | inside a node |
+| context | $N-1$ hops / attention | inside a node |
+| pipeline | 1 tensor / boundary | across nodes |
+| data + ZeRO | 1 reduce / step | across everything |
+
+NVLink is roughly an order of magnitude faster than InfiniBand, so tensor
+parallelism is capped at the NVLink domain — usually 8. The ninth device is
+across a slower link and the collective inherits its bandwidth, so the whole
+group runs at network speed.
+
+<Note label="annotation">
+Llama 3's 405B run: TP 8, CP up to 16, PP 16, DP 128, over 16 384 GPUs. Worth
+noticing that the context-parallel degree changed between stages — the long
+context phase came last, so the layout is not a constant of the run but a
+function of what is being trained at the time.
+</Note>
+
+### The two constraints that fight
+
+<Eq caption="eq. 2 — both must hold simultaneously">
+
+$$
+N_{\text{devices}} = \mathrm{TP}\times\mathrm{CP}\times\mathrm{PP}\times\mathrm{DP}
+\qquad
+\text{batch} = \mathrm{DP}\times b_{\text{micro}}\times \text{accum}
+$$
+
+</Eq>
+
+This is why configuring one of these is unpleasant. Raising the pipeline depth to
+fit a larger model reduces the data-parallel degree at fixed device count, which
+reduces the batch, which means fewer micro-batches, which *raises* the pipeline
+bubble fraction — the change made to fit the model makes the thing it introduced
+worse.
+
+### The failure with no error message
+
+The mapping from global rank to a (tp, cp, pp, dp) coordinate decides which group
+lands on which physical link. Get it wrong — tensor-parallel groups striped
+across nodes, data-parallel groups packed inside them — and every collective goes
+over the wrong wire.
+
+The job runs. The gradients are correct. The loss curve is normal. It is simply
+two to three times slower than it should be, and there is nothing anywhere to
+tell you.
+
+<Note label="caveat">
+The only defence I know is to assert it. Compute the tensor-parallel group's
+ranks, divide by <code>LOCAL_WORLD_SIZE</code>, and check they land on one node.
+Three lines, at start-up. On a new cluster this class of misconfiguration
+otherwise survives until someone computes model FLOPs utilisation, and that is
+often weeks.
+</Note>
+
+MFU — achieved FLOPs over peak — is the number that catches it. Below about 35%
+on a modern cluster means the layout is wrong, not that the model is demanding.
+It is the only metric I would insist on having before a long run starts.
+
+### And then the hardware breaks
+
+One more thing that only appears at this scale. A GPU has a mean time between
+failures measured in years; sixteen thousand of them give a system MTBF measured
+in hours. Llama 3's run had 466 interruptions in 54 days, 419 unplanned.
+
+Since every collective is a barrier, one dead rank stops everything. There is no
+partial progress and no graceful degradation — the job is up or it is not.
+
+<Eq caption="eq. 3 — Young’s formula, and it is the whole question">
+
+$$
+T^{*} = \sqrt{2\,C\cdot\mathrm{MTBF}}
+$$
+
+</Eq>
+
+At a three-hour MTBF and a five-minute checkpoint, that is 42 minutes. Which
+makes checkpoint *cost* the thing worth engineering: sharded writes so every rank
+saves its own slice in parallel, and asynchronous flushing so the GPUs resume
+after a host-memory copy rather than after a storage write.
+
+And the checkpoint has to contain the optimiser state, the data-loader position
+and the RNG state. Omit the first and you get a visible loss spike on resume;
+omit the others and the model quietly re-reads data it has already seen, which
+nothing will ever tell you about.
+
+<Rule label="End of series" />
+
+Four parts. Count the bytes and the technique list becomes an ordering; recompute
+selectively rather than uniformly, and check whether the free thing already
+solved it; split the batch and keep the ranks honest; then split the model, and
+match each strategy to a wire.
+
+The thread running through all of it is that these systems fail *quietly*. Nearly
+every mistake in this series — the wrong checkpointing target, the missing
+`set_epoch`, clipping before the reduce, a tensor-parallel group spanning nodes,
+a checkpoint without the loader state — produces a run that completes and is
+worse. Which is why the arithmetic in part 1 is worth doing up front: it is
+mostly the only thing that will tell you.

@@ -1,0 +1,128 @@
+---
+title: 'Where demonstrations run out'
+desc: 'Fine-tuning on good answers works, and then stops working for a reason worth understanding.'
+lede: 'Supervised fine-tuning gets you most of the way in an afternoon. The ceiling it hits is not about data volume — it is that a demonstration can only say "do this", never "not that".'
+series: 'alignment-from-scratch'
+part: 2
+minutes: 8
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['alignment', 'objectives', 'fine-tuning']
+related: [supervised-fine-tuning, next-token-prediction, reward-modelling, lora, config-driven-finetuning]
+refs:
+  - cite: 'Ouyang et al. — Training language models to follow instructions with human feedback (2022)'
+    id: 'arXiv:2203.02155'
+    href: https://arxiv.org/abs/2203.02155
+  - cite: 'Zhou et al. — LIMA: Less Is More for Alignment (2023)'
+    id: 'arXiv:2305.11206'
+    href: https://arxiv.org/abs/2305.11206
+  - cite: 'Gudibande et al. — The False Promise of Imitating Proprietary LLMs (2023)'
+    id: 'arXiv:2305.15717'
+    href: https://arxiv.org/abs/2305.15717
+---
+
+Part 1 ended with two ways to ask a human what they want. This part takes the
+first one — show me — as far as it goes.
+
+### It is just more pre-training
+
+Supervised fine-tuning has no new machinery. Same objective, same optimiser,
+different data: prompt-and-response pairs instead of documents, with the loss
+masked so it only applies to the response.
+
+<Eq lead caption="eq. 1 — the only difference is which tokens count">
+
+$$
+\mathcal{L} = -\sum_{t \in \text{response}} \log p_\theta\bigl(y_t \mid x, y_{<t}\bigr)
+$$
+
+</Eq>
+
+That mask is the whole implementation and it is easy to get wrong. Include the
+prompt tokens and you are training the model to generate questions as well as
+answers, which degrades it in a way that produces a perfectly normal-looking loss
+curve. I have made this mistake; the symptom was a model that would occasionally
+continue past its answer into a plausible next user turn.
+
+### It works alarmingly well
+
+LIMA is the result that reset my expectations. A 65B base model, **one thousand**
+carefully written examples, no reinforcement learning of any kind — and outputs
+competitive with heavily post-trained models in human comparisons.
+
+A thousand. Not a hundred thousand.
+
+Their reading is the *superficial alignment hypothesis*: essentially all
+capability arrives during pre-training, and post-training is teaching the model
+which of its existing distributions to sample from. If that is right, then a
+small number of examples suffices, because you are selecting a mode rather than
+teaching a skill — and the evidence is consistent with it, since quality of
+examples matters far more than quantity in every ablation I have seen.
+
+<Note label="annotation">
+This is the most practically useful thing in the series. If you have a specific
+task, the correct first move is a few hundred excellent examples, not a
+preference pipeline. I spent time building the latter for a problem the former
+would have solved, on the assumption that more machinery meant better results.
+</Note>
+
+### The three ways it stops
+
+**It cannot express a negative.** A demonstration says "produce this". It never
+says "not that". If the model has a failure mode — hedging, over-refusing,
+inventing citations — you can show it a thousand examples of not doing that, and
+each one is only positive evidence for one alternative. The gradient never points
+*away* from the failure, because the failure never appears in the data.
+
+<Eq caption="eq. 2 — what the two kinds of signal contain">
+
+$$
+\text{SFT: } \nabla \log p(y^{\text{good}})
+\qquad\qquad
+\text{preference: } \nabla \bigl[\log p(y^{w}) - \log p(y^{l})\bigr]
+$$
+
+</Eq>
+
+The second term on the right is the one SFT structurally cannot have.
+
+**The ceiling is the demonstrator.** The model is fitted to imitate the
+distribution of responses in the data, so it converges towards the quality of
+whoever wrote them. That is fine when the writers are excellent and expensive.
+It is a hard bound when they are not — and for tasks where a good response is
+hard to *produce* but easy to *recognise*, it is the wrong bound entirely.
+Comparisons ask people for the easy judgement; demonstrations ask for the hard
+one.
+
+**Imitation is not the thing being imitated.** Gudibande et al. fine-tuned open
+models on outputs from a much stronger one and got a result worth remembering:
+human raters preferred the students, and targeted benchmarks showed no
+improvement at all. The models had learned the *style* — the confident register,
+the structure, the formatting — without the underlying capability.
+
+<Note label="caveat">
+That paper is the reason I distrust win-rate numbers reported alone. Style is
+cheap to imitate and heavily rewarded by raters, so any evaluation that is purely
+comparative will overstate what imitation buys. Pair it with something that has a
+ground truth or you are measuring register.
+</Note>
+
+### Where it leaves us
+
+SFT is not a rung on a ladder that gets discarded. Every pipeline in the rest of
+this series *starts* from an SFT model — it is the reference policy that PPO
+constrains towards, and the initialisation DPO improves. Skipping it does not
+work.
+
+What it cannot do is improve past its data, and it cannot be told what to avoid.
+Both limits have the same shape: the signal is one-sided.
+
+The fix is to ask the other question. Not "what should the answer be" but "which
+of these two is better" — cheaper to collect, available for tasks nobody can
+demonstrate well, and it carries a negative.
+
+<Rule label="Next" />
+
+Part 3 turns a pile of comparisons into a number, which is less obvious than it
+sounds and introduces the failure mode that the two parts after it are both
+trying to contain.

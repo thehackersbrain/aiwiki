@@ -1,0 +1,99 @@
+---
+name: 'SGLang'
+desc: 'A serving runtime built around prefix reuse and constrained decoding.'
+category: 'tooling'
+complexity: '—'
+path: 'tooling/serving'
+difficulty: 'intermediate'
+described: '2024'
+status: 'common'
+statusNote: 'The credible alternative to vLLM, and ahead of it on multi-turn and structured-output workloads. The two converge on features quickly, so any specific comparison dates fast.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['tooling', 'inference', 'serving']
+lede: 'Most serving workloads are not independent prompts. They share system prompts, branch from a common context, and want output matching a schema — SGLang is a runtime designed around those facts rather than retrofitted to them.'
+metrics:
+  caption: 'RadixAttention, shared-prefix workloads'
+  rows:
+    - { label: 'Throughput vs vLLM', value: 'up to 5×' }
+    - { label: 'Cache hit, multi-turn', value: 'high', accent: true }
+    - { label: 'Grammar decoding', value: 'near zero cost' }
+implNote:
+  label: 'annotation'
+  html: 'RadixAttention is prefix caching with a radix tree instead of a hash table, so a partial match is reusable. Two prompts sharing 900 of 1000 tokens share those 900 — a hash on the full prefix would treat them as unrelated.'
+related: [prefix-caching, vllm, paged-attention, continuous-batching, sampling-strategies]
+refs:
+  - cite: 'Zheng et al. — SGLang: Efficient Execution of Structured Language Model Programs (2023)'
+    id: 'arXiv:2312.07104'
+    href: https://arxiv.org/abs/2312.07104
+  - cite: 'SGLang documentation'
+    id: 'docs.sglang.ai'
+    href: https://docs.sglang.ai
+  - cite: 'Willard & Louf — Efficient Guided Generation for Large Language Models (2023)'
+    id: 'arXiv:2307.09702'
+    href: https://arxiv.org/abs/2307.09702
+---
+
+[vLLM](/entries/vllm) treats requests as independent and manages their memory
+well. SGLang starts from the observation that they usually are not.
+
+A chat conversation resends the whole history each turn. An agent loop resends
+the same system prompt and tool definitions every step. A branching search shares
+a common prefix across every branch. In all three, most of the prefill is
+recomputation of something the server has already done.
+
+### RadixAttention
+
+Cached prefixes are held in a radix tree keyed by token sequence, so lookup finds
+the *longest matching prefix* rather than requiring an exact hit.
+
+That distinction is the point. Turn five of a conversation shares turns one to
+four with the previous request, and a hash of the full prompt would miss. A radix
+tree matches the shared span, reuses its KV blocks, and prefills only the new
+tokens. Eviction is LRU over tree nodes, so hot prefixes — a system prompt shared
+by every request — stay resident.
+
+### Constrained decoding
+
+The other half. When output must be valid JSON matching a schema, the usual
+approach is to generate and retry until it parses.
+
+Instead, compile the grammar to a finite-state machine and, at each step, mask
+the logits of every token that cannot legally come next. The output is valid by
+construction, retries disappear, and — because the mask is precomputed per state
+— it costs almost nothing at generation time.
+
+<CodeFrame meta="python">
+
+```python
+import sglang as sgl
+
+@sgl.function
+def extract(s, document: str):
+    s += sgl.system("Extract structured data. JSON only.")
+    s += sgl.user(document)
+    # The schema is enforced during decoding, not checked afterwards.
+    s += sgl.assistant(sgl.gen("out", max_tokens=256, json_schema=SCHEMA))
+
+# Or as a server, OpenAI-compatible like everything else:
+#   python -m sglang.launch_server --model-path <model> --port 30000
+```
+
+</CodeFrame>
+
+### Choosing between the two
+
+| Workload | Reach for |
+| --- | --- |
+| independent prompts, high throughput | vLLM |
+| multi-turn chat, agent loops | SGLang |
+| strict JSON or grammar output | SGLang |
+| widest model and hardware support | vLLM |
+| branching or tree search | SGLang |
+
+<Note label="caveat">
+This table has a short half-life. vLLM has prefix caching and structured output;
+SGLang has broadened its model coverage; each release narrows the gap in one
+direction or the other. Treat the row headings as the durable part and benchmark
+your own workload rather than trusting the ordering.
+</Note>

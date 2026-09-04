@@ -1,0 +1,121 @@
+---
+name: 'Continuous Batching'
+desc: 'Iteration-level scheduling; requests join and leave the batch mid-flight.'
+category: 'inference'
+complexity: 'O(1)'
+path: 'inference/serving'
+difficulty: 'intermediate'
+described: '2022'
+status: 'standard'
+revised: 2026-08-16
+added: 2025-01-08
+tags: ['serving', 'latency']
+lede: 'Static batching makes every request in a batch wait for the longest one. Schedule at the granularity of a decode step instead, and a finished sequence frees its slot immediately.'
+metrics:
+  caption: 'reported throughput at fixed p50 latency, mixed-length workload'
+  rows:
+    - { label: 'Static batching', value: '1.0×' }
+    - { label: 'Continuous', value: 'up to 23×', accent: true }
+    - { label: 'Slot occupancy', value: '~100%' }
+implNote:
+  label: 'annotation'
+  html: 'Prefill and decode have opposite profiles — one compute-bound, one bandwidth-bound. Chunked prefill exists so a long prompt cannot stall every decode in flight.'
+related: [paged-attention, multi-query-attention, speculative-decoding, prefix-caching]
+refs:
+  - cite: 'Yu et al. — Orca: A Distributed Serving System for Transformer-Based Generative Models (2022)'
+    id: 'OSDI 2022'
+  - cite: 'Kwon et al. — Efficient Memory Management for LLM Serving with PagedAttention (2023)'
+    id: 'arXiv:2309.06180'
+    href: https://arxiv.org/abs/2309.06180
+  - cite: 'Agrawal et al. — Taming Throughput-Latency Tradeoff with Sarathi-Serve (2024)'
+    id: 'arXiv:2403.02310'
+    href: https://arxiv.org/abs/2403.02310
+---
+
+A batch of generation requests finishes at different times. Under request-level
+batching the whole batch is held until the longest completion is done, so a
+20-token reply sharing a batch with a 2000-token one occupies its slot for the
+full 2000 steps.
+
+<Eq caption="eq. 1 — utilisation under static batching" lead>
+
+$$
+U = \frac{\sum_i L_i}{B \cdot \max_i L_i}
+$$
+
+</Eq>
+
+<Note label="in numbers">
+Completion lengths in real traffic are heavy-tailed. A batch of 32 with a mean
+of 100 tokens and a max of 2000 runs at 5% utilisation.
+</Note>
+
+Continuous batching schedules at each decode iteration instead. A sequence that
+emits EOS is evicted at the end of that step, a queued request is admitted in
+its place, and the batch composition changes continuously.
+
+### What it requires
+
+The transformer itself is indifferent to this — attention over a batch of
+sequences at different lengths is the same operation — but three things must
+hold:
+
+- The KV cache must be allocated per sequence and freed independently, which is
+  what [paged attention](/entries/paged-attention) provides.
+- Newly admitted requests need a prefill pass, which is compute-bound, while the
+  in-flight sequences want a decode step, which is bandwidth-bound. Mixing them
+  in one forward pass is the scheduling problem.
+- Admission must be bounded by free cache blocks, not by a batch-size constant,
+  or the scheduler will admit a request it cannot finish.
+
+<Eq caption="eq. 2 — the real admission constraint">
+
+$$
+\sum_{i \in \text{running}} \left\lceil \frac{n_i}{\text{block}} \right\rceil
+\;+\; \left\lceil \frac{n_{\text{new}}}{\text{block}} \right\rceil
+\;\le\; \text{blocks}_{\text{total}}
+$$
+
+</Eq>
+
+> When that constraint binds, something must be preempted. Recomputing the
+> evicted sequence's cache is usually cheaper than swapping it to host memory
+> and back — prefill is fast, and PCIe is not.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · sketch of the scheduler loop">
+
+```python
+def serve(model, queue, cache, max_batch: int):
+    running: list[Request] = []
+
+    while queue or running:
+        # admit what the free cache can actually hold
+        while queue and len(running) < max_batch:
+            if not cache.can_allocate(queue[0].prompt_len):
+                break
+            running.append(cache.admit(queue.pop(0)))
+
+        # one decode step across every live sequence
+        logits = model.step([r.next_token for r in running],
+                            [r.block_table for r in running])
+
+        for request, token in zip(running, logits.argmax(-1)):
+            request.append(token)
+
+        finished = [r for r in running if r.is_done()]
+        for request in finished:
+            cache.free(request)
+            request.respond()
+        running = [r for r in running if r not in finished]
+```
+
+</CodeFrame>
+
+Admitting purely first-come-first-served is simple and starves nobody, but it
+lets one long prompt block the queue; most production schedulers add a
+shortest-remaining-first bias for the prefill queue and accept the fairness
+cost. The `can_allocate` check must reserve for the *expected* output length,
+not just the prompt, or preemption becomes the normal case rather than the
+exception.

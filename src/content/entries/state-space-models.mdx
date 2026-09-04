@@ -1,0 +1,140 @@
+---
+name: 'Selective State Space Models'
+desc: 'Linear recurrence with input-dependent dynamics; Mamba and the S4 line.'
+category: 'architectures'
+complexity: 'O(n·d·N)'
+memory: 'O(d·N)'
+path: 'architectures/recurrence'
+difficulty: 'advanced'
+described: '2021'
+status: 'emerging'
+statusNote: 'Strong results in hybrid stacks. Nobody has yet shipped a frontier model without attention in it.'
+revised: 2026-08-19
+added: 2025-05-02
+tags: ['sequence', 'recurrence', 'sparse']
+lede: 'A continuous linear system, discretised and run over the sequence. Constant state per step rather than a cache that grows with context — and, since Mamba, dynamics that depend on the input.'
+metrics:
+  caption: 'decode state per layer, d = 4096, batch 1'
+  rows:
+    - { label: 'KV cache @ 32k', value: '512 MB' }
+    - { label: 'SSM state', value: '0.5 MB', accent: true }
+    - { label: 'Scaling in n', value: 'O(1)' }
+implNote:
+  label: 'caveat'
+  html: 'The recurrence is written as a loop here for legibility. Run that way it is unusably slow — the real kernel is a parallel scan that never materialises the states.'
+related: [parallel-scan, hippo, state-space-duality, hybrid-recurrent-attention, rwkv, linear-attention]
+refs:
+  - cite: 'Gu & Dao — Mamba: Linear-Time Sequence Modeling with Selective State Spaces (2023)'
+    id: 'arXiv:2312.00752'
+    href: https://arxiv.org/abs/2312.00752
+  - cite: 'Gu et al. — Efficiently Modeling Long Sequences with Structured State Spaces (2021)'
+    id: 'arXiv:2111.00396'
+    href: https://arxiv.org/abs/2111.00396
+  - cite: 'Dao & Gu — Transformers are SSMs: State Space Duality (2024)'
+    id: 'arXiv:2405.21060'
+    href: https://arxiv.org/abs/2405.21060
+---
+
+Start from a linear time-invariant system mapping a scalar input stream to an
+output through an $N$-dimensional latent state.
+
+<Eq caption="eq. 1 — continuous form" lead>
+
+$$
+h'(t) = A\,h(t) + B\,x(t),
+\qquad
+y(t) = C\,h(t)
+$$
+
+</Eq>
+
+To run it on tokens you discretise with a step size $\Delta$. Zero-order hold
+gives the matrices the recurrence actually uses.
+
+<Eq caption="eq. 2 — zero-order hold discretisation">
+
+$$
+\bar{A} = \exp(\Delta A),
+\qquad
+\bar{B} = (\Delta A)^{-1}\bigl( \exp(\Delta A) - I \bigr)\, \Delta B
+$$
+
+</Eq>
+
+<Note label="annotation">
+$A$ is not initialised randomly. HiPPO gives the matrix whose state is an
+optimal polynomial compression of the history seen so far — without it, S4
+trains no better than a plain RNN.
+</Note>
+
+With $A$, $B$, $C$ constant the recurrence is a convolution, computable for the
+whole sequence in one FFT. That is S4, and it is also its ceiling: a
+time-invariant system cannot choose what to remember, so it cannot solve
+selective copying or induction.
+
+### Selection
+
+Mamba makes $B$, $C$ and $\Delta$ functions of the current token. The system
+stops being time-invariant, the convolution disappears, and what remains is a
+recurrence that must be scanned.
+
+<Eq caption="eq. 3 — the parameters become projections of the input" source="Gu &amp; Dao §3.2">
+
+$$
+B_t = W_B x_t,
+\qquad
+C_t = W_C x_t,
+\qquad
+\Delta_t = \mathrm{softplus}(W_\Delta x_t)
+$$
+
+</Eq>
+
+$\Delta_t$ is the interesting one. Large $\Delta$ makes $\bar{A} \to 0$ and the
+state resets to the current input; small $\Delta$ makes $\bar{A} \to I$ and the
+token is ignored. It is a gate in the LSTM sense, arrived at from the
+discretisation rather than bolted on.
+
+> The cost model inverts the transformer's. Decoding is $O(1)$ per token in
+> context length with a fixed-size state, but that state is a lossy summary —
+> exact retrieval from far back is the thing attention buys and this does not.
+> Hybrids that interleave a few attention layers among many SSM layers are the
+> current answer.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch — recurrence, not the scan kernel">
+
+```python
+import torch
+from torch import Tensor
+
+
+def selective_scan(
+    x: Tensor,        # [B, L, D]   input
+    A: Tensor,        # [D, N]      log-negative, learned
+    B: Tensor,        # [B, L, N]   input-dependent
+    C: Tensor,        # [B, L, N]   input-dependent
+    delta: Tensor,    # [B, L, D]   input-dependent, softplus'd
+) -> Tensor:
+    batch, length, dim = x.shape
+    state = torch.zeros(batch, dim, A.size(-1), device=x.device)
+    out = []
+
+    for t in range(length):
+        dt = delta[:, t].unsqueeze(-1)                  # [B, D, 1]
+        a_bar = torch.exp(dt * A)                       # [B, D, N]
+        b_bar = dt * B[:, t].unsqueeze(1)               # [B, 1, N] -> broadcast
+        state = a_bar * state + b_bar * x[:, t].unsqueeze(-1)
+        out.append((state @ C[:, t].unsqueeze(-1)).squeeze(-1))
+
+    return torch.stack(out, dim=1)
+```
+
+</CodeFrame>
+
+$A$ is stored as $-\exp(A_{\log})$ so the eigenvalues stay negative and the
+system stays stable; $\bar{A} = \exp(\Delta A)$ then lies in $(0, 1)$ and the
+state cannot blow up. The $\bar{B}$ above drops the $(\Delta A)^{-1}(\exp(\Delta
+A) - I)$ factor for the first-order approximation $\Delta B$, which is what
+Mamba itself uses.

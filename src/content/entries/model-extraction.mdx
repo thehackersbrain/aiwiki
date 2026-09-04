@@ -1,0 +1,51 @@
+---
+name: 'Model Extraction'
+desc: 'Query-only reconstruction of a victim model''s decision function.'
+category: 'adversarial-ml'
+complexity: 'O(Q·d)'
+path: 'adversarial-ml/stealing'
+difficulty: 'advanced'
+described: '2016'
+status: 'common'
+revised: 2026-07-21
+added: 2025-02-18
+tags: ['attack', 'stealing']
+lede: 'An API that returns logits returns more than it means to. What is extractable ranges from a distilled approximation to, for the final layer, exact parameters up to symmetry.'
+related: [membership-inference, prompt-injection-taxonomy]
+refs:
+  - cite: 'Tramèr et al. — Stealing Machine Learning Models via Prediction APIs (2016)'
+    id: 'arXiv:1609.02943'
+    href: https://arxiv.org/abs/1609.02943
+  - cite: 'Carlini et al. — Stealing Part of a Production Language Model (2024)'
+    id: 'arXiv:2403.06634'
+    href: https://arxiv.org/abs/2403.06634
+---
+
+Functional extraction is distillation with the victim as teacher: query, collect
+outputs, fit a student. Query efficiency is the whole game, and active selection
+near the decision boundary beats uniform sampling by orders of magnitude.
+
+<Note label="annotation">
+The hidden width of several production models was recovered this way, for a few
+hundred dollars of queries each.
+</Note>
+
+Exact extraction is stronger and narrower. Because the logit layer is a linear map
+from a $d$-dimensional hidden space to $|V|$ outputs, its image is a
+$d$-dimensional subspace of $\R^{|V|}$. Collecting more than $d$ linearly
+independent logit vectors and taking an SVD recovers that subspace — and hence
+$d$, the hidden width — from the singular value spectrum alone.
+
+<Eq caption="eq. 1 — width leaks from the logit spectrum" source="Carlini et al. §4" lead>
+
+$$
+\mathrm{rank}\bigl( [\, \ell(x_1) \; \cdots \; \ell(x_n) \,] \bigr) = d_{\text{model}},
+\qquad n > d_{\text{model}}
+$$
+
+</Eq>
+
+> The defences follow directly from the mechanism: return top-$k$ rather than full
+> logits, add calibrated noise, or bind an unrecoverable per-account transform to
+> the head. Rate limiting alone does not help against an attacker whose query
+> budget is measured in dollars.

@@ -1,0 +1,151 @@
+---
+name: 'Schedule-Free Optimisation'
+desc: 'Averaging in place of a decay schedule, so the run has no fixed horizon.'
+category: 'training'
+complexity: 'O(P)'
+memory: 'O(P)'
+path: 'training/optimisers'
+difficulty: 'intermediate'
+described: '2024'
+status: 'emerging'
+statusNote: 'Won the 2024 AlgoPerf self-tuning track and has not displaced cosine decay in any large public run. Strongest case is any setting where the step count is not known in advance.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['optimisers', 'training']
+lede: 'Every learning-rate schedule needs the total step count up front, and decides in advance when the run ends. Averaging the iterates achieves the same annealing without ever being told.'
+metrics:
+  caption: 'What the schedule assumes'
+  rows:
+    - { label: 'Cosine decay', value: 'T known at step 0' }
+    - { label: 'Stop early', value: 'undertrained' }
+    - { label: 'Schedule-free', value: 'any T', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Three sequences, two stored. The gradient is evaluated at an interpolated point y, the update is applied to z, and x — the average — is what you evaluate and ship. Checkpointing z and forgetting x gives a model that scores far worse than the run reported.'
+related: [learning-rate-schedules, adamw, stochastic-gradient-descent, maximal-update-parameterisation, chinchilla-scaling-laws]
+refs:
+  - cite: 'Defazio et al. — The Road Less Scheduled (2024)'
+    id: 'arXiv:2405.15682'
+    href: https://arxiv.org/abs/2405.15682
+  - cite: 'Polyak & Juditsky — Acceleration of Stochastic Approximation by Averaging (1992)'
+    id: 'SIAM J. Control Optim. 30(4)'
+    href: https://epubs.siam.org/doi/10.1137/0330046
+  - cite: 'Hägele et al. — Scaling Laws and Compute-Optimal Training Beyond Fixed Training Durations (2024)'
+    id: 'arXiv:2405.18392'
+    href: https://arxiv.org/abs/2405.18392
+---
+
+A cosine [schedule](/entries/learning-rate-schedules) needs $T$, the total number
+of steps, before the first one. That is a stronger requirement than it appears:
+it fixes the compute budget in advance, it makes early stopping produce a model
+caught mid-decay, and it means extending a run is not possible without retuning.
+
+<Note label="annotation">
+It also distorts the scaling-law literature. Fitting a loss curve needs
+checkpoints at many budgets, and under cosine decay every budget is a separate
+run — you cannot read the loss at 30% of a schedule and treat it as the loss of a
+30%-length run, because the learning rate is wrong there.
+</Note>
+
+Averaging is the old alternative. Polyak–Ruppert averaging of the iterates has
+been known to give optimal asymptotic rates since 1992 and is not used in deep
+learning, because the plain average includes the early iterates when the model
+was bad.
+
+### The three-sequence form
+
+Defazio et al.'s contribution is an arrangement that makes averaging work
+without a schedule: evaluate the gradient somewhere other than where you average.
+
+<Eq lead caption="eq. 1 — y is where the gradient is taken, x is what you keep">
+
+$$
+\begin{aligned}
+y_t &= (1 - \beta)\, z_t + \beta\, x_t \\
+z_{t+1} &= z_t - \gamma\, \nabla f(y_t) \\
+x_{t+1} &= \Bigl(1 - \tfrac{1}{t+1}\Bigr) x_t + \tfrac{1}{t+1}\, z_{t+1}
+\end{aligned}
+$$
+
+</Eq>
+
+$z$ is an ordinary un-decayed SGD or Adam sequence. $x$ is the running average of
+it, which is what you evaluate and ship. $y$ is an interpolation between them,
+and it is the point at which the gradient is computed — this is the piece that
+makes the scheme work rather than merely average.
+
+The average provides the annealing. Late in training $x$ moves by $1/t$ of the
+step, so the effective learning rate decays like $1/t$ without anything having
+been scheduled — and because $t$ is the *current* step and not a fraction of $T$,
+nothing needs to know where the run ends.
+
+<Eq caption="eq. 2 — every prefix is a finished model">
+
+$$
+x_t \text{ is a converged model } \forall t,
+\qquad\text{whereas cosine gives one only at } t = T
+$$
+
+</Eq>
+
+### Where it stands
+
+It won the self-tuning track of the 2024 AlgoPerf benchmark, which is the
+strongest available evidence for an optimiser that is not simply "we trained our
+model with it". Across the benchmark's workloads it matches or beats a tuned
+cosine schedule with no schedule to tune.
+
+It has not displaced cosine decay in large language-model runs. The reason is
+partly institutional — the recipes work and nobody wants to risk a seven-figure
+run on an optimiser change — and partly that at frontier scale $T$ genuinely is
+known in advance, so the property being offered is one those runs do not need.
+
+Where it does help is the case Hägele et al. document from another direction:
+scaling-law fitting, continued pre-training, and any run whose budget might
+change. Their answer is a warmup-stable-decay schedule, which keeps a constant
+rate and decays only over the final stretch, and reaches much the same place by
+keeping the option open rather than removing the schedule.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor
+
+
+class ScheduleFreeAdamW:
+    """x is the model you evaluate; z is the optimiser's own iterate."""
+
+    def __init__(self, params, lr=2.5e-3, beta=0.9, betas=(0.9, 0.999), warmup=1000):
+        self.p = list(params)
+        self.z = [p.detach().clone() for p in self.p]         # un-averaged iterate
+        self.state = {"step": 0}
+        self.lr, self.beta, self.betas, self.warmup = lr, beta, betas, warmup
+
+    @torch.no_grad()
+    def eval_mode(self) -> None:
+        """Parameters currently hold y. Swap in x before validating or saving."""
+        for p, x in zip(self.p, self.x):
+            p.copy_(x)
+
+    @torch.no_grad()
+    def step(self) -> None:
+        t = self.state["step"] = self.state["step"] + 1
+        c = 1.0 / t                                           # averaging weight
+
+        for p, z in zip(self.p, self.z):
+            # p currently holds y_t; the gradient was taken there.
+            z.add_(adam_direction(p.grad, self.betas), alpha=-self.lr)
+            x = p.sub(z, alpha=self.beta).div_(1 - self.beta) # recover x from y, z
+            x.mul_(1 - c).add_(z, alpha=c)
+            p.copy_((1 - self.beta) * z + self.beta * x)      # next y
+```
+
+</CodeFrame>
+
+The swap in `eval_mode` is the practical trap. During training the parameter
+tensors hold $y$, which is not the model the method is claiming to produce —
+validate or checkpoint without swapping and the numbers are meaningfully worse
+than the ones in the paper, in a way that looks like the method not working.

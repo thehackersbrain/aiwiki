@@ -1,0 +1,114 @@
+---
+name: 'LangChain'
+desc: 'The composition framework everyone starts with, and the argument about whether to keep it.'
+category: 'tooling'
+complexity: '—'
+path: 'tooling/orchestration'
+difficulty: 'introductory'
+described: '2022'
+status: 'common'
+statusNote: 'Ubiquitous and contested. Widely adopted, widely abandoned after prototyping, and its graph library LangGraph is the part that has held up.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['tooling', 'orchestration', 'agents']
+lede: 'A large library of adapters and chains for wiring a model to everything else. Excellent for finding out what is possible, and routinely removed once a team knows what they are building.'
+implNote:
+  label: 'annotation'
+  html: 'The durable half is LangGraph, which models an agent as an explicit state machine. Cycles, checkpoints and interruption are what a real agent needs, and none of them fit the linear chain abstraction the project started from.'
+related: [llamaindex, agent-frameworks, model-context-protocol, vector-databases, ollama, prompt-injection-taxonomy]
+refs:
+  - cite: 'LangChain documentation'
+    id: 'python.langchain.com'
+    href: https://python.langchain.com
+  - cite: 'LangGraph documentation'
+    id: 'langchain-ai.github.io'
+    href: https://langchain-ai.github.io/langgraph/
+  - cite: 'Lewis et al. — Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks (2020)'
+    id: 'arXiv:2005.11401'
+    href: https://arxiv.org/abs/2005.11401
+---
+
+LangChain is a very large library of integrations — model providers, vector
+stores, document loaders, tools, output parsers — plus abstractions for composing
+them. It is where most people begin, and the criticism it attracts is worth
+understanding before either adopting or dismissing it.
+
+<CodeFrame meta="python">
+
+```python
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_ollama import ChatOllama
+
+prompt = ChatPromptTemplate.from_template(
+    "Answer using only this context.\n\n{context}\n\nQuestion: {question}"
+)
+
+# The pipe operator is the whole abstraction: each step is a callable
+# with a common interface, so they compose and stream.
+chain = prompt | ChatOllama(model="llama3.1") | StrOutputParser()
+chain.invoke({"context": docs, "question": "What is a capacity factor?"})
+```
+
+</CodeFrame>
+
+### What it is for
+
+- **Prototyping.** An idea reaches something runnable quickly, against whichever
+  provider and store you have.
+- **The integrations.** Several hundred adapters someone else has debugged. This
+  is the real asset, and it is why the library keeps being reached for.
+- **LangGraph**, which is a different and better thing — see below.
+
+### What it is criticised for
+
+**Abstraction depth.** A simple call goes through several layers, which makes
+behaviour hard to predict and failures hard to locate. A stack trace from inside
+a chain is not a pleasant object.
+
+**Churn.** The interfaces have been reorganised repeatedly. Examples written
+eighteen months ago frequently do not run.
+
+**Thin value over the API.** For a single call with a template, the direct
+provider SDK is shorter, faster and easier to debug. The framework earns its
+place when there are many steps, not one.
+
+The common trajectory — prototype with it, then replace it with about two hundred
+lines of your own — is a reasonable outcome rather than an indictment. It is
+faster to discover the shape of the problem inside a framework than to guess it.
+
+### LangGraph
+
+The part worth taking seriously. An agent is modelled as a graph of nodes over a
+shared state object, with explicit edges — including cycles.
+
+<CodeFrame meta="python">
+
+```python
+from langgraph.graph import StateGraph, END
+
+g = StateGraph(AgentState)
+g.add_node("think", call_model)
+g.add_node("act", run_tools)
+
+# The cycle is the point: act returns to think, and the loop is visible
+# in the graph rather than buried in a while statement.
+g.add_conditional_edges("think", lambda s: "act" if s["tool_calls"] else END)
+g.add_edge("act", "think")
+
+app = g.compile(checkpointer=SqliteSaver.from_conn_string("state.db"))
+```
+
+</CodeFrame>
+
+The checkpointer is what makes it more than a diagram. State is persisted per
+step, so a run can be resumed, inspected, rewound, or paused for human approval —
+which is the difference between a demo and something that can be operated.
+
+<Note label="caveat">
+Any framework that gives a model tools inherits the whole
+<a href="/entries/prompt-injection-taxonomy">prompt injection</a> problem, and
+none of them solves it. Retrieved documents and tool outputs are untrusted input
+arriving in the same channel as instructions. The framework will not tell you
+this; the boundary is yours to enforce.
+</Note>

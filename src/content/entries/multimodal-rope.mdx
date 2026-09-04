@@ -1,0 +1,140 @@
+---
+name: 'Multimodal RoPE'
+desc: 'Splitting the rotary dimensions across time, height and width for interleaved image and video input.'
+category: 'architectures'
+complexity: 'O(n·d)'
+path: 'architectures/position'
+difficulty: 'advanced'
+described: '2024'
+status: 'common'
+statusNote: 'The default for vision–language models with any temporal component. Qwen2-VL introduced it; most video-capable models since use a variant.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['position', 'attention', 'multimodal']
+lede: 'A flattened image has no meaningful one-dimensional position. Partition the rotary dimensions into three groups, give each its own coordinate, and the same mechanism handles text, pictures and video without changing shape.'
+implNote:
+  label: 'in practice'
+  html: 'The scheme must degenerate exactly to 1-D RoPE on text — set all three coordinates equal — or a text-pretrained backbone loses its positional behaviour the moment vision is bolted on.'
+related: [rotary-position-embedding, rope-scaling, cross-attention, scaled-dot-product-attention, sinusoidal-position-encoding]
+refs:
+  - cite: 'Wang et al. — Qwen2-VL: Enhancing Vision-Language Model’s Perception of the World at Any Resolution (2024)'
+    id: 'arXiv:2409.12191'
+    href: https://arxiv.org/abs/2409.12191
+  - cite: 'Heo et al. — Rotary Position Embedding for Vision Transformer (2024)'
+    id: 'arXiv:2403.13298'
+    href: https://arxiv.org/abs/2403.13298
+  - cite: 'Su et al. — RoFormer: Rotary Position Embedding (2021)'
+    id: 'arXiv:2104.09864'
+    href: https://arxiv.org/abs/2104.09864
+---
+
+Feeding an image to a language model means flattening a grid into a sequence. Do
+that and [RoPE](/entries/rotary-position-embedding) makes a claim that is simply
+false: that patch 32 and patch 33 are adjacent. On a 32-wide grid they are
+vertical neighbours in different rows, and the patch directly below patch 32 is
+patch 64 — an offset of 32, indistinguishable from thirty-two steps along a line
+of text.
+
+The fix is to stop using one coordinate.
+
+### Partitioning the dimensions
+
+RoPE applies an independent rotation to each dimension pair. Nothing requires
+every pair to be driven by the *same* position. Qwen2-VL splits the pairs into
+three contiguous groups and assigns each a coordinate: temporal, height, width.
+
+<Eq lead caption="eq. 1 — three position indices, one rotation">
+
+$$
+\theta^{(i)}_{p} =
+\begin{cases}
+t \cdot \omega_i & i \in \mathcal{T} \\
+h \cdot \omega_i & i \in \mathcal{H} \\
+w \cdot \omega_i & i \in \mathcal{W}
+\end{cases}
+$$
+
+</Eq>
+
+with the split weighted towards the temporal group — 16 : 24 : 24 of 64 pairs in
+the released configuration, the low-frequency (long-wavelength) pairs going to
+time, since that coordinate ranges furthest.
+
+The relative-offset property survives group by group. A query and key in the same
+group still see only their difference, so the model reads vertical offset from
+$\mathcal{H}$, horizontal offset from $\mathcal{W}$, and frame offset from
+$\mathcal{T}$, all out of a single dot product.
+
+<Note label="annotation">
+Text tokens set $t = h = w = p$. All three groups then rotate by the same angle
+and the whole construction collapses to ordinary 1-D RoPE — which is what makes
+it safe to graft onto a text-pretrained backbone.
+</Note>
+
+### Position ids across a mixed sequence
+
+The bookkeeping is where implementations get this wrong. Coordinates are assigned
+per segment, and each segment starts after the maximum coordinate used by the
+one before it:
+
+- **Text**: $t = h = w$, incrementing by one per token.
+- **Image**: one $t$ for the whole picture; $h$ and $w$ from the patch grid.
+- **Video**: $t$ increments per frame; $h, w$ from the grid, reset each frame.
+
+<Eq caption="eq. 2 — the next segment starts past everything before it">
+
+$$
+\mathrm{start}_{s+1} = 1 + \max\bigl(t_s,\, h_s,\, w_s\bigr)
+$$
+
+</Eq>
+
+Without that rule a 24 × 24 image would consume 24 positions of text budget in
+$h$ and $w$ but only one in $t$, and the following text would overlap the image
+in two of the three groups.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch · position ids for a mixed sequence">
+
+```python
+import torch
+from torch import Tensor
+
+
+def mrope_position_ids(segments: list[tuple[str, tuple[int, ...]]]) -> Tensor:
+    """[3, T] of (t, h, w) ids. Segments are ('text', (n,)) or ('image', (f, gh, gw))."""
+    ids: list[Tensor] = []
+    offset = 0
+
+    for kind, shape in segments:
+        if kind == "text":
+            (n,) = shape
+            p = torch.arange(offset, offset + n)
+            ids.append(p.expand(3, n))                        # t = h = w
+        else:
+            f, gh, gw = shape
+            t = torch.arange(f).repeat_interleave(gh * gw) + offset
+            h = torch.arange(gh).repeat_interleave(gw).repeat(f) + offset
+            w = torch.arange(gw).repeat(f * gh) + offset
+            ids.append(torch.stack([t, h, w]))
+
+        offset = int(ids[-1].max()) + 1                       # next segment starts clear
+
+    return torch.cat(ids, dim=-1)
+```
+
+</CodeFrame>
+
+The compression matters as much as the layout. Qwen2-VL merges 2 × 2 neighbouring
+patches before the language model sees them, so a 448 × 448 image costs 256
+tokens rather than 1024 — and the $h, w$ ids above are for the merged grid, not
+the raw one.
+
+<Rule label="Vision-only variants" />
+
+A plain vision transformer needs the same idea with the temporal group dropped:
+half the pairs on $h$, half on $w$. Heo et al. show this beats the interpolated
+learned table that ViT normally uses, and beats it by more as the evaluation
+resolution moves further from the training resolution — the familiar argument for
+relative over absolute, arriving in vision several years after language.

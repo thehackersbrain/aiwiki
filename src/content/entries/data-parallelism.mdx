@@ -1,0 +1,160 @@
+---
+name: 'Data Parallelism'
+desc: 'Replicate the model, split the batch, average the gradients.'
+category: 'training'
+complexity: 'O(P)'
+memory: 'O(P)'
+path: 'training/distributed'
+difficulty: 'introductory'
+described: '2012'
+status: 'standard'
+statusNote: 'The outermost layer of every distributed run. Pure replication is obsolete — ZeRO or FSDP shard the state — but the batch-splitting structure is unchanged.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['distributed', 'training', 'core']
+lede: 'The simplest parallelism and the one that scales furthest: every device holds the whole model, sees a different slice of the batch, and one all-reduce keeps them identical.'
+metrics:
+  caption: 'Per step, per rank'
+  rows:
+    - { label: 'Communication', value: '2P bytes' }
+    - { label: 'Independent of', value: 'rank count' }
+    - { label: 'Memory', value: 'full replica', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'The ranks must stay bitwise identical. A different seed, a different dropout mask, or a rank that skips a step because its micro-batch was empty causes silent divergence — the loss stays plausible and the model is being trained by N slightly different optimisers.'
+related: [collective-communication, zero-sharding, gradient-accumulation, tensor-parallelism, learning-rate-schedules, parallelism-composition]
+refs:
+  - cite: 'Dean et al. — Large Scale Distributed Deep Networks (2012)'
+    id: 'NeurIPS 2012'
+    href: https://papers.nips.cc/paper/2012/hash/6aca97005c68f1206823815f66102863-Abstract.html
+  - cite: 'Goyal et al. — Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour (2017)'
+    id: 'arXiv:1706.02677'
+    href: https://arxiv.org/abs/1706.02677
+  - cite: 'Li et al. — PyTorch Distributed: Experiences on Accelerating Data Parallel Training (2020)'
+    id: 'arXiv:2006.15704'
+    href: https://arxiv.org/abs/2006.15704
+---
+
+The gradient of a sum is the sum of gradients, so the batch can be split across
+devices and the results added. This is
+[gradient accumulation](/entries/gradient-accumulation) with the micro-batches
+running concurrently rather than in sequence.
+
+<Eq lead caption="eq. 1 — one collective per step, and that is the whole method">
+
+$$
+g = \frac{1}{N}\sum_{i=1}^{N} g_i
+\quad\longleftarrow\quad \texttt{all\_reduce(g, AVG)}
+$$
+
+</Eq>
+
+Every rank starts from identical weights, computes on its own shard of the batch,
+all-reduces, and steps. Because all ranks apply the same averaged gradient to the
+same weights, they remain identical without anything being synchronised except
+that one tensor.
+
+### Why it scales
+
+The [all-reduce](/entries/collective-communication) moves $2P$ bytes per rank
+regardless of how many ranks there are. Compute per rank is constant. So the
+communication-to-compute ratio does not degrade with scale, and that is the
+property no other parallelism strategy has.
+
+<Eq caption="eq. 2 — what has to hold for the collective to be free">
+
+$$
+\frac{\text{step compute}}{\text{throughput}} \;\ge\; \frac{2P}{B_{\text{net}}}
+$$
+
+</Eq>
+
+Larger micro-batches make the left side bigger without changing the right, which
+is why data parallelism wants as much local batch as memory allows — and why
+[activation memory](/entries/activation-memory-accounting) is the constraint that
+binds first.
+
+### Overlapping the collective
+
+The gradient for the last layer is ready long before the first layer's. DDP
+exploits this: it registers autograd hooks, buckets gradients as they become
+available, and launches an all-reduce per bucket while the backward pass is still
+running. By the time the backward finishes, most of the communication is done.
+
+<Note label="annotation">
+This is why DDP is substantially faster than a manual loop that calls
+<code>all_reduce</code> after <code>backward()</code>. The naïve version
+serialises compute and communication; DDP hides one inside the other, and on a
+slow interconnect that is most of the step time.
+</Note>
+
+### Batch size and the learning rate
+
+Doubling the ranks doubles the effective batch, which changes the optimisation
+problem. Goyal et al.'s two rules are still the practical answer:
+
+**Linear scaling.** Multiply the learning rate by the number of ranks. The
+gradient's variance falls as $1/N$, so a proportionally larger step is
+justified — up to a point.
+
+**Warmup.** Ramp to the scaled rate over a few epochs. The linear rule fails at
+the start of training, when the loss surface changes fastest.
+
+Both hold to a limit. Past a critical batch size, additional examples stop
+reducing gradient variance meaningfully and the extra compute buys nothing —
+the quantity [Kaplan et al.](/entries/kaplan-scaling-laws) estimated and the
+reason data parallelism eventually stops being the answer.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data import DataLoader, DistributedSampler
+
+
+def setup(model, dataset, batch: int, accum: int):
+    dist.init_process_group("nccl")
+    rank, world = dist.get_rank(), dist.get_world_size()
+    torch.cuda.set_device(rank)
+
+    model = DDP(model.cuda(rank), device_ids=[rank], gradient_as_bucket_view=True)
+
+    # Without the sampler every rank sees the same data and the whole
+    # exercise averages N copies of one gradient.
+    sampler = DistributedSampler(dataset, num_replicas=world, rank=rank)
+    loader = DataLoader(dataset, batch_size=batch, sampler=sampler)
+    return model, loader, sampler
+
+
+def epoch(model, loader, sampler, opt, epoch_idx: int, accum: int):
+    # Reshuffles per epoch, identically on every rank. Omit it and every
+    # epoch sees the same order.
+    sampler.set_epoch(epoch_idx)
+
+    for i, batch in enumerate(loader):
+        sync = (i + 1) % accum == 0
+        with model.no_sync() if not sync else contextlib.nullcontext():
+            (model(**batch).loss / accum).backward()
+        if sync:
+            opt.step()
+            opt.zero_grad(set_to_none=True)
+```
+
+</CodeFrame>
+
+`set_epoch` is the line everyone forgets. Without it `DistributedSampler` uses
+the same permutation every epoch, so the model sees an identical data order
+throughout training — which degrades the result and produces no error.
+
+<Rule label="What replaced pure replication" />
+
+Every rank holding a full copy of the parameters, gradients and optimiser state
+is $16P$ bytes per device to store one model's worth of information $N$ times.
+[ZeRO](/entries/zero-sharding) shards all three across the data-parallel group,
+and FSDP is the same idea in PyTorch. Both keep the structure above — split the
+batch, average the gradients — and change only what is resident between steps,
+which is why "data parallelism" now nearly always means one of them.

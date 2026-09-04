@@ -1,0 +1,213 @@
+---
+import { getCollection, getEntry, render, type CollectionEntry } from 'astro:content';
+import {
+  isoDate,
+  metaDescription,
+  relativeDate,
+  seriesNeighbours,
+} from '../../lib/grimoire';
+import { breadcrumbs, noteNode, siteNodes } from '../../lib/schema';
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import Rail from '../../components/Rail.astro';
+import Breadcrumb from '../../components/Breadcrumb.astro';
+import Note from '../../components/mdx/Note.astro';
+import Eq from '../../components/mdx/Eq.astro';
+import CodeFrame from '../../components/mdx/CodeFrame.astro';
+import Rule from '../../components/mdx/Rule.astro';
+import 'katex/dist/katex.min.css';
+
+export async function getStaticPaths() {
+  const notes = await getCollection('notes');
+  return notes.map((note) => ({ params: { slug: note.id }, props: { note } }));
+}
+
+interface Props {
+  note: CollectionEntry<'notes'>;
+}
+
+const { note } = Astro.props;
+const data = note.data;
+const { Content } = await render(note);
+const { series, prev, next, parts } = await seriesNeighbours(note);
+
+const related = (
+  await Promise.all(data.related.map((ref) => getEntry(ref)))
+).filter((e): e is CollectionEntry<'entries'> => e !== undefined);
+
+const shortcodes = { Note, Eq, CodeFrame, Rule };
+
+const trail = [
+  { label: 'AI Grimoire', href: '/' },
+  { label: 'Notes', href: '/notes' },
+  ...(series ? [{ label: series.data.name, href: '/notes' }] : []),
+  { label: data.title },
+];
+---
+
+<BaseLayout
+  title={data.title}
+  tabTitle={`${data.title} — AI Grimoire`}
+  description={metaDescription(data.lede)}
+  nav="notes"
+  type="article"
+  image="/og/default.png"
+  imageAlt={data.title}
+  publishedTime={data.added}
+  modifiedTime={data.revised}
+  section={series?.data.name ?? 'Notes'}
+  tags={data.tags}
+  schema={[
+    ...siteNodes(),
+    noteNode(note, series?.data.name ?? 'Notes'),
+    breadcrumbs([
+      { name: 'AI Grimoire', path: '/' },
+      { name: 'Notes', path: '/notes' },
+      { name: data.title },
+    ]),
+  ]}
+>
+  <main class="mx-auto max-w-[70%] animate-rise px-6 pb-20 sm:px-12">
+    <Breadcrumb trail={trail} />
+
+    <Rail class="pt-12 pb-9">
+      <div slot="rail" class="font-mono text-[11px] leading-[2] text-dim">
+        <div class="label mb-3 text-accent">
+          {series ? `Part ${data.part} of ${parts.length}` : 'Note'}
+        </div>
+        {
+          parts.map((p) => (
+            <a
+              href={`/notes/${p.id}`}
+              class:list={[
+                'block py-0.5',
+                p.id === note.id ? 'text-chalk' : 'text-mute-2 hover:text-chalk',
+              ]}
+            >
+              {String(p.data.part ?? 0).padStart(2, '0')} · {p.data.title}
+            </a>
+          ))
+        }
+        <div class="mt-3 border-t border-rule-faint pt-2 text-dim-2">
+          {data.minutes} min · revised {relativeDate(data.revised)}
+        </div>
+      </div>
+
+      <h1
+        class="mt-0 mb-3.5 max-w-[30ch] text-[30px] leading-[1.14] font-normal tracking-[-0.024em] text-bone sm:text-[40px]"
+      >
+        {data.title}
+      </h1>
+      <p
+        class="mt-0 mb-5.5 max-w-[62ch] text-[18px] text-lede text-pretty"
+        set:html={data.lede}
+      />
+      <div class="flex flex-wrap gap-1.5 font-mono text-[10px] tracking-[0.1em]">
+        {
+          data.tags.map((tag) => (
+            <a
+              href={`/entries?tag=${encodeURIComponent(tag)}`}
+              class="border border-accent-edge bg-accent-wash px-2 py-1 whitespace-nowrap text-accent hover:text-accent-hi"
+            >
+              [{tag}]
+            </a>
+          ))
+        }
+      </div>
+    </Rail>
+
+    {
+      data.unfinished && (
+        <Rail labelAs="h2" label="Open">
+          <p class="mt-0 mb-0 max-w-[62ch] text-[17px] text-lede text-pretty">
+            This note is still open — I have not finished thinking it through.
+            What is written below is where the reasoning has got to, including
+            the parts I am not sure about, which are marked as such.
+          </p>
+        </Rail>
+      )
+    }
+
+    <section class="border-b border-rule py-11">
+      <div class="entry-prose md:ml-[258px]">
+        <Content components={shortcodes} />
+      </div>
+    </section>
+
+    {
+      (prev || next) && (
+        <Rail labelAs="h2" label="Series" class="py-9">
+          <div class="grid gap-3 sm:grid-cols-2">
+            {prev ? (
+              <a
+                href={`/notes/${prev.id}`}
+                class="block border border-edge px-4 py-3 transition-colors hover:border-accent"
+              >
+                <div class="eyebrow text-dim-2">← Part {prev.data.part}</div>
+                <div class="mt-1 text-[17px] text-bone">{prev.data.title}</div>
+              </a>
+            ) : (
+              <span />
+            )}
+            {next && (
+              <a
+                href={`/notes/${next.id}`}
+                class="block border border-edge px-4 py-3 transition-colors hover:border-accent sm:text-right"
+              >
+                <div class="eyebrow text-dim-2">Part {next.data.part} →</div>
+                <div class="mt-1 text-[17px] text-bone">{next.data.title}</div>
+              </a>
+            )}
+          </div>
+        </Rail>
+      )
+    }
+
+    {
+      related.length > 0 && (
+        <Rail labelAs="h2" label="Reference" class="py-9">
+          <p class="mt-0 mb-4 max-w-[62ch] text-[16px] text-dim italic">
+            The settled statements of what this note works through.
+          </p>
+          <div class="flex flex-wrap gap-2">
+            {related.map((r) => (
+              <a
+                href={`/entries/${r.id}`}
+                title={r.data.desc}
+                class="border border-edge px-3 py-1.5 font-mono text-[12px] whitespace-nowrap text-mute transition-colors hover:border-accent hover:text-chalk"
+              >
+                {r.id}
+              </a>
+            ))}
+          </div>
+        </Rail>
+      )
+    }
+
+    {
+      data.refs.length > 0 && (
+        <Rail labelAs="h2" label="References" divider={false} class="pt-9">
+          {data.refs.map((ref, i) => (
+            <div class="grid grid-cols-[30px_minmax(0,1fr)] items-baseline gap-x-4 gap-y-1 border-b border-rule-faint py-3 sm:grid-cols-[30px_minmax(0,1fr)_150px]">
+              <span class="font-mono text-[11px] text-dim-3">[{i + 1}]</span>
+              <span class="text-[15px] text-prose">{ref.cite}</span>
+              <span class="col-start-2 font-mono text-[11px] text-accent sm:col-start-3 sm:text-right">
+                {ref.href ? (
+                  <a href={ref.href} rel="noreferrer" target="_blank">
+                    {ref.id}
+                  </a>
+                ) : (
+                  ref.id
+                )}
+              </span>
+            </div>
+          ))}
+        </Rail>
+      )
+    }
+
+    <p class="mt-9 font-mono text-[11px] text-dim-3">
+      <time datetime={isoDate(data.added)}>written {isoDate(data.added)}</time> ·
+      <time datetime={isoDate(data.revised)}>revised {isoDate(data.revised)}</time>
+    </p>
+  </main>
+</BaseLayout>

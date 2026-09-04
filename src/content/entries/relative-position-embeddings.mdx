@@ -1,0 +1,130 @@
+---
+name: 'Relative Position Embeddings'
+desc: 'Learned vectors indexed by query–key offset, injected into the score rather than the input.'
+category: 'architectures'
+complexity: 'O(n²·d)'
+memory: 'O(n²·d)'
+path: 'architectures/position'
+difficulty: 'intermediate'
+described: '2018'
+status: 'superseded'
+statusNote: 'The idea won and the implementation lost. Offset-based position is now universal; nobody pays this scheme’s quadratic memory for it.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['position', 'attention']
+lede: 'Position stops being a property of a token and becomes a property of a pair. The model is given a learned vector for "eleven tokens back" and never told where in the sequence it is.'
+implNote:
+  label: 'caveat'
+  html: 'The naïve implementation materialises an <code>[n, n, d]</code> tensor. At n = 4096 and d = 64 that is 4 GB in fp32 per layer — which is why the skewing trick below is not an optimisation but a prerequisite.'
+related: [sinusoidal-position-encoding, t5-relative-position-bias, rotary-position-embedding, scaled-dot-product-attention, alibi]
+refs:
+  - cite: 'Shaw et al. — Self-Attention with Relative Position Representations (2018)'
+    id: 'arXiv:1803.02155'
+    href: https://arxiv.org/abs/1803.02155
+  - cite: 'Dai et al. — Transformer-XL: Attentive Language Models Beyond a Fixed-Length Context (2019)'
+    id: 'arXiv:1901.02860'
+    href: https://arxiv.org/abs/1901.02860
+  - cite: 'Huang et al. — Music Transformer (2018)'
+    id: 'arXiv:1809.04281'
+    href: https://arxiv.org/abs/1809.04281
+---
+
+Absolute schemes answer "where is this token". Almost nothing a language model
+does needs that answer. Agreement, coreference, bracket matching, the local
+syntax that most heads are doing — all of it is about *distance between* two
+tokens, and the absolute index is a detour.
+
+Shaw et al. cut the detour out. Keep a learned table indexed by offset, and add
+the entry for $j - i$ to the key (and optionally the value) when computing the
+score for the pair $(i, j)$.
+
+<Eq lead caption="eq. 1 — the offset enters the score directly">
+
+$$
+e_{ij} = \frac{q_i^\top \bigl(k_j + a^K_{\,j-i}\bigr)}{\sqrt{d_k}},
+\qquad
+z_i = \sum_j \alpha_{ij}\bigl(v_j + a^V_{\,j-i}\bigr)
+$$
+
+</Eq>
+
+The offset is clipped to a window: every distance beyond $\pm k$ shares the
+outermost entry. Shaw found $k = 16$ sufficient for translation, which is a
+strong claim about how local the useful signal is — everything further away is
+told only "far", and the model still works.
+
+<Note label="annotation">
+Clipping is what makes the table finite, and it is also what makes the scheme
+extrapolate trivially: a sequence longer than training contains no offset the
+table has not already collapsed into its outermost bucket. It extrapolates by
+declining to distinguish.
+</Note>
+
+### Transformer-XL's decomposition
+
+Dai et al. rederived it from the four-term expansion of an absolute score, and
+replaced each positional piece with something offset-indexed:
+
+<Eq caption="eq. 2 — content and position, separated on purpose">
+
+$$
+e_{ij} = \underbrace{q_i^\top k_j}_{\text{(a) content}}
++ \underbrace{q_i^\top W_R r_{i-j}}_{\text{(b) content–position}}
++ \underbrace{u^\top k_j}_{\text{(c) content bias}}
++ \underbrace{w^\top W_R r_{i-j}}_{\text{(d) position bias}}
+$$
+
+</Eq>
+
+Terms (c) and (d) replace the query's absolute position — which cannot appear,
+because the query has none — with learned global vectors $u$ and $w$. Term (b) is
+the one that does the work: a content-dependent read of the offset, so a head can
+learn "attend three back *if you are a verb*" rather than "attend three back".
+
+This is the form that stuck. [T5's bias](/entries/t5-relative-position-bias)
+drops (b) and keeps a scalar version of (d); [ALiBi](/entries/alibi) fixes (d) to
+a straight line and drops the rest; [RoPE](/entries/rotary-position-embedding)
+gets (b) for free by rotating $q$ and $k$ instead of adding anything.
+
+### The memory problem
+
+Terms (b) and (d) need $r_{i-j}$ for every pair. Built directly that is an
+$[n, n, d]$ tensor, which is worse than the attention matrix it decorates — and
+it defeats [FlashAttention](/entries/flash-attention), which exists precisely to
+avoid instantiating anything $n \times n$.
+
+The escape is that $r_{i-j}$ is a Toeplitz matrix: it has only $2n - 1$ distinct
+rows, arranged in shifted diagonals. Compute the $[n, 2n-1]$ product once and
+shift each row into place with a pad-and-reshape.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch · the skewing trick">
+
+```python
+import torch
+from torch import Tensor
+
+
+def skew(qr: Tensor) -> Tensor:
+    """[B, H, n, 2n-1] of q·r_k  →  [B, H, n, n] indexed by (i, j).
+
+    Row i needs r_{i-j} for j = 0..n-1, which is row i of the input shifted by i.
+    A pad of one column per row turns the shift into a reshape.
+    """
+    b, h, n, _ = qr.shape
+    qr = torch.nn.functional.pad(qr, (0, 1))                  # [B, H, n, 2n]
+    qr = qr.reshape(b, h, 2 * n * n).narrow(2, n - 1, n * (2 * n - 1))
+    return qr.reshape(b, h, n, 2 * n - 1).narrow(3, 0, n)
+
+
+def relative_scores(q: Tensor, r: Tensor) -> Tensor:          # r: [2n-1, d]
+    return skew(torch.einsum("bhnd,kd->bhnk", q, r))
+```
+
+</CodeFrame>
+
+Correct, $O(n^2)$ rather than $O(n^2 d)$ in memory, and still an explicit score
+matrix. That last point is why the scheme did not survive: it is structurally
+incompatible with fused attention kernels, whereas rotary embeddings apply to $q$
+and $k$ before the kernel ever sees them and cost the kernel nothing at all.

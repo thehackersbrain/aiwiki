@@ -1,0 +1,112 @@
+---
+name: 'DoRA'
+desc: 'Low-rank adaptation split into a magnitude and a direction.'
+category: 'fine-tuning'
+complexity: 'O(r·d)'
+path: 'fine-tuning/peft'
+difficulty: 'advanced'
+described: '2024'
+status: 'common'
+statusNote: 'A consistent small improvement over LoRA at a small extra cost. Adopted where the margin matters.'
+revised: 2026-07-17
+added: 2025-04-30
+tags: ['fine-tuning', 'peft']
+lede: 'Decompose each weight column into a magnitude and a unit direction, adapt the direction with LoRA and the magnitude with a scalar. Recovers most of the gap to full fine-tuning at low rank.'
+implNote:
+  label: 'caveat'
+  html: 'The column norm sits inside the forward pass, so DoRA costs real time to train — noticeably more than LoRA. It still merges to nothing at inference.'
+related: [lora, qlora, adapter-merging]
+refs:
+  - cite: 'Liu et al. — DoRA: Weight-Decomposed Low-Rank Adaptation (2024)'
+    id: 'arXiv:2402.09353'
+    href: https://arxiv.org/abs/2402.09353
+  - cite: 'Hu et al. — LoRA: Low-Rank Adaptation of Large Language Models (2021)'
+    id: 'arXiv:2106.09685'
+    href: https://arxiv.org/abs/2106.09685
+  - cite: 'Salimans & Kingma — Weight Normalization (2016)'
+    id: 'arXiv:1602.07868'
+    href: https://arxiv.org/abs/1602.07868
+---
+
+The motivating measurement comes first. Take a full fine-tune, decompose the
+weight change into a change in each column's magnitude and a change in its
+direction, and plot the two against each other. Full fine-tuning shows a
+negative correlation — it makes large directional changes with small magnitude
+changes, or the reverse. LoRA shows a positive one: it moves both together,
+because a rank-$r$ additive update cannot easily do otherwise.
+
+<Note label="annotation">
+This is a rare case of a method designed backwards from a diagnostic. The
+decomposition was a measurement tool first and a parameterisation second.
+</Note>
+
+DoRA adopts the decomposition as the parameterisation. Write $W$ as a
+per-column magnitude vector $m$ times a column-normalised direction matrix, then
+adapt the direction with LoRA and let $m$ train freely.
+
+<Eq caption="eq. 1 — ‖·‖_c is the column-wise 2-norm" source="Liu et al. §4" lead>
+
+$$
+W' = m \odot \frac{W_0 + BA}{\lVert W_0 + BA \rVert_c}
+$$
+
+</Eq>
+
+$m$ is initialised to $\lVert W_0 \rVert_c$ and $B$ at zero, so training starts
+exactly at $W_0$ as it does for LoRA. The normalisation is what decouples the
+two: however far $BA$ pushes a column, the magnitude is set by $m$ alone.
+
+<Eq caption="eq. 2 — parameters added, per adapted matrix">
+
+$$
+\underbrace{r(d + k)}_{\text{LoRA}} \;+\; \underbrace{k}_{\text{magnitude}}
+$$
+
+</Eq>
+
+The magnitude vector costs one scalar per output column — a rounding error
+against the low-rank factors, and the reason DoRA is compared against LoRA at
+equal rank rather than equal parameters.
+
+> Where it earns its keep is at rank 4 and 8, where LoRA is capacity-starved.
+> By rank 64 the two converge, and the extra forward-pass cost stops paying for
+> itself.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch ≥ 2.1">
+
+```python
+import math
+import torch
+from torch import Tensor, nn
+
+
+class DoRALinear(nn.Module):
+    def __init__(self, base: nn.Linear, r: int = 8, alpha: int = 16):
+        super().__init__()
+        self.base = base
+        self.base.requires_grad_(False)
+
+        self.A = nn.Parameter(torch.empty(r, base.in_features))
+        self.B = nn.Parameter(torch.zeros(base.out_features, r))
+        nn.init.kaiming_uniform_(self.A, a=math.sqrt(5))
+        self.scale = alpha / r
+
+        # one magnitude per output column, initialised from the base weight
+        norm = base.weight.norm(dim=1, keepdim=True)
+        self.magnitude = nn.Parameter(norm.detach().clone())
+
+    def forward(self, x: Tensor) -> Tensor:
+        weight = self.base.weight + (self.B @ self.A) * self.scale
+        direction = weight / weight.norm(dim=1, keepdim=True).detach()
+        return nn.functional.linear(x, self.magnitude * direction)
+```
+
+</CodeFrame>
+
+The `.detach()` on the norm is from the paper and is not optional: letting the
+gradient flow through the normaliser roughly doubles the backward-pass memory
+for no measured gain. Note that the merged weight must be materialised each
+forward pass to compute the column norms, which is precisely the cost LoRA
+avoids by keeping the factors separate.

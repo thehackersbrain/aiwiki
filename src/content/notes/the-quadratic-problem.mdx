@@ -1,0 +1,136 @@
+---
+title: 'The quadratic problem'
+desc: 'Where the n² really comes from, and why the escape routes divide into exactly three kinds.'
+lede: 'Attention is called quadratic in time and memory, and the two are not the same claim — one is a law and the other is an implementation choice. Separating them is what made the whole efficiency literature legible to me.'
+series: 'attention-from-scratch'
+part: 4
+minutes: 9
+revised: 2026-09-01
+added: 2026-08-24
+tags: ['attention', 'efficiency', 'foundations']
+related: [flash-attention, linear-attention, sliding-window-attention, scaled-dot-product-attention, state-space-models]
+refs:
+  - cite: 'Dao et al. — FlashAttention: Fast and Memory-Efficient Exact Attention (2022)'
+    id: 'arXiv:2205.14135'
+    href: https://arxiv.org/abs/2205.14135
+  - cite: 'Rabe & Staats — Self-attention Does Not Need O(n²) Memory (2021)'
+    id: 'arXiv:2112.05682'
+    href: https://arxiv.org/abs/2112.05682
+  - cite: 'Katharopoulos et al. — Transformers are RNNs (2020)'
+    id: 'arXiv:2006.16236'
+    href: https://arxiv.org/abs/2006.16236
+  - cite: 'Tay et al. — Long Range Arena: A Benchmark for Efficient Transformers (2020)'
+    id: 'arXiv:2011.04006'
+    href: https://arxiv.org/abs/2011.04006
+---
+
+"Attention is $O(n^2)$" is said so often that I repeated it for a year without
+noticing it conflates two different things.
+
+<Eq caption="eq. 1 — two costs, one usually misattributed to the other" lead>
+
+$$
+\underbrace{2 n^2 d}_{\text{FLOPs: unavoidable, given the operation}}
+\qquad\text{versus}\qquad
+\underbrace{n^2}_{\text{memory: an implementation choice}}
+$$
+
+</Eq>
+
+The arithmetic is quadratic because the operation genuinely compares every query
+with every key — that is what it is for, and no amount of engineering removes it
+while computing the same function. The *memory* is quadratic only because the
+naive implementation writes $S = QK^\top$ to memory, softmaxes it, and reads it
+back.
+
+Those two facts have entirely different escape routes, and almost every "efficient
+attention" paper is one of exactly three responses.
+
+### One: don't materialise it
+
+The $n \times n$ matrix never needs to exist all at once. Softmax can be computed
+in a streaming pass — keep a running maximum and a running sum, rescale when the
+maximum moves — so attention can be tiled: load a block of queries and a block of
+keys, accumulate that block's contribution to the output, discard the block's
+scores, move on.
+
+<Note label="annotation">
+This is the online-softmax trick, and it is the entire mathematical content of
+FlashAttention. Everything else in that paper is about which tile sizes keep the
+working set in SRAM.
+</Note>
+
+Memory drops to $O(n)$ and the *result is bit-for-bit the same function*. The
+FLOPs are unchanged — slightly increased, in fact, because the backward pass
+recomputes scores rather than storing them — and it is still much faster, because
+the operation was bound by memory bandwidth rather than arithmetic.
+
+This is the free one. There is no accuracy trade, so
+[FlashAttention](/entries/flash-attention) is not an approximation you weigh up;
+it is what you should be running.
+
+### Two: don't compute all of it
+
+If most of the matrix is going to be near zero anyway, decide in advance which
+entries to skip. [Sliding windows](/entries/sliding-window-attention), block
+sparsity, global tokens attended to by everyone: all of them are a mask chosen
+before the scores are computed, so the masked tiles are never launched.
+
+<Eq caption="eq. 2 — a band mask, and the depth needed to cross the sequence">
+
+$$
+\text{cost} = O(n \cdot w \cdot d),
+\qquad
+\text{receptive field after } L \text{ layers} = L \cdot w
+$$
+
+</Eq>
+
+The trade is explicit and it is a *depth* trade rather than an accuracy trade:
+information can still cross the sequence, but it needs $n/w$ layers to do it.
+For a 32-layer model with $w = 512$ that is fine up to about 16k tokens and a
+problem beyond it.
+
+<Note label="caveat">
+Sliding windows also break in a way that has nothing to do with the receptive
+field — evicting the first tokens destroys the model's
+[attention sinks](/entries/attention-sinks). That cost me an afternoon.
+</Note>
+
+### Three: change the operation
+
+Replace the softmax so that the matrix multiplications reassociate.
+$(\phi(Q)\phi(K)^\top)V$ is $O(n^2 d)$; $\phi(Q)(\phi(K)^\top V)$ is $O(n d^2)$,
+and they are equal, because matrix multiplication is associative and the softmax
+was the only thing standing in the way.
+
+This is the honest one and the expensive one. You are no longer computing
+attention — you are computing a different operation that keeps a fixed-size
+$d \times d$ state, which makes it a linear RNN and caps how much it can recall at
+$d^2$ regardless of $n$. [Linear attention](/entries/linear-attention) and
+[state space models](/entries/state-space-models) both live here, and the gap
+they have to close is exact recall of a specific earlier token.
+
+### The comparison table I keep
+
+| | FLOPs | Memory | Same function? |
+|---|---|---|---|
+| Naive | $O(n^2 d)$ | $O(n^2)$ | — |
+| Tiled (Flash) | $O(n^2 d)$ | $O(n)$ | yes, exactly |
+| Sparse / windowed | $O(n w d)$ | $O(n w)$ | no — restricted |
+| Linear | $O(n d^2)$ | $O(d^2)$ | no — different |
+
+### What I actually concluded
+
+The efficient-attention literature looked, for a long time, like a pile of
+interchangeable tricks. Sorted into these three columns it stops being a pile.
+
+The first column is free and you should always take it. The second is a bounded,
+well-understood trade you take when your context is long and mostly local. The
+third is a genuine architectural bet, and the Long Range Arena results are a
+useful corrective here: many methods that beat attention on synthetic long-range
+tasks lose to a tiled exact implementation on real language, because a 4× FLOP
+saving does not help if the operation you replaced it with cannot recall a name
+from 3000 tokens ago.
+
+The order I now try things in is exactly that order.

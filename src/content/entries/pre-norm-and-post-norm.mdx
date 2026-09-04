@@ -1,0 +1,155 @@
+---
+name: 'Pre-Norm and Post-Norm'
+desc: 'Where the normalisation sits relative to the residual add, and what each choice costs.'
+category: 'architectures'
+complexity: '—'
+path: 'architectures/normalisation'
+difficulty: 'intermediate'
+described: '2019'
+status: 'standard'
+statusNote: 'Pre-norm is effectively unanimous in models above a few billion parameters. The argument is settled; the variants below are attempts to recover what it gives up.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['normalisation', 'training', 'core']
+lede: 'The most consequential one-line difference in the transformer. Put the norm inside the residual branch and the model trains without warmup; put it after the add and it trains better, if it trains at all.'
+metrics:
+  caption: 'Post-norm gradient at initialisation'
+  rows:
+    - { label: 'Scale at layer L', value: 'O(√(ln d))' }
+    - { label: 'Pre-norm equivalent', value: 'O(√(ln d / L))' }
+    - { label: 'Warmup needed', value: 'post-norm only', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'A pre-norm stack needs one extra normalisation after the last block, before the output projection — the residual stream is never normalised on its own path, so without it the logits see an unnormalised sum of every layer.'
+related: [layer-normalisation, rmsnorm, deepnorm, learning-rate-schedules, gradient-checkpointing]
+refs:
+  - cite: 'Xiong et al. — On Layer Normalization in the Transformer Architecture (2020)'
+    id: 'arXiv:2002.04745'
+    href: https://arxiv.org/abs/2002.04745
+  - cite: 'Wang et al. — DeepNet: Scaling Transformers to 1,000 Layers (2022)'
+    id: 'arXiv:2203.00555'
+    href: https://arxiv.org/abs/2203.00555
+  - cite: 'Nguyen & Salazar — Transformers without Tears: Improving the Normalization of Self-Attention (2019)'
+    id: 'arXiv:1910.05895'
+    href: https://arxiv.org/abs/1910.05895
+---
+
+Two lines, differing in where one function call goes.
+
+<Eq lead caption="eq. 1 — post-norm, as originally published">
+
+$$
+x_{\ell+1} = \mathrm{LN}\bigl(x_\ell + F(x_\ell)\bigr)
+$$
+
+</Eq>
+
+<Eq caption="eq. 2 — pre-norm, as everything is built now">
+
+$$
+x_{\ell+1} = x_\ell + F\bigl(\mathrm{LN}(x_\ell)\bigr)
+$$
+
+</Eq>
+
+In eq. 2 there is an unbroken identity path from the embedding to the output: $x$
+passes through additions and nothing else. In eq. 1 every layer's output goes
+through a normalisation, so the path from layer 1 to layer 50 traverses fifty
+non-linear rescalings.
+
+### Why post-norm needs warmup
+
+Xiong et al. worked out the gradient at initialisation. For post-norm, the
+expected gradient norm at the parameters of the final layer is $O(d\sqrt{\ln d})$
+and does not shrink with depth — the early steps of training take enormous,
+badly-conditioned steps and the model diverges. For pre-norm the same quantity
+carries a $1/\sqrt{L}$ factor, and depth *reduces* the gradient rather than
+leaving it unbounded.
+
+<Note label="annotation">
+This is the actual origin of the learning-rate warmup in the original
+transformer recipe. It was never a general truth about optimisation; it was a
+patch for post-norm's initialisation, and Xiong et al. showed that pre-norm
+models train to the same quality with warmup removed entirely.
+</Note>
+
+Warmup costs more than the steps it consumes. It couples the schedule to the
+architecture, it interacts with the batch size, and it is one more thing to tune
+per run. Removing it is most of why pre-norm won.
+
+### What pre-norm gives up
+
+The identity path is also the problem. Each block adds its output to a stream
+that is never rescaled, so the variance of $x_\ell$ grows roughly linearly with
+depth. Later blocks see an input whose norm is dominated by the accumulated sum,
+and their own contribution — normalised before $F$, and therefore of bounded
+size — is a progressively smaller fraction of it.
+
+<Eq caption="eq. 3 — the stream grows, the contribution does not">
+
+$$
+\mathrm{Var}[x_L] \approx \sum_{\ell=1}^{L}\mathrm{Var}\bigl[F_\ell(\cdot)\bigr]
+\;\Longrightarrow\;
+\frac{\|F_L\|}{\|x_L\|} \sim \frac{1}{\sqrt{L}}
+$$
+
+</Eq>
+
+The observable consequence is that deep pre-norm models behave like shallower
+ones: the last layers change the representation less than the first, and at
+matched parameter count a post-norm model that *does* converge reaches slightly
+better loss. This is sometimes called representation collapse, and it is the
+motivation for every variant below.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+from torch import Tensor, nn
+
+
+class PreNormBlock(nn.Module):
+    """The modern arrangement. Note the norms are inside the branches."""
+
+    def __init__(self, dim: int, **kw):
+        super().__init__()
+        self.n1, self.n2 = nn.RMSNorm(dim), nn.RMSNorm(dim)
+        self.attn, self.ffn = Attention(dim, **kw), FeedForward(dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        x = x + self.attn(self.n1(x))
+        return x + self.ffn(self.n2(x))
+
+
+class Stack(nn.Module):
+    def __init__(self, dim: int, layers: int, **kw):
+        super().__init__()
+        self.blocks = nn.ModuleList(PreNormBlock(dim, **kw) for _ in range(layers))
+        # Required: the residual stream itself is never normalised on its path.
+        self.final = nn.RMSNorm(dim)
+
+    def forward(self, x: Tensor) -> Tensor:
+        for block in self.blocks:
+            x = block(x)
+        return self.final(x)
+```
+
+</CodeFrame>
+
+<Rule label="The compromises" />
+
+**Sandwich norm** normalises both entering and leaving the branch —
+$x + \mathrm{LN}_2(F(\mathrm{LN}_1(x)))$ — which bounds each block's contribution
+without touching the identity path. Gemma 2 ships this, and it costs one extra
+norm per branch.
+
+**Residual scaling** multiplies each branch output by a constant, commonly
+$1/\sqrt{2L}$, so the accumulated variance stays $O(1)$ instead of $O(L)$. GPT-2
+did a version of this at initialisation rather than as a persistent factor.
+
+**[DeepNorm](/entries/deepnorm)** goes the other way: keep post-norm, and pick
+the residual weight and the initialisation scale so that the update to each layer
+is bounded by construction. It is the only one of the three that recovers
+post-norm's quality rather than patching pre-norm's deficit, and it is the least
+used, because it requires getting two constants right as a function of depth.

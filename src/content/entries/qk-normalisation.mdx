@@ -1,0 +1,144 @@
+---
+name: 'QK Normalisation'
+desc: 'Normalise queries and keys before the dot product to bound the attention logits.'
+category: 'architectures'
+complexity: 'O(n·d)'
+path: 'architectures/normalisation'
+difficulty: 'intermediate'
+described: '2023'
+status: 'common'
+statusNote: 'Adopted quickly once large runs started diverging on logit growth. In Gemma 2, Chameleon, ViT-22B and most recent multimodal models; not yet universal in text-only stacks.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['normalisation', 'attention', 'training']
+lede: 'Attention logits grow without bound during training, and one day the softmax saturates and the run dies. Normalising the query and key vectors first caps the logit at a constant and the failure mode disappears.'
+metrics:
+  caption: 'ViT-22B, without QK-norm'
+  rows:
+    - { label: 'Divergence onset', value: '≈ 8 B params' }
+    - { label: 'Max logit before', value: '> 10³' }
+    - { label: 'Max logit after', value: '≤ √d_k', accent: true }
+implNote:
+  label: 'in practice'
+  html: 'Normalise per head, not across the concatenated projection. A single norm over all heads lets one head’s scale dominate the others, which is most of what the technique exists to prevent.'
+related: [scaled-dot-product-attention, rmsnorm, layer-normalisation, multi-head-attention, flash-attention]
+refs:
+  - cite: 'Dehghani et al. — Scaling Vision Transformers to 22 Billion Parameters (2023)'
+    id: 'arXiv:2302.05442'
+    href: https://arxiv.org/abs/2302.05442
+  - cite: 'Wortsman et al. — Small-scale proxies for large-scale Transformer training instabilities (2023)'
+    id: 'arXiv:2309.14322'
+    href: https://arxiv.org/abs/2309.14322
+  - cite: 'Henry et al. — Query-Key Normalization for Transformers (2020)'
+    id: 'arXiv:2010.04245'
+    href: https://arxiv.org/abs/2010.04245
+---
+
+The $1/\sqrt{d_k}$ in [scaled dot-product
+attention](/entries/scaled-dot-product-attention) assumes $q$ and $k$ have unit
+variance per component. At initialisation they do. After fifty thousand steps
+they do not — $W_Q$ and $W_K$ have grown, the logits have grown with them, and
+nothing in the architecture pushes back.
+
+The end state is a softmax that has saturated: one weight is 1, the rest are 0,
+the gradient through the row is zero, and the head is dead. In a large run this
+shows up as a loss spike that does not recover.
+
+<Eq lead caption="eq. 1 — normalise, then scale by a learned temperature">
+
+$$
+A = \mathrm{softmax}\!\left(\gamma \cdot \frac{\mathrm{LN}(q)\,\mathrm{LN}(k)^\top}{\sqrt{d_k}}\right)
+$$
+
+</Eq>
+
+If both vectors are normalised, their dot product is bounded by $d_k$ in the
+worst case and concentrated near zero in the typical one, regardless of what the
+projection weights have become. The logit cannot run away because it is no longer
+a function of the weight norms at all.
+
+<Note label="annotation">
+Normalising both sides makes the score a cosine similarity up to scale. The
+learned $\gamma$ then has to supply the sharpness that the vector magnitudes used
+to provide — which is why the temperature is not optional, and why initialising
+it too small produces a model that trains stably to a worse loss.
+</Note>
+
+### The evidence
+
+Dehghani et al. hit this training ViT-22B: attention logits grew until the
+entropy of the attention distribution collapsed to near zero, always in the first
+few thousand steps, always fatal. QK-norm fixed it outright and was the change
+that made the 22-billion-parameter run possible.
+
+Wortsman et al. then studied it at small scale deliberately, and found the same
+instability reproduces in models of a few hundred million parameters if you push
+the learning rate — which makes it a cheap thing to test. Their measurements show
+QK-norm widening the range of usable learning rates by roughly an order of
+magnitude, with the divergence threshold moving out rather than the optimum
+moving.
+
+### The variants, and what they cost
+
+**LayerNorm** on $q$ and $k$ per head — the ViT-22B form, with the mean
+subtraction retained.
+
+**[RMSNorm](/entries/rmsnorm)** on $q$ and $k$ — what Gemma 2 and most recent
+models use, on the same reasoning that dropped the mean elsewhere.
+
+**$\ell_2$ normalisation** with an explicit learned scalar — the original Henry
+et al. formulation, which makes the cosine interpretation exact.
+
+All three cost two extra reductions over $[B, H, T, d_k]$ per layer. Against a
+$d_k$-deep matmul that is a small overhead in FLOPs, but it is bandwidth-bound
+and it sits between the projection and the attention kernel, where fusion is
+awkward — figure on 3–5% of step time in a naïve implementation, and less if the
+norm is folded into the projection epilogue.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+
+
+class Attention(nn.Module):
+    def __init__(self, dim: int, heads: int, qk_norm: bool = True):
+        super().__init__()
+        self.h, self.dk = heads, dim // heads
+        self.qkv = nn.Linear(dim, 3 * dim, bias=False)
+        self.out = nn.Linear(dim, dim, bias=False)
+
+        # Per-head, over the head dimension only.
+        self.qn = nn.RMSNorm(self.dk) if qk_norm else nn.Identity()
+        self.kn = nn.RMSNorm(self.dk) if qk_norm else nn.Identity()
+
+    def forward(self, x: Tensor) -> Tensor:                   # [B, T, D]
+        b, t, _ = x.shape
+        q, k, v = self.qkv(x).view(b, t, 3, self.h, self.dk).permute(2, 0, 3, 1, 4)
+
+        q, k = self.qn(q), self.kn(k)                         # bound the logits
+
+        z = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        return self.out(z.transpose(1, 2).reshape(b, t, -1))
+```
+
+</CodeFrame>
+
+Applying the norm before the rotary rotation rather than after is the convention,
+and it matters: [RoPE](/entries/rotary-position-embedding) is orthogonal, so it
+preserves the norm, but the two orders produce different results once a learned
+per-channel gain is involved.
+
+<Rule label="Related failures it does not fix" />
+
+QK-norm bounds the attention logit. It does nothing for the *output* logits,
+which have their own growth problem — the usual answer there is a soft cap,
+$c \cdot \tanh(z/c)$, which Gemma 2 applies to both the attention scores and the
+final projection. Nor does it help with the loss spikes that come from the
+optimiser state rather than the forward pass; those need
+[AdamW](/entries/adamw) epsilon tuning or gradient clipping, and misdiagnosing
+one as the other wastes a lot of compute.

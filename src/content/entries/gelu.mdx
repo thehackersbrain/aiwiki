@@ -1,0 +1,131 @@
+---
+name: 'GELU'
+desc: 'A smooth gate on the identity, and the activation lineage it belongs to.'
+category: 'architectures'
+complexity: 'O(n·d)'
+path: 'architectures/ffn'
+difficulty: 'introductory'
+described: '2016'
+status: 'common'
+statusNote: 'In BERT, GPT-2, GPT-3 and every ViT. New models use SiLU inside a gate instead, and the difference between them is not measurable.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['ffn', 'core']
+lede: 'Not a threshold but a probability: multiply the input by the chance that a standard normal falls below it. The result looks like ReLU with the corner rounded off, and the rounding is the point.'
+metrics:
+  caption: 'Cost of the exact form'
+  rows:
+    - { label: 'erf-based', value: 'exact' }
+    - { label: 'tanh approximation', value: '≈ 1e−3 error' }
+    - { label: 'sigmoid (SiLU)', value: 'different function', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'The tanh approximation is not interchangeable with the exact form when loading weights. GPT-2 was trained against the approximation, and evaluating it with the erf form shifts logits by enough to change tokens.'
+related: [swiglu, feed-forward-networks, squared-relu, activation-sparsity, rmsnorm]
+refs:
+  - cite: 'Hendrycks & Gimpel — Gaussian Error Linear Units (GELUs) (2016)'
+    id: 'arXiv:1606.08415'
+    href: https://arxiv.org/abs/1606.08415
+  - cite: 'Ramachandran et al. — Searching for Activation Functions (2017)'
+    id: 'arXiv:1710.05941'
+    href: https://arxiv.org/abs/1710.05941
+  - cite: 'Shazeer — GLU Variants Improve Transformer (2020)'
+    id: 'arXiv:2002.05202'
+    href: https://arxiv.org/abs/2002.05202
+---
+
+ReLU makes a hard decision: keep the input or discard it. GELU makes a soft one —
+scale the input by how likely it is to be worth keeping, where "likely" is read
+off a standard normal.
+
+<Eq lead caption="eq. 1 — the input times its own percentile">
+
+$$
+\mathrm{GELU}(x) = x \cdot \Phi(x)
+= x \cdot \frac{1}{2}\left[1 + \mathrm{erf}\!\left(\frac{x}{\sqrt{2}}\right)\right]
+$$
+
+</Eq>
+
+The motivation in the original paper is a stochastic regulariser: dropout
+multiplies by a Bernoulli mask, and if you make the keep-probability depend on
+the input's magnitude and then take the expectation, $x\Phi(x)$ is what falls
+out. Whether that story is load-bearing is doubtful. What is not doubtful is that
+the function has a small negative lobe and a continuous derivative, and both help.
+
+<Note label="annotation">
+The negative lobe is the substantive difference from ReLU. Around $x = -0.75$
+GELU reaches about $-0.17$ and comes back up, so a unit that is slightly negative
+still passes a gradient. ReLU passes exactly zero there, and a unit that lands in
+that region during training may never leave it — the dying-ReLU problem, which
+GELU does not have.
+</Note>
+
+### The family
+
+Three functions are in circulation and they are near-identical over the range
+activations actually occupy.
+
+| Name | Form | Where |
+| --- | --- | --- |
+| GELU | $x\,\Phi(x)$ | BERT, GPT-2/3, ViT |
+| SiLU / Swish | $x\,\sigma(x)$ | Llama, Mistral (inside a gate) |
+| GELU-tanh | $x\,\Phi_{\tanh}(x)$ | the fast approximation |
+
+SiLU replaces the Gaussian CDF with a logistic one, which is the same S-curve
+with slightly heavier tails. Ramachandran et al. found it by automated search,
+which is a pleasing result about how much of activation design is taste: a search
+over thousands of candidates rediscovered the function someone had already
+derived from a dropout argument.
+
+<Eq caption="eq. 2 — the approximation everyone actually ships">
+
+$$
+\mathrm{GELU}_{\tanh}(x) = \frac{x}{2}\left[1 + \tanh\!\left(\sqrt{\tfrac{2}{\pi}}\,\bigl(x + 0.044715\,x^3\bigr)\right)\right]
+$$
+
+</Eq>
+
+That constant is a curve fit, not a derivation. The approximation exists because
+`erf` was slow on the hardware of 2018; it is no longer slow, and the
+approximation persists because checkpoints were trained against it.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import math
+
+import torch
+from torch import Tensor
+
+
+def gelu_exact(x: Tensor) -> Tensor:
+    return x * 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
+
+
+def gelu_tanh(x: Tensor) -> Tensor:
+    """GPT-2's form. Use this iff the checkpoint was trained with it."""
+    inner = math.sqrt(2.0 / math.pi) * (x + 0.044715 * x.pow(3))
+    return x * 0.5 * (1.0 + torch.tanh(inner))
+
+
+# torch spells the choice as a flag, which is the right way to carry it:
+#   nn.GELU()                     -> exact
+#   nn.GELU(approximate="tanh")   -> GPT-2
+```
+
+</CodeFrame>
+
+<Rule label="Does the choice matter" />
+
+Barely, and it is worth saying so plainly. Shazeer's GLU-variants paper trained
+the whole matrix — ReLU, GELU, Swish, each with and without a gate — and the
+gated versions beat the ungated ones by a clear margin while the activations
+within each group were separated by noise.
+
+The conclusion the field drew, correctly, is that [gating](/entries/swiglu) is
+the design decision and the activation inside it is a detail. Llama uses SiLU
+because SwiGLU is what Shazeer named; had he named GEGLU, the models would use
+GELU and nothing else would differ.

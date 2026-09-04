@@ -1,0 +1,164 @@
+---
+name: 'Parallel Scan'
+desc: 'Compute a linear recurrence in log-depth instead of a loop.'
+category: 'architectures'
+complexity: 'O(n·log n)'
+memory: 'O(n)'
+path: 'architectures/recurrence'
+difficulty: 'intermediate'
+described: '1980'
+status: 'standard'
+statusNote: 'The algorithm that makes every modern recurrent model trainable. Not new, not from machine learning, and the reason Mamba exists at all.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['recurrence', 'sequence', 'core']
+lede: 'A recurrence looks inherently sequential. If the update is associative it is not — the same result is reachable in log n dependent steps, which is what lets a recurrent model train on a GPU.'
+metrics:
+  caption: 'Sequence of 4096'
+  rows:
+    - { label: 'Sequential depth', value: '4 096' }
+    - { label: 'Scan depth', value: '24', accent: true }
+    - { label: 'Total work', value: '≈ 2n' }
+implNote:
+  label: 'caveat'
+  html: 'Associativity is the entire precondition. Insert a nonlinearity inside the recurrence and the operator stops being associative, the scan is invalid, and you are back to a loop — which is exactly why the models on this shelf are linear.'
+related: [state-space-models, recurrent-neural-networks, rwkv, linear-attention, state-space-duality, flash-attention]
+refs:
+  - cite: 'Blelloch — Prefix Sums and Their Applications (1990)'
+    id: 'CMU-CS-90-190'
+    href: https://www.cs.cmu.edu/~guyb/papers/Ble93.pdf
+  - cite: 'Martin & Cundy — Parallelizing Linear Recurrent Neural Nets Over Sequence Length (2017)'
+    id: 'arXiv:1709.04057'
+    href: https://arxiv.org/abs/1709.04057
+  - cite: 'Smith et al. — Simplified State Space Layers for Sequence Modeling (2022)'
+    id: 'arXiv:2208.04933'
+    href: https://arxiv.org/abs/2208.04933
+---
+
+An [RNN](/entries/recurrent-neural-networks) trains slowly because $h_t$ needs
+$h_{t-1}$. That dependency looks like a law of nature. For a *linear* recurrence
+it is not.
+
+<Eq lead caption="eq. 1 — the form that admits a scan">
+
+$$
+h_t = a_t \odot h_{t-1} + b_t
+$$
+
+</Eq>
+
+with $a_t$ and $b_t$ computed from the input alone — not from $h$. Every element
+of the state evolves independently, and the update is affine.
+
+### Composition
+
+Two consecutive steps compose into a single step of the same shape.
+
+<Eq caption="eq. 2 — the associative operator">
+
+$$
+(a_2, b_2) \bullet (a_1, b_1) = \bigl(a_2 a_1,\; a_2 b_1 + b_2\bigr)
+$$
+
+</Eq>
+
+Substituting confirms it: applying $(a_1,b_1)$ then $(a_2,b_2)$ gives
+$a_2(a_1 h + b_1) + b_2$, which is the composed pair applied once. And the
+operator is associative, because function composition always is.
+
+That is the whole trick. Associativity means the operations can be grouped
+however you like, and a different grouping is a different schedule — a balanced
+binary tree instead of a chain.
+
+<Note label="annotation">
+Associativity is emphatically not commutativity. Order still matters:
+$(a_2,b_2)\bullet(a_1,b_1)$ is not the same as the reverse. The scan preserves
+sequence order exactly; it only regroups the parentheses.
+</Note>
+
+### Blelloch's two sweeps
+
+**Up-sweep.** Pair adjacent elements and compose, giving $n/2$ pairs each
+representing two steps. Repeat. After $\log n$ rounds the root holds the
+composition of the entire sequence. This is a reduction tree.
+
+**Down-sweep.** Walk back down, pushing each node's accumulated prefix into its
+children, so every leaf ends up holding the composition of everything to its
+left. Another $\log n$ rounds.
+
+<Eq caption="eq. 3 — depth against work">
+
+$$
+\text{depth} = 2\log_2 n
+\qquad
+\text{work} = O(n)
+$$
+
+</Eq>
+
+For $n = 4096$: 24 dependent steps rather than 4096. The total arithmetic is
+about twice the sequential version, which is an excellent trade on hardware with
+thousands of idle cores.
+
+### Why every recurrent model since 2021 is linear
+
+The scan requires eq. 1's form. A $\tanh$ inside the recurrence destroys
+associativity — $\tanh(a_2\tanh(a_1 h + b_1) + b_2)$ does not collapse into one
+affine step — and no amount of engineering recovers it.
+
+So the design question inverted. Rather than asking what recurrence is most
+expressive and accepting slow training, the field asked what can be trained in
+parallel and found expressiveness elsewhere: nonlinearities *between* layers, and
+input-dependent $a_t$ within them. [Selective
+SSMs](/entries/state-space-models), [RWKV](/entries/rwkv) and gated
+[linear attention](/entries/linear-attention) are all eq. 1 with different
+parameterisations of $a$ and $b$, and they are all trained by this algorithm.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch · Hillis–Steele, the simpler variant">
+
+```python
+import torch
+from torch import Tensor
+
+
+def scan(a: Tensor, b: Tensor) -> Tensor:
+    """h_t = a_t * h_{t-1} + b_t, over dim 1. a, b: [B, T, D]."""
+    a, b = a.clone(), b.clone()
+    t, shift = a.size(1), 1
+
+    while shift < t:
+        # Compose each element with the one `shift` places behind it. After
+        # round k every element holds the composition of 2^k steps.
+        a_prev = torch.nn.functional.pad(a[:, :-shift], (0, 0, shift, 0), value=1.0)
+        b_prev = torch.nn.functional.pad(b[:, :-shift], (0, 0, shift, 0), value=0.0)
+
+        b = a * b_prev + b
+        a = a * a_prev
+        shift *= 2
+
+    return b
+
+
+def scan_reference(a: Tensor, b: Tensor) -> Tensor:
+    """The loop it replaces. Same answer, 4096 launches instead of 12."""
+    h = torch.zeros_like(b[:, 0])
+    return torch.stack([(h := a[:, t] * h + b[:, t]) for t in range(b.size(1))], 1)
+```
+
+</CodeFrame>
+
+Hillis–Steele is $O(n\log n)$ work against Blelloch's $O(n)$, and is nonetheless
+what most implementations use: it has half the depth, no down-sweep, and a memory
+access pattern the hardware likes. Asymptotically worse and reliably faster at
+the sizes that occur.
+
+<Rule label="The part the papers do not put in the equations" />
+
+The real kernels do not run the scan on the full sequence in one go. They tile it:
+load a chunk into SRAM, scan it there, carry one composed pair across the chunk
+boundary, and never write intermediate states to HBM. That is the same IO-aware
+argument as [FlashAttention](/entries/flash-attention), and it is why Mamba's
+paper spends as much space on the memory hierarchy as on the model — the
+algorithm was settled in 1980, and what was new was making it bandwidth-efficient.

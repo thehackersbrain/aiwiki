@@ -1,0 +1,117 @@
+---
+name: 'Agent Frameworks'
+desc: 'Loops with tools: what the frameworks add, and how little of it is the hard part.'
+category: 'tooling'
+complexity: '—'
+path: 'tooling/orchestration'
+difficulty: 'intermediate'
+described: '2023'
+status: 'common'
+statusNote: 'The least settled software on this shelf. The core loop is twenty lines; everything contested is about what surrounds it.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['tooling', 'orchestration', 'agents']
+lede: 'An agent is a while loop that calls a model, runs whatever tools it asked for, and feeds the results back. The frameworks are not selling the loop — they are selling state, observability and the things that go wrong.'
+implNote:
+  label: 'annotation'
+  html: 'Write the loop yourself first. It is short, and having done it once you can evaluate what a framework is actually adding — which is often persistence and tracing rather than anything about agency.'
+related: [langchain, model-context-protocol, llamaindex, prompt-injection-taxonomy, test-time-compute-scaling, llm-as-judge]
+refs:
+  - cite: 'Yao et al. — ReAct: Synergizing Reasoning and Acting in Language Models (2022)'
+    id: 'arXiv:2210.03629'
+    href: https://arxiv.org/abs/2210.03629
+  - cite: 'LangGraph documentation'
+    id: 'langchain-ai.github.io'
+    href: https://langchain-ai.github.io/langgraph/
+  - cite: 'Wu et al. — AutoGen: Enabling Next-Gen LLM Applications via Multi-Agent Conversation (2023)'
+    id: 'arXiv:2308.08155'
+    href: https://arxiv.org/abs/2308.08155
+---
+
+The whole idea, without a framework:
+
+<CodeFrame meta="python">
+
+```python
+def agent(task: str, tools: dict, max_steps: int = 20) -> str:
+    messages = [{"role": "user", "content": task}]
+
+    for _ in range(max_steps):
+        reply = model.chat(messages, tools=[schema(t) for t in tools.values()])
+        messages.append(reply)
+
+        if not reply.tool_calls:
+            return reply.content
+
+        for call in reply.tool_calls:
+            # Everything returned here is untrusted input, whatever it says.
+            result = tools[call.name](**call.arguments)
+            messages.append({"role": "tool", "tool_call_id": call.id,
+                             "content": str(result)})
+
+    return "step limit reached"
+```
+
+</CodeFrame>
+
+That is ReAct, and it is a complete agent. Anything a framework offers is on top
+of it.
+
+### What the frameworks add
+
+**State and persistence.** The loop above loses everything if the process dies.
+LangGraph checkpoints state per step, so a run resumes, and can be rewound to a
+prior step and continued differently.
+
+**Human-in-the-loop.** Pausing before a consequential action and waiting for
+approval requires the loop to be interruptible and resumable — which is the same
+machinery as persistence, and the main reason to want it.
+
+**Observability.** Which tools were called, with what, how many tokens, where the
+time went. Debugging an agent without a trace view is guesswork, and this is
+where most of the practical value is.
+
+**Multi-agent structure.** Several models with different prompts and tools,
+passing work between them. AutoGen and CrewAI are organised around this; the
+evidence that it beats one well-prompted model with all the tools is weaker than
+the enthusiasm suggests.
+
+### The hard parts, which no framework solves
+
+**Knowing when to stop.** Agents loop, repeat failed actions, and declare success
+on incomplete work. The step limit above is a blunt instrument and it is what
+most production systems actually rely on.
+
+**Error recovery.** A tool returns an error; the model tries the same call again.
+Making failure informative — a message that says what to do differently — matters
+more than any orchestration feature.
+
+**Context growth.** Every step appends. A twenty-step run overflows the window,
+and what to summarise or drop is application-specific.
+
+**[Prompt injection](/entries/prompt-injection-taxonomy).** A retrieved document
+or tool output containing instructions is indistinguishable, to the model, from
+instructions you sent. Give an agent both a browser and a shell and this stops
+being theoretical. No framework fixes it, and the mitigations that work are
+architectural: least privilege per tool, approval gates on anything with an
+effect, and never routing untrusted content into a step that can act.
+
+<Note label="caveat">
+Evaluation is the other gap. An agent has no single correct output, so quality is
+measured by task completion on a curated set — which someone has to build and
+maintain. Teams routinely ship agents with no such set, and then have no way to
+tell whether a prompt change helped.
+</Note>
+
+<Rule label="Choosing" />
+
+| Situation | Reasonable choice |
+| --- | --- |
+| learning what an agent is | write the loop |
+| a production loop with approvals | LangGraph |
+| a conversation between several roles | AutoGen |
+| a fixed pipeline of specialists | CrewAI |
+| tools shared across hosts | [MCP](/entries/model-context-protocol) servers |
+
+The last row is orthogonal to the others: MCP is how tools are exposed, and every
+framework above can consume them.

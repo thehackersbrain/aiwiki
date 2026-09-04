@@ -1,0 +1,111 @@
+---
+name: 'Model Context Protocol'
+desc: 'A standard interface between a model host and the tools it can call.'
+category: 'tooling'
+complexity: '—'
+path: 'tooling/orchestration'
+difficulty: 'introductory'
+described: '2024'
+status: 'common'
+statusNote: 'Adopted quickly and broadly for an interface specification. It solves an integration problem cleanly and leaves the security problem entirely open.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['tooling', 'orchestration', 'agents']
+lede: 'Every framework had its own way to describe a tool, so every integration was written N times. MCP is the interface that makes it N plus M — a server exposes tools once, and any client can use them.'
+implNote:
+  label: 'caveat'
+  html: 'Tool descriptions are instructions the model will follow. A malicious or compromised server can put directives in a tool’s description text and they arrive with the same authority as the system prompt — which is why servers are trusted software, not plugins.'
+related: [langchain, agent-frameworks, prompt-injection-taxonomy, ollama, llamaindex]
+refs:
+  - cite: 'Anthropic — Model Context Protocol specification'
+    id: 'modelcontextprotocol.io'
+    href: https://modelcontextprotocol.io
+  - cite: 'Anthropic — Introducing the Model Context Protocol (2024)'
+    id: 'anthropic.com'
+    href: https://www.anthropic.com/news/model-context-protocol
+  - cite: 'Greshake et al. — Not what you’ve signed up for: Compromising Real-World LLM-Integrated Applications with Indirect Prompt Injection (2023)'
+    id: 'arXiv:2302.12173'
+    href: https://arxiv.org/abs/2302.12173
+---
+
+Giving a model access to a database, a filesystem or an API means describing
+those capabilities in whatever format the framework expects. Do it for three
+frameworks and you have written the integration three times.
+
+MCP is a JSON-RPC protocol that puts a standard boundary in the middle. A
+**server** exposes capabilities; a **client** — a model host — consumes them. The
+integration is written once.
+
+### Three kinds of thing a server exposes
+
+**Tools.** Functions the model may call, with a JSON Schema for their arguments.
+Model-controlled: the model decides when to invoke one.
+
+**Resources.** Data the client may read — files, records, documents. Application-
+controlled: the host decides what to include, and the model does not fetch them
+on its own.
+
+**Prompts.** Named templates a user can invoke, typically surfaced as slash
+commands.
+
+The distinction between the first two is the interesting design choice. Tools are
+actions with effects and need the model's judgement; resources are context and
+should not be. Collapsing them — which most pre-MCP tool interfaces did — is what
+makes "read this file" and "delete this file" look like the same kind of
+operation to a model.
+
+<CodeFrame meta="python · a minimal server">
+
+```python
+from mcp.server.fastmcp import FastMCP
+
+mcp = FastMCP("grimoire")
+
+@mcp.tool()
+def search_entries(query: str, limit: int = 5) -> list[dict]:
+    """Search the reference entries. The docstring is what the model reads
+    to decide whether to call this — it is prompt text, not documentation."""
+    return db.search(query, limit)
+
+@mcp.resource("entry://{slug}")
+def read_entry(slug: str) -> str:
+    """Fetched by the host, not chosen by the model."""
+    return db.get(slug).body
+
+mcp.run(transport="stdio")
+```
+
+</CodeFrame>
+
+Two transports: `stdio` for a local subprocess, and HTTP with server-sent events
+for a remote one. Local servers are the common case and get their credentials
+from the environment they are launched in.
+
+### What it is for
+
+- **Writing an integration once.** Any MCP-speaking client can use it.
+- **Keeping tools out of the application.** A server is a separate process with
+  its own dependencies and its own credentials.
+- **Local-first access.** A filesystem or database server runs on your machine
+  and the data does not leave it.
+
+### What it does not do
+
+**Authorisation.** The protocol describes capabilities; deciding who may invoke
+which is the host's problem, and hosts vary in how seriously they take it.
+
+**Sandboxing.** A server runs with the permissions it was started with. There is
+no isolation in the specification.
+
+**Injection defence.** This is the significant one. Tool results are untrusted
+text that arrives in the model's context alongside instructions, and so are tool
+*descriptions*. A compromised server can rewrite a description to include
+directives, and the model has no way to distinguish those from the operator's.
+
+<Note label="caveat">
+The practical consequence: an MCP server is trusted software running with your
+credentials, not a plugin. Read what you install, prefer servers whose scope is
+narrow, and treat everything returned across the boundary as
+<a href="/entries/prompt-injection-taxonomy">data rather than instruction</a> —
+a discipline the protocol enables and does not enforce.
+</Note>

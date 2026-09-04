@@ -1,0 +1,126 @@
+---
+title: 'What alignment is asking for'
+desc: 'A base model is not disobedient, it is doing something else entirely — and naming that is the first step.'
+lede: 'Before any of the methods make sense, it helps to be precise about the gap. A pre-trained model is not a bad assistant. It is not an assistant.'
+series: 'alignment-from-scratch'
+part: 1
+minutes: 7
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['alignment', 'objectives', 'foundations']
+related: [next-token-prediction, supervised-fine-tuning, sampling-strategies, reward-modelling]
+refs:
+  - cite: 'Ouyang et al. — Training language models to follow instructions with human feedback (2022)'
+    id: 'arXiv:2203.02155'
+    href: https://arxiv.org/abs/2203.02155
+  - cite: 'Askell et al. — A General Language Assistant as a Laboratory for Alignment (2021)'
+    id: 'arXiv:2112.00861'
+    href: https://arxiv.org/abs/2112.00861
+  - cite: 'Radford et al. — Language Models are Unsupervised Multitask Learners (2019)'
+    id: 'GPT-2'
+    href: https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf
+---
+
+The first time I used a raw base model I assumed it was broken. I asked it a
+question and it produced four more questions. I asked it to summarise something
+and it appended a citation and a paragraph about a different paper.
+
+It was working perfectly. I had misunderstood what it was for.
+
+### The objective, taken literally
+
+<Eq lead caption="eq. 1 — the entire training objective of a base model">
+
+$$
+\mathcal{L} = -\sum_t \log p_\theta\bigl(x_t \mid x_{<t}\bigr)
+$$
+
+</Eq>
+
+Nothing in that says *be helpful*. It says: given this prefix, what is likely to
+come next in the corpus this was fitted to. If the corpus is the internet, then
+after a question the likely continuation is often another question — because
+that is what a list of FAQs looks like, and a forum thread, and an exam paper.
+
+The model is not refusing to answer. It is answering a different question, and
+the different question is the only one it was ever asked.
+
+<Note label="annotation">
+This reframing did more for me than any amount of reading about RLHF. The gap is
+not obedience. It is that <em>document continuation</em> and <em>respond to this
+person</em> are distinct tasks, and pre-training only ever optimised the first.
+</Note>
+
+### What the model already has
+
+It is worth being equally precise about what is *not* missing, because it decides
+what post-training can be.
+
+The knowledge is there. So is the syntax, the reasoning, the ability to write
+code and translate and summarise — the abilities are all latent, and demonstrably
+so, because the right prompt elicits them from a base model. GPT-3's few-shot
+results are exactly this: given three worked examples, the likely continuation
+becomes a fourth worked example, and the model produces one.
+
+<Eq caption="eq. 2 — what few-shot prompting is doing">
+
+$$
+p(\text{answer} \mid \text{examples} + \text{question}) \gg p(\text{answer} \mid \text{question})
+$$
+
+</Eq>
+
+So the capability is present and the *addressing* is broken. You can reach it by
+constructing a context where the desired behaviour is the likely continuation,
+which is what prompt engineering is, and which is fragile and tedious.
+
+Post-training makes the desired behaviour likely without the scaffolding. That is
+all it is doing — and it explains a result that surprised me when I first met it:
+alignment barely changes what a model knows. Benchmarks measuring knowledge move
+very little between a base model and its instruct version. What moves is whether
+you can get at it by asking.
+
+### Three things we want, and they conflict
+
+Askell et al.'s framing is the one that stuck: **helpful, honest, harmless.**
+Useful mainly because they pull against each other.
+
+Helpful and harmless conflict on any request where the useful answer is
+dangerous. Helpful and honest conflict whenever the honest answer is "I don't
+know" and the user wanted a number. Honest and harmless conflict when a true fact
+is one someone should not be handed.
+
+There is no setting where all three are maximised, so alignment is not
+optimisation towards a target — it is a choice of trade-off, made by whoever
+writes the guidelines and whoever labels the data. This is worth sitting with
+before any of the mathematics, because every method in the rest of this series is
+a way of *transmitting* a trade-off someone made, and none of them chooses it.
+
+### Why the loss cannot be written down
+
+Here is the difficulty that shapes everything after.
+
+Suppose we accept the trade-off and just want to optimise for it. Write the loss
+function for "helpful". Not an approximation — the actual function that takes a
+prompt and a response and returns how helpful it was.
+
+You cannot. There is no closed form, no reference implementation, no dataset of
+labelled helpfulness that would generalise if there were. The target is defined
+only by human judgement, and human judgement is available in one form: you can
+show a person things and ask what they think.
+
+That is the constraint the whole field is arranged around. Two ways to ask:
+
+**Show me what you want.** Collect demonstrations and train on them. That is
+[supervised fine-tuning](/entries/supervised-fine-tuning), and it is part 2.
+
+**Tell me which of these is better.** Collect comparisons and fit something to
+them. That is [reward modelling](/entries/reward-modelling), and it is part 3.
+
+Every method in this series is one of those two, or a consequence of one of them.
+
+<Rule label="Next" />
+
+Part 2 takes the first route as far as it goes, which is further than I expected
+and not far enough — and the specific way demonstrations run out is what makes
+the second route necessary rather than merely available.

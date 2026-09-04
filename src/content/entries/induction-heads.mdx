@@ -1,0 +1,138 @@
+---
+name: 'Induction Heads'
+desc: 'A two-head circuit that completes [A][B]…[A] with [B]; the substrate of in-context learning.'
+category: 'interpretability'
+complexity: 'O(L²)'
+path: 'interpretability/circuits'
+difficulty: 'intermediate'
+described: '2022'
+status: 'standard'
+statusNote: 'The clearest fully traced circuit there is, and the existence proof the rest of the field argues from.'
+revised: 2026-08-23
+added: 2024-12-04
+tags: ['circuits', 'causal']
+lede: 'Two attention heads composing across layers: one writes the previous token into the residual stream, the next searches for where the current token appeared before and copies what followed it.'
+metrics:
+  caption: '2-layer attention-only model, reported in the source'
+  rows:
+    - { label: 'Layers needed', value: '2' }
+    - { label: 'Heads in circuit', value: '2' }
+    - { label: 'Formation', value: 'a visible loss bump', accent: true }
+implNote:
+  label: 'annotation'
+  html: 'The phase change is sharp enough to see in the loss curve — a small bump partway through training, in the same window the head appears.'
+related: [activation-patching, path-patching, logit-lens, sparse-autoencoders]
+refs:
+  - cite: 'Olsson et al. — In-context Learning and Induction Heads (2022)'
+    id: 'transformer-circuits'
+    href: https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/index.html
+  - cite: 'Elhage et al. — A Mathematical Framework for Transformer Circuits (2021)'
+    id: 'transformer-circuits'
+    href: https://transformer-circuits.pub/2021/framework/index.html
+  - cite: 'Wang et al. — Interpretability in the Wild: a Circuit for IOI (2022)'
+    id: 'arXiv:2211.00593'
+    href: https://arxiv.org/abs/2211.00593
+---
+
+Present a model with a repeated random sequence. At the second occurrence of a
+token it predicts what followed the first occurrence — with tokens it has never
+seen in training, so this is not memorisation but an algorithm implemented in
+the weights.
+
+<Eq caption="eq. 1 — the behaviour, stated as a rule" lead>
+
+$$
+[A]\,[B]\;\dots\;[A] \;\longrightarrow\; [B]
+$$
+
+</Eq>
+
+### The circuit
+
+Two heads in different layers, composing through the residual stream.
+
+<Note label="annotation">
+Neither head can do this alone. The circuit is the minimal example of
+composition, which is why it is the one everyone learns first.
+</Note>
+
+The **previous-token head**, in an early layer, attends from each position to
+the one before it and writes that token's embedding into a subspace of the
+residual stream. The **induction head**, later, forms its query from the current
+token and matches it against those written-back embeddings — so it attends to
+the position *after* an earlier copy of the current token, and its OV circuit
+copies that position's token to the output.
+
+<Eq caption="eq. 2 — Q-composition: the key comes from what the earlier head wrote" source="Elhage et al.">
+
+$$
+q_i = W_Q\, x_i,
+\qquad
+k_j = W_K\bigl( x_j + \underbrace{W_{OV}^{\text{prev}} x_{j-1}}_{\text{written by head 1}} \bigr)
+$$
+
+</Eq>
+
+The match therefore fires when $x_i \approx x_{j-1}$ — the current token equals
+the token before position $j$ — and attention lands on $j$, whose content is
+then copied.
+
+### The phase change
+
+Induction heads do not appear gradually. They form in a narrow window of
+training, and that window coincides with a visible bump in the loss curve and
+with the model's abrupt acquisition of in-context learning. Ablating the heads
+after training removes most of the in-context learning gain.
+
+<Eq caption="eq. 3 — the standard measure of in-context learning">
+
+$$
+\text{ICL score} = \mathcal{L}_{\text{token } 50} - \mathcal{L}_{\text{token } 500}
+$$
+
+</Eq>
+
+A model that uses context well predicts the 500th token of a document much
+better than the 50th; the gap is the score, and it jumps when the heads form.
+
+> The strong version of the claim — that induction heads are the mechanism
+> behind in-context learning generally, including few-shot task performance —
+> is supported by ablation and correlation, not proved. The weak version, that
+> they implement literal copying, is not in doubt.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch — the standard detector">
+
+```python
+import torch
+from torch import Tensor
+
+
+@torch.no_grad()
+def induction_score(model, seq_len: int = 64, vocab: int = 1000) -> Tensor:
+    """Mean attention paid to the token after the current token's
+    previous occurrence. Returns [layers, heads]."""
+    half = torch.randint(0, vocab, (1, seq_len))
+    tokens = torch.cat([half, half], dim=1)      # exact repeat
+
+    _, cache = model.run_with_cache(tokens)
+    scores = []
+
+    for layer in range(model.cfg.n_layers):
+        # [batch, head, query, key]
+        pattern = cache["pattern", layer]
+        # from position i in the second copy, the induction target is
+        # i - seq_len + 1: one after where this token appeared before
+        diagonal = pattern.diagonal(offset=-(seq_len - 1), dim1=-2, dim2=-1)
+        scores.append(diagonal.mean(dim=-1)[0])
+
+    return torch.stack(scores)
+```
+
+</CodeFrame>
+
+The offset is the whole detector: `-(seq_len - 1)` selects, for each query in
+the repeated half, the key one position after the matching token in the first
+half. Off by one and you are measuring a previous-token head instead, which
+scores high on a different diagonal and is easy to mistake for a positive result.

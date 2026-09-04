@@ -1,0 +1,101 @@
+---
+name: 'Ollama'
+desc: 'A local model runner: pull a name, get a server, forget the flags.'
+category: 'tooling'
+complexity: '—'
+path: 'tooling/serving'
+difficulty: 'introductory'
+described: '2023'
+status: 'standard'
+statusNote: 'The default way to run a model locally. Almost every "local LLM" tutorial written since 2024 assumes it, which is itself the reason to know it.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['tooling', 'inference']
+lede: 'llama.cpp with the decisions made for you. A model registry, automatic quantisation choice, memory-aware loading and an HTTP API — in exchange for not choosing any of those things yourself.'
+implNote:
+  label: 'in practice'
+  html: 'A bare tag such as <code>llama3.1</code> gets you the 8B at Q4_K_M. Sizes and quantisations are explicit suffixes — <code>llama3.1:70b-instruct-q6_K</code> — and it is worth being explicit, because the default changes when upstream does.'
+related: [llama-cpp, vllm, model-context-protocol, langchain, gptq]
+refs:
+  - cite: 'Ollama'
+    id: 'ollama.com'
+    href: https://ollama.com
+  - cite: 'Ollama — Modelfile reference'
+    id: 'github'
+    href: https://github.com/ollama/ollama/blob/main/docs/modelfile.md
+  - cite: 'Gerganov — llama.cpp'
+    id: 'github'
+    href: https://github.com/ggml-org/llama.cpp
+---
+
+[llama.cpp](/entries/llama-cpp) requires you to find a checkpoint, convert it,
+choose a quantisation, and pick a layer-offload count for your hardware. Ollama
+does all four and gives you a command that looks like Docker.
+
+<CodeFrame meta="shell">
+
+```bash
+ollama pull llama3.1:8b
+ollama run llama3.1:8b "Why does a sliding window break attention sinks?"
+
+# It is also always an HTTP server on :11434.
+curl localhost:11434/v1/chat/completions -d '{
+  "model": "llama3.1:8b",
+  "messages": [{"role": "user", "content": "hello"}]
+}'
+```
+
+</CodeFrame>
+
+### What it is for
+
+- **Trying a model in one line.** No conversion, no quantisation decision, no
+  memory arithmetic.
+- **Being a local API.** The endpoint is OpenAI-compatible, so anything that
+  speaks that protocol — [LangChain](/entries/langchain), an editor plugin, a
+  script — points at it unchanged.
+- **Managing several models.** Loads on demand, unloads on idle, and will not
+  attempt one that does not fit.
+
+### What it is not for
+
+Serving other people. It is a single-machine tool with no batching worth the
+name, no scheduling, and no tenancy model. Anything with concurrent users wants
+[vLLM](/entries/vllm) or [SGLang](/entries/sglang).
+
+It also hides the things you would want to control in a serious deployment —
+which quantisation, how much context, what is on the GPU — behind defaults that
+are good and not visible.
+
+### Modelfiles
+
+The one piece of configuration worth knowing. A Modelfile pins a system prompt
+and sampling parameters onto a base model and registers the result under a name.
+
+<CodeFrame meta="Modelfile">
+
+```dockerfile
+FROM llama3.1:8b
+
+PARAMETER temperature 0.2
+PARAMETER num_ctx 16384
+
+SYSTEM """
+You are a terse technical reference. Answer in at most three sentences.
+Say "I don't know" rather than guessing.
+"""
+```
+
+</CodeFrame>
+
+`ollama create terse -f Modelfile` and it is a model like any other. This is
+prompt configuration rather than training — nothing is fine-tuned, and the base
+weights are shared between every model derived from them, so a dozen variants
+cost one download.
+
+<Note label="caveat">
+<code>num_ctx</code> defaults to a modest value regardless of what the model
+supports, and long inputs are silently truncated rather than refused. It is the
+most common surprise with Ollama: a model that appears to ignore the start of a
+long document is not ignoring it, it never received it.
+</Note>

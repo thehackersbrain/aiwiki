@@ -1,0 +1,142 @@
+---
+name: 'Sparse Upcycling'
+desc: 'Turn a finished dense checkpoint into a mixture of experts by copying the FFN.'
+category: 'architectures'
+complexity: 'O(k·d²)'
+path: 'architectures/sparse'
+difficulty: 'intermediate'
+described: '2022'
+status: 'common'
+statusNote: 'How most open MoE models were actually made. Cheaper than training sparse from scratch, and reliably a little worse if you have the budget not to.'
+revised: 2026-09-02
+added: 2026-09-02
+tags: ['sparse', 'training', 'scaling']
+lede: 'Pre-training an MoE from random initialisation wastes a dense checkpoint you already have. Copy its feed-forward block E times, add a router, and continue training.'
+metrics:
+  caption: 'Komatsuzaki et al., T5/ViT'
+  rows:
+    - { label: 'Budget to beat dense', value: '≈ 10% of pre-training' }
+    - { label: 'Experts from one FFN', value: '8 … 64' }
+    - { label: 'Router init', value: 'near-zero', accent: true }
+implNote:
+  label: 'caveat'
+  html: 'Copying the FFN verbatim makes every expert identical, so the router sees no reason to prefer one over another and gradients are symmetric. Symmetry breaking comes from the router noise and from the data order — which is why the auxiliary loss matters more in the first thousand steps than ever after.'
+related: [mixture-of-experts-routing, shared-and-fine-grained-experts, expert-capacity-and-token-dropping, supervised-fine-tuning, feed-forward-networks, loss-free-load-balancing]
+refs:
+  - cite: 'Komatsuzaki et al. — Sparse Upcycling: Training Mixture-of-Experts from Dense Checkpoints (2022)'
+    id: 'arXiv:2212.05055'
+    href: https://arxiv.org/abs/2212.05055
+  - cite: 'Jiang et al. — Mixtral of Experts (2024)'
+    id: 'arXiv:2401.04088'
+    href: https://arxiv.org/abs/2401.04088
+  - cite: 'Wei et al. — Skywork-MoE: A Deep Dive into Training Techniques for Mixture-of-Experts Language Models (2024)'
+    id: 'arXiv:2406.06563'
+    href: https://arxiv.org/abs/2406.06563
+---
+
+Training a sparse model from scratch means discarding whatever dense checkpoints
+you already have. Since the architectures differ in exactly one block, that is an
+avoidable waste.
+
+Upcycling: keep the embeddings, the attention, the norms. Replace each
+feed-forward block with $E$ copies of itself and a fresh router, then continue
+pre-training.
+
+<Eq lead caption="eq. 1 — the initialisation">
+
+$$
+W^{(e)}_1 \leftarrow W_1,\quad W^{(e)}_2 \leftarrow W_2 \;\;\forall e,
+\qquad
+W_{\text{router}} \sim \mathcal{N}(0, \epsilon^2)
+$$
+
+</Eq>
+
+At step zero the model computes almost exactly what the dense model did — every
+expert is the same function, so which one is chosen does not matter, and with
+top-$k$ weights summing to one the block's output is unchanged. The loss does not
+jump. Training then pulls the copies apart.
+
+### Symmetry breaking
+
+Identical experts are a degenerate initialisation: the gradient to every copy is
+the same up to which tokens it received, and there is nothing to prefer one over
+another. What breaks it is the routing itself — the random router sends different
+tokens to different experts, so the copies see different data from the first
+step and diverge.
+
+<Note label="caveat">
+This makes the early phase unusually sensitive to load balancing. A router that
+collapses in the first few hundred steps leaves most experts untrained and
+identical, and the model never recovers the capacity it was upcycled to gain. Run
+the <a href="/entries/expert-capacity-and-token-dropping">auxiliary loss</a> at a
+higher weight for the first stretch and decay it.
+</Note>
+
+Some implementations add small noise to each copy instead, on the reasoning that
+explicit asymmetry beats waiting for the router to supply it. Skywork-MoE
+compared the two and found the noise unnecessary and occasionally harmful — it
+perturbs a well-trained block for no gain.
+
+### What it costs in quality
+
+Komatsuzaki et al. are careful about the comparison, and the honest summary is a
+crossover. Upcycling beats continued dense training after roughly 10% of the
+original pre-training budget is spent on it. It also stays behind an MoE trained
+sparse from scratch, and the gap narrows with budget without closing.
+
+<Eq caption="eq. 2 — where the choice actually lies">
+
+$$
+\text{budget} \ll \text{pre-train} \;\Rightarrow\; \text{upcycle}
+\qquad
+\text{budget} \sim \text{pre-train} \;\Rightarrow\; \text{train sparse}
+$$
+
+</Eq>
+
+Which is a statement about who you are, not about which method is better. Most
+organisations have a dense checkpoint and a fraction of the compute that produced
+it, and for them the crossover never arrives.
+
+Skywork-MoE adds a second finding worth knowing: upcycled models show weaker
+expert specialisation than from-scratch ones, measurably so. The copies start in
+the same basin and do not travel far from it, so the diversity that makes sparsity
+worth having is partly foreclosed by the initialisation.
+
+<Rule label="Implementation" />
+
+<CodeFrame meta="python · torch">
+
+```python
+import copy
+
+import torch
+from torch import nn
+
+
+def upcycle(model: nn.Module, n_experts: int = 8, k: int = 2, every: int = 2):
+    """Replace every `every`-th FFN with n_experts copies of itself plus a router."""
+    for i, block in enumerate(model.blocks):
+        if i % every:
+            continue
+
+        dense = block.ffn
+        experts = nn.ModuleList(copy.deepcopy(dense) for _ in range(n_experts))
+
+        router = nn.Linear(model.dim, n_experts, bias=False)
+        # Near-zero: the initial gate is uniform, so the layer starts out
+        # computing what the dense block computed.
+        nn.init.normal_(router.weight, std=1e-3)
+
+        block.ffn = MoELayer(experts, router, k=k)
+    return model
+```
+
+</CodeFrame>
+
+`every = 2` is the common choice: alternate blocks become sparse and the rest
+stay dense. Converting every block multiplies the parameter count by $E$ and, in
+the reported ablations, buys less than converting half of them — the usual
+finding that sparsity is worth more in some layers than others, and that the
+middle of the network is where it pays.
